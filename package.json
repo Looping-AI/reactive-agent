@@ -1,8 +1,8 @@
 {
-  "name": "looping-proactive-agent",
+  "name": "looping-reactive-agent",
   "version": "1.0.0",
   "private": true,
-  "description": "Proactive A2A agent for looping-gateway — signed AgentCard + gateway-JWT verification, zero shared secrets.",
+  "description": "Reactive A2A agent for looping-gateway — signed AgentCard + gateway-JWT verification, zero shared secrets.",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

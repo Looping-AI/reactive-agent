@@ -2,7 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { AgentDB } from "@/db/db";
 
-const ns = env.ProactiveAgent;
+const ns = env.ReactiveAgent;
 
 /** Fresh, unique DO stub per test — state never leaks between tests. */
 export function freshStub(label: string) {

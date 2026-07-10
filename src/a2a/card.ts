@@ -1,7 +1,7 @@
 import { FlattenedSign, importJWK, type JWK } from "jose";
 import type { AgentCard } from "@a2a-js/sdk";
 import { canonicalCardPayload } from "./canonical";
-import { manifest } from "@/proactive-agent/manifest";
+import { manifest } from "@/reactive-agent/manifest";
 
 /** JWS algorithm for the card signature — must match the gateway (`EdDSA`). */
 const ALG = "EdDSA";

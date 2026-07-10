@@ -7,7 +7,7 @@ import type { PushNotificationConfig } from "@a2a-js/sdk";
 import { env } from "cloudflare:workers";
 import type { GatewayIdentity } from "./verify";
 import type { NotifyTaskParams } from "@/workflows/notify-task";
-import { getAgent } from "@/proactive-agent";
+import { getAgent } from "@/reactive-agent";
 import { textOf } from "./inbound";
 
 /** Per-request config the outer Worker extracts from `message/send` and injects. */

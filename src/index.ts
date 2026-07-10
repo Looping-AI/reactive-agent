@@ -18,11 +18,11 @@ import {
 import { A2AExecutor } from "./a2a/executor";
 import { DurableTaskStore } from "./a2a/task-store";
 
-export { ProactiveAgent } from "./proactive-agent";
+export { ReactiveAgent } from "./reactive-agent";
 export { NotifyTaskWorkflow } from "./workflows/notify-task";
 
 /**
- * Reference remote and proactive A2A agent for looping-gateway.
+ * Reference remote and reactive A2A agent for looping-gateway.
  *
  * The outer Worker owns the zero-trust, no-shared-secrets contract and runs the
  * one A2A JSON-RPC server, dispatching each verified call into the agent
@@ -34,7 +34,7 @@ export { NotifyTaskWorkflow } from "./workflows/notify-task";
  *  3. **Verify the gateway's identity JWT** on every JSON-RPC call against the
  *     gateway's public JWKS ("R knows G"), then run the A2A JSON-RPC server for
  *     this call. The {@link A2AExecutor} dispatches into the caller's
- *     {@link file://./proactive-agent/index.ts ProactiveAgent} DO — one instance per
+ *     {@link file://./reactive-agent/index.ts ReactiveAgent} DO — one instance per
  *     calling gateway-agent (keyed by the verified `identity.key`) — with a
  *     single native Cloudflare RPC call (no internal wire protocol); the DO
  *     holds that caller's durable Session and answers via the Workers-AI loop.

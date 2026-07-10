@@ -7,7 +7,7 @@ import {
   postNotification,
   signCallbackJwt
 } from "@/a2a/notify";
-import { getAgent } from "@/proactive-agent";
+import { getAgent } from "@/reactive-agent";
 
 /**
  * The async turn controller. The gateway no longer waits for a synchronous reply:
@@ -23,7 +23,7 @@ import { getAgent } from "@/proactive-agent";
  * A Workflow is a separate entrypoint and cannot touch the agent DO's SQLite
  * directly, so: the turn inputs travel as the workflow **payload**, and the agent
  * runtime + task state are reached only through **native DO RPC** (`converse`,
- * `markWorking`, `completeTask`) — see {@link file://../proactive-agent/index.ts}.
+ * `markWorking`, `completeTask`) — see {@link file://../reactive-agent/index.ts}.
  *
  * Idempotency: the instance id is derived from the gateway's `messageId`
  * (deterministic across dispatch retries), so a re-dispatch never starts a second

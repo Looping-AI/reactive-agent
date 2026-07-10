@@ -3,7 +3,7 @@ import { importJWK, jwtVerify } from "jose";
 import { env } from "cloudflare:workers";
 import type { WorkflowStep } from "cloudflare:workers";
 import type { Task } from "@a2a-js/sdk";
-import type { ProactiveAgent } from "@/proactive-agent";
+import type { ReactiveAgent } from "@/reactive-agent";
 import { runNotifyTask, type NotifyTaskParams } from "@/workflows/notify-task";
 import {
   TEST_AGENT_PRIVATE_JWK,
@@ -48,7 +48,7 @@ async function agentPublicKey() {
   return importJWK(pub, "EdDSA");
 }
 
-/** Spy on the global ProactiveAgent namespace to return a fake stub. */
+/** Spy on the global ReactiveAgent namespace to return a fake stub. */
 function mockAgent(cap: StubCapture) {
   const stub = {
     markWorking: vi.fn(async (id: string) => {
@@ -66,8 +66,8 @@ function mockAgent(cap: StubCapture) {
     completeTask: vi.fn(async (task: Task) => {
       cap.completed = { task };
     })
-  } as unknown as DurableObjectStub<ProactiveAgent>;
-  vi.spyOn(env.ProactiveAgent, "get").mockReturnValue(stub);
+  } as unknown as DurableObjectStub<ReactiveAgent>;
+  vi.spyOn(env.ReactiveAgent, "get").mockReturnValue(stub);
   return stub;
 }
 

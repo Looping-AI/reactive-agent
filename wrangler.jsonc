@@ -4,7 +4,7 @@
  */
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "looping-proactive-agent",
+  "name": "looping-reactive-agent",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-06",
   "compatibility_flags": ["nodejs_compat"],
@@ -33,9 +33,9 @@
   // calling gateway-agent (keyed by the verified JWT `identity.key`), each with
   // its own SQLite-backed Session (continuous history + writable memory).
   "durable_objects": {
-    "bindings": [{ "class_name": "ProactiveAgent", "name": "ProactiveAgent" }]
+    "bindings": [{ "class_name": "ReactiveAgent", "name": "ReactiveAgent" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProactiveAgent"] }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ReactiveAgent"] }],
   // Async A2A (accept + notify): the Worker accepts a turn synchronously and hands
   // generation + the gateway push-notification callback to this durable Workflow.
   "workflows": [
@@ -52,7 +52,7 @@
   "vectorize": [
     {
       "binding": "VECTORIZE",
-      "index_name": "proactive-agent-recall",
+      "index_name": "reactive-agent-recall",
       "remote": true
     }
   ],

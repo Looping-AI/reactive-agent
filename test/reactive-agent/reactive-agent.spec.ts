@@ -5,7 +5,7 @@ import { sessionText } from "@/agent/history";
 import { freshStub } from "../helpers/do";
 
 /**
- * Real-DO integration coverage for the `ProactiveAgent` DO: its own Session
+ * Real-DO integration coverage for the `ReactiveAgent` DO: its own Session
  * ownership — everything `test/index.spec.ts`'s fake-DO test deliberately does NOT
  * exercise. That test unit-tests the outer Worker's own routing/identity forwarding
  * in isolation; this one integration-tests the DO's internals for real (real
@@ -22,7 +22,7 @@ function converse(stub: ReturnType<typeof freshStub>, text: string) {
   return stub.converse(text, IDENTITY);
 }
 
-describe("ProactiveAgent — Session persistence (real SQLite)", () => {
+describe("ReactiveAgent — Session persistence (real SQLite)", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it("persists the raw user turn before the (unavailable) model is called", async () => {
@@ -61,7 +61,7 @@ describe("ProactiveAgent — Session persistence (real SQLite)", () => {
   });
 });
 
-describe("ProactiveAgent — async task state (real SQLite)", () => {
+describe("ReactiveAgent — async task state (real SQLite)", () => {
   it("beginTask returns a submitted Task and is idempotent on messageId", async () => {
     const stub = freshStub("tasks-begin");
     const first = await runInDurableObject(stub, (instance) =>

@@ -63,7 +63,7 @@ const UNEXPECTED_REPLY =
  * (the Sessions `compactAfter` mechanism). (Phase 5 will also serve a self-generated
  * avatar from here.)
  */
-export class ProactiveAgent extends Agent<Env> {
+export class ReactiveAgent extends Agent<Env> {
   private session?: SessionLike;
   private models?: ModelPair;
   private _db?: AgentDB;
@@ -199,14 +199,14 @@ export class ProactiveAgent extends Agent<Env> {
           task
         );
         if (!res.ok) {
-          console.warn("[proactive-agent] working notification non-2xx", {
+          console.warn("[reactive-agent] working notification non-2xx", {
             taskId: push.taskId,
             stepIndex,
             status: res.status
           });
         }
       } catch (err) {
-        console.warn("[proactive-agent] working notification failed", {
+        console.warn("[reactive-agent] working notification failed", {
           taskId: push.taskId,
           stepIndex,
           err: String(err)
@@ -261,11 +261,11 @@ export class ProactiveAgent extends Agent<Env> {
  */
 export function getAgent(
   identity: GatewayIdentity
-): DurableObjectStub<ProactiveAgent> {
+): DurableObjectStub<ReactiveAgent> {
   if (!identity.key) {
     throw new Error("identity.key is required to route to the agent DO");
   }
-  return env.ProactiveAgent.get(env.ProactiveAgent.idFromName(identity.key));
+  return env.ReactiveAgent.get(env.ReactiveAgent.idFromName(identity.key));
 }
 
 /**

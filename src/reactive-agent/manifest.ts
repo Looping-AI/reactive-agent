@@ -11,9 +11,9 @@ interface AgentManifest {
 }
 
 export const manifest: AgentManifest = {
-  name: "Proactive Agent",
+  name: "Reactive Agent",
   description:
-    "Reference remote and proactive A2A agent for looping-gateway. Verifies the gateway " +
+    "Reference remote and reactive A2A agent for looping-gateway. Verifies the gateway " +
     "identity JWT, then answers the caller via a Workers-AI tool loop with a " +
     "durable per-caller memory (one continuous, self-compacting conversation).",
   version: "0.3.0",

@@ -34,7 +34,7 @@ process.env.GATEWAY_ORIGINS ??= JSON.stringify([GATEWAY_ORIGIN]);
 // rejection through the AI SDK telemetry span that workerd flags as a failure.
 //
 // The pool reads wrangler.jsonc directly (main, compat settings, the AI binding,
-// and the ProactiveAgent DO + its SQLite migration) so this config can't drift from
+// and the ReactiveAgent DO + its SQLite migration) so this config can't drift from
 // it; secrets are supplied via process.env above (real env vars take precedence).
 //
 // `remoteBindings: false` is required, not just the default: Workers AI has no

@@ -1,11 +1,11 @@
 import type { TaskStore } from "@a2a-js/sdk/server";
 import type { Task } from "@a2a-js/sdk";
 import type { GatewayIdentity } from "./verify";
-import { getAgent } from "@/proactive-agent";
+import { getAgent } from "@/reactive-agent";
 
 /**
  * A durable {@link TaskStore} for the a2a-js `DefaultRequestHandler`, backed by
- * the caller's {@link file://../proactive-agent/index.ts ProactiveAgent} Durable
+ * the caller's {@link file://../reactive-agent/index.ts ReactiveAgent} Durable
  * Object (via native RPC) instead of the SDK's per-request `InMemoryTaskStore`.
  *
  * Task state must survive the accept → async callback gap (and answer

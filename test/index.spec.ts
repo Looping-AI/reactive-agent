@@ -2,7 +2,7 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import worker from "@/index";
 import type { Task } from "@a2a-js/sdk";
-import type { ProactiveAgent } from "@/proactive-agent";
+import type { ReactiveAgent } from "@/reactive-agent";
 import { buildSubmittedTask } from "@/a2a/notify";
 import type { GatewayIdentity } from "@/a2a/verify";
 import {
@@ -16,17 +16,16 @@ const PUSH_URL = `${GATEWAY_ORIGIN}/a2a/notifications`;
 const PUSH_TOKEN = "push-token-abc";
 
 // Stub env for tests that only need config vars (auth/card/jwks paths) and
-// do not exercise ProactiveAgent routing — ProactiveAgent is left undefined.
+// do not exercise ReactiveAgent routing — ReactiveAgent is left undefined.
 // Tests that go through message/send (which enqueues a Workflow and calls
-// getAgent) or tasks/cancel (which spies on env.ProactiveAgent.get) pass
+// getAgent) or tasks/cancel (which spies on env.ReactiveAgent.get) pass
 // the real miniflare `env` instead so the DO binding is live.
 const TEST_ENV: Env = {
   A2A_SIGNING_KEY: JSON.stringify(TEST_AGENT_PRIVATE_JWK),
   GATEWAY_ORIGINS: JSON.stringify([GATEWAY_ORIGIN]),
   AI: undefined as unknown as Ai,
   BROWSER: undefined as unknown as BrowserRun,
-  ProactiveAgent:
-    undefined as unknown as DurableObjectNamespace<ProactiveAgent>,
+  ReactiveAgent: undefined as unknown as DurableObjectNamespace<ReactiveAgent>,
   VECTORIZE: undefined as unknown as VectorizeIndex,
   NOTIFY_WORKFLOW: undefined as unknown as Env["NOTIFY_WORKFLOW"]
 };
@@ -280,7 +279,7 @@ describe("POST /a2a", () => {
       workspaceId: 1
     };
 
-    vi.spyOn(env.ProactiveAgent, "get").mockReturnValue({
+    vi.spyOn(env.ReactiveAgent, "get").mockReturnValue({
       getTask: vi.fn(async (id: string) => tasks.get(id) ?? null),
       saveTask: vi.fn(async (task: Task) => {
         tasks.set(task.id, task);
@@ -299,7 +298,7 @@ describe("POST /a2a", () => {
         tasks.set(id, canceled);
         return canceled;
       })
-    } as unknown as DurableObjectStub<ProactiveAgent>);
+    } as unknown as DurableObjectStub<ReactiveAgent>);
 
     const res = await postRpc(cancelBody(taskId), identity);
 
