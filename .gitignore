@@ -147,6 +147,7 @@ dist
 .dev.vars*
 !.dev.vars.example
 !.env.example
+secrets
 
 # Agents
 .claude

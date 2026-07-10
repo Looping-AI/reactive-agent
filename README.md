@@ -76,14 +76,36 @@ Register the agent once at `https://<your-subdomain.yourdomain.com>` and the URL
 
 ### 5. Deploy to production
 
-Upload the signing key and gateway origins as Wrangler secrets, then deploy:
+For the first deployment, the Worker does not yet exist, so Wrangler cannot set
+its secrets in advance. Create an ignored deployment secrets file from the
+example, then generate a production signing key:
 
 ```sh
-npm run keygen agent-1                 # generate new key for production
-wrangler secret put A2A_SIGNING_KEY    # paste the new private JWK
-wrangler secret put GATEWAY_ORIGINS    # paste, e.g. ["https://<your-gateway>"]
-npx wrangler deploy
+cp .dev.vars.example secrets
+npm run keygen agent-1
 ```
+
+`agent-1` is an example key identifier (`kid`), not a required name. Replace it
+with any descriptive identifier you choose for this agent's signing key.
+
+Set `A2A_SIGNING_KEY` in `secrets` to the private JWK printed by `keygen`, and
+set `GATEWAY_ORIGINS` to the deployed gateway origin:
+
+```sh
+A2A_SIGNING_KEY=<private JWK printed by keygen>
+GATEWAY_ORIGINS=["https://<your-gateway>"]
+```
+
+Deploy the new Worker with both secrets:
+
+```sh
+npx wrangler deploy --secrets-file secrets
+```
+
+After this first deployment, don't forget to delete `secrets` file.
+In future, rotate either secret with `npx wrangler secret put
+<SECRET_NAME>` and deploy normally with `npx wrangler deploy`. Never commit the
+`secrets` file.
 
 SQLite schema migrations run automatically inside each Durable Object instance on first wake-up — no separate migration command is needed.
 

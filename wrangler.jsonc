@@ -41,7 +41,7 @@
   "workflows": [
     {
       "binding": "NOTIFY_WORKFLOW",
-      "name": "notify-task",
+      "name": "reactive-agent-notify-task",
       "class_name": "NotifyTaskWorkflow"
     }
   ],
