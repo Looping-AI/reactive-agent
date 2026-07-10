@@ -31,13 +31,14 @@ Copy the printed private JWK into `.dev.vars` as `A2A_SIGNING_KEY`.
 
 ### 3. Configure the gateway origin
 
-In `.dev.vars`, point `GATEWAY_ORIGINS` at your deployed gateway:
+In `.dev.vars`, list the hostname of your deployed gateway:
 
 ```sh
-GATEWAY_ORIGINS=["https://<your-gateway>"]
+GATEWAY_ORIGINS=["gateway.example"]
 ```
 
-This must match the gateway's own `GATEWAY_ORIGIN`. Add multiple entries for multi-worker setups or domain transitions.
+The hostname must identify the gateway that signs calls to this agent. Add
+multiple entries for multi-worker setups or domain transitions.
 
 ### 4. Run locally
 
@@ -93,7 +94,7 @@ set `GATEWAY_ORIGINS` to the deployed gateway origin:
 
 ```sh
 A2A_SIGNING_KEY=<private JWK printed by keygen>
-GATEWAY_ORIGINS=["https://<your-gateway>"]
+GATEWAY_ORIGINS=["gateway.example"]
 ```
 
 Deploy the new Worker with both secrets:

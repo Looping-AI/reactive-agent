@@ -7,7 +7,6 @@
 A2A_SIGNING_KEY=
 
 // GATEWAY_ORIGINS: JSON array of trusted gateway origins, e.g.
-// ["https://gw.example.com"]. Must match the deployed gateway's own
-// GATEWAY_ORIGIN. Not a traditional secret, but kept out of wrangler.jsonc
+// ["gateway.example"]. Not a traditional secret, but kept out of wrangler.jsonc
 // for deploy-time convenience (differs per environment, no code change to ship).
 GATEWAY_ORIGINS=

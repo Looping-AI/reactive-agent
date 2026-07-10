@@ -78,6 +78,18 @@ export interface VerifyOptions {
 }
 
 /**
+ * Normalize configured gateway origins to the HTTPS origins emitted in gateway
+ * JWT `jku` and `iss` claims. This accepts a hostname, `http://` URL, or URL
+ * with a trailing slash while keeping the verification allowlist exact.
+ */
+export function normalizeGatewayOrigins(origins: string[]): string[] {
+  return origins.map(
+    (origin) =>
+      new URL(`https://${origin.trim().replace(/^https?:\/\//i, "")}`).origin
+  );
+}
+
+/**
  * Verify a gateway JWT and return its payload + parsed identity.
  *
  * The `jku` JWK Set URL is read directly from the token's protected header
@@ -91,6 +103,7 @@ export async function verifyGatewayToken(
   opts: VerifyOptions
 ): Promise<{ payload: JWTPayload; identity: GatewayIdentity }> {
   try {
+    const allowedOrigins = normalizeGatewayOrigins(opts.allowedOrigins);
     // Extract jku from the protected header — this is the standard way the
     // gateway advertises where to fetch its public key (RFC 7515 §4.1.2).
     const header = decodeProtectedHeader(token) as { jku?: string };
@@ -103,7 +116,7 @@ export async function verifyGatewayToken(
     // Security: validate the jku origin before fetching. Without this an
     // attacker could forge a token with jku pointing at their own JWKS.
     const jkuOrigin = new URL(jku).origin;
-    if (!opts.allowedOrigins.includes(jkuOrigin)) {
+    if (!allowedOrigins.includes(jkuOrigin)) {
       throw new GatewayAuthError(
         `jku origin '${jkuOrigin}' is not in the allowed gateway origins`
       );
@@ -118,7 +131,7 @@ export async function verifyGatewayToken(
       );
     }
     const { payload } = await jwtVerify(token, jwksFor(jku), {
-      issuer: opts.allowedOrigins,
+      issuer: allowedOrigins,
       audience: opts.audience,
       algorithms: [ALG]
     });
