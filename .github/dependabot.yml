@@ -1,0 +1,32 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    groups:
+      cloudflare:
+        patterns:
+          - "@cloudflare/*"
+          - "wrangler"
+      a2a-sdk:
+        patterns:
+          - "@a2a-js/*"
+          - "jose"
+      dev-tooling:
+        patterns:
+          - "eslint"
+          - "typescript-eslint"
+          - "prettier"
+          - "typescript"
+          - "husky"
+          - "@types/*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5

@@ -1,0 +1,54 @@
+{
+  "name": "looping-proactive-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Proactive A2A agent for looping-gateway — signed AgentCard + gateway-JWT verification, zero shared secrets.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "types": "wrangler types",
+    "keygen": "node scripts/generate-keys.mjs",
+    "format": "prettier --write .",
+    "lint": "eslint .",
+    "check": "wrangler types --check && prettier --check . && eslint . && tsc && tsc -p test/tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepare": "husky"
+  },
+  "dependencies": {
+    "@a2a-js/sdk": "^0.3.14",
+    "agents": "^0.17.3",
+    "ai": "^6.0.222",
+    "drizzle-orm": "^0.45.2",
+    "jose": "^6.2.3",
+    "workers-ai-provider": "^3.3.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.18.4",
+    "@types/node": "^26.1.1",
+    "drizzle-kit": "^0.31.10",
+    "eslint": "^10.6.0",
+    "husky": "^9.1.7",
+    "prettier": "^3.9.5",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.63.0",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.110.0"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "overrides": {
+    "@esbuild-kit/core-utils": {
+      "esbuild": "^0.25.0"
+    }
+  },
+  "allowScripts": {
+    "esbuild": false,
+    "fsevents": false,
+    "sharp": false,
+    "workerd": false,
+    "core-js-pure": false
+  }
+}

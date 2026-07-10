@@ -1,0 +1,62 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "looping-proactive-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  // Workers AI binding backing the agent's LLM tool loop (via AI Gateway).
+  // `remote: true` reflects reality — Workers AI has no local execution mode and
+  // always hits remote resources — and suppresses wrangler's per-run warning. In
+  // tests the pool-level `remoteBindings: false` (vitest.config.ts) still overrides
+  // this and keeps the suite from eagerly opening that remote connection.
+  "ai": {
+    "binding": "AI",
+    "remote": true
+  },
+  // Browser Rendering — backs the agent's web read/scrape tools (Quick Actions:
+  // browser_markdown/extract/links/scrape). `remote: true` mirrors AI/VECTORIZE
+  // (no local mode) and is required for Quick Actions under `wrangler dev`; the
+  // pool-level `remoteBindings: false` still keeps tests off the real connection.
+  // NOTE: requires a PAID Workers plan; Browser Rendering is not on the free tier.
+  "browser": {
+    "binding": "BROWSER",
+    "remote": true
+  },
+  // The agent runtime is a Durable Object (Agents-SDK `Agent`): one instance per
+  // calling gateway-agent (keyed by the verified JWT `identity.key`), each with
+  // its own SQLite-backed Session (continuous history + writable memory).
+  "durable_objects": {
+    "bindings": [{ "class_name": "ProactiveAgent", "name": "ProactiveAgent" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProactiveAgent"] }],
+  // Async A2A (accept + notify): the Worker accepts a turn synchronously and hands
+  // generation + the gateway push-notification callback to this durable Workflow.
+  "workflows": [
+    {
+      "binding": "NOTIFY_WORKFLOW",
+      "name": "notify-task",
+      "class_name": "NotifyTaskWorkflow"
+    }
+  ],
+  // Episodic recall: the messages each Session compaction displaces are embedded
+  // (Workers AI `@cf/baai/bge-m3`, 1024-dim) and upserted into this Vectorize
+  // index, namespaced per DO instance.
+  // Vectorize has no local mode, so tests inject a fake index.
+  "vectorize": [
+    {
+      "binding": "VECTORIZE",
+      "index_name": "proactive-agent-recall",
+      "remote": true
+    }
+  ],
+  "secrets": {
+    "required": ["A2A_SIGNING_KEY", "GATEWAY_ORIGINS"]
+  }
+}

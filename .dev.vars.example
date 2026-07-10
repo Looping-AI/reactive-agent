@@ -1,0 +1,13 @@
+// Copy to `.dev.vars` for local `wrangler dev`. In production set these as
+// secrets with `wrangler secret put <NAME>`.
+
+// A2A_SIGNING_KEY: an Ed25519 private JWK (one line) that signs this agent's
+// AgentCard. MUST include a `kid`. Generate with `npm run keygen`.
+// Only the matching PUBLIC key is ever exposed, at /.well-known/jwks.json.
+A2A_SIGNING_KEY=
+
+// GATEWAY_ORIGINS: JSON array of trusted gateway origins, e.g.
+// ["https://gw.example.com"]. Must match the deployed gateway's own
+// GATEWAY_ORIGIN. Not a traditional secret, but kept out of wrangler.jsonc
+// for deploy-time convenience (differs per environment, no code change to ship).
+GATEWAY_ORIGINS=
