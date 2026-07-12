@@ -69,11 +69,16 @@ export async function runHandleTask(
   p: HandleTaskParams,
   step: WorkflowStep
 ): Promise<void> {
+  // Phase 0: Pre-work
   const stub = getAgent(p.identity);
 
   await step.do("working", async () => {
     await stub.markWorking(p.taskId);
   });
+
+  // Phase 1: Decompose Task
+
+  // Phase 2: Execute Subtasks
 
   // Generate the reply. Durable + retried; `converse` resolves its own transient
   // failures to a friendly string, so a throw here is a genuine RPC fault. The
@@ -88,6 +93,10 @@ export async function runHandleTask(
       jku: p.jku
     })
   );
+
+  // Phase 3: Compose Task
+
+  // Phase 4: Deliver Task
 
   const task = buildCompletedTask(p.taskId, p.contextId, reply);
 
