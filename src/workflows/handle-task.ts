@@ -29,7 +29,7 @@ import { getAgent } from "@/reactive-agent";
  * (deterministic across dispatch retries), so a re-dispatch never starts a second
  * run — `converse` executes exactly once.
  */
-export interface NotifyTaskParams {
+export interface HandleTaskParams {
   /** The accepted task id (echoed back to the gateway on the callback). */
   taskId: string;
   /** The user turn text to answer. */
@@ -46,15 +46,15 @@ export interface NotifyTaskParams {
   jku: string;
 }
 
-export class NotifyTaskWorkflow extends WorkflowEntrypoint<
+export class HandleTaskWorkflow extends WorkflowEntrypoint<
   Env,
-  NotifyTaskParams
+  HandleTaskParams
 > {
   async run(
-    event: Readonly<WorkflowEvent<NotifyTaskParams>>,
+    event: Readonly<WorkflowEvent<HandleTaskParams>>,
     step: WorkflowStep
   ): Promise<void> {
-    await runNotifyTask(event.payload, step);
+    await runHandleTask(event.payload, step);
   }
 }
 
@@ -65,8 +65,8 @@ export class NotifyTaskWorkflow extends WorkflowEntrypoint<
  * `cloudflare:workers` import rather than a parameter. Steps are named so
  * retries are durable and idempotent.
  */
-export async function runNotifyTask(
-  p: NotifyTaskParams,
+export async function runHandleTask(
+  p: HandleTaskParams,
   step: WorkflowStep
 ): Promise<void> {
   const stub = getAgent(p.identity);

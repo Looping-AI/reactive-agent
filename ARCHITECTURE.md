@@ -21,7 +21,7 @@ sequenceDiagram
     Agent->>Gateway: GET /.well-known/jwks.json (gateway public JWKS)
     Gateway-->>Agent: gateway public JWKS
     Agent->>Agent: verify JWT (sig + iss + aud + exp)
-    Agent->>Agent: record submitted Task (DO) + start NotifyTaskWorkflow
+    Agent->>Agent: record submitted Task (DO) + start HandleTaskWorkflow
     Agent-->>Gateway: submitted Task (the accept — returns immediately)
     Note over Agent: workflow: converse() over the caller's Session (out of band)
     Agent->>Gateway: POST pushNotificationConfig.url (/a2a/notifications)<br/>x-a2a-notification-token + Bearer(card-key JWT), body = completed Task
@@ -122,7 +122,7 @@ This agent implements that contract in three moving parts:
   without a `pushNotificationConfig` (JSON-RPC `-32602` — this agent is
   async-only), then the [`A2AExecutor`](src/a2a/executor.ts) records a `submitted`
   Task via the DO (`beginTask`, idempotent on the gateway's `messageId`), starts a
-  [`NotifyTaskWorkflow`](src/workflows/notify-task.ts) whose instance id is derived
+  [`HandleTaskWorkflow`](src/workflows/handle-task.ts) whose instance id is derived
   from that `messageId`, and publishes the Task as the accept — all in well under
   the gateway's 30s accept timeout. Task state persists in the DO
   ([`src/a2a/task-store.ts`](src/a2a/task-store.ts) backs the a2a-js `TaskStore`),
@@ -130,7 +130,7 @@ This agent implements that contract in three moving parts:
   `ReactiveAgent.cleanupOldTasks` runs as a weekly cron (Sunday 01:00 UTC) via the
   Agents SDK `this.schedule` API, registered idempotently in `onStart`.
 - **Generate + deliver (Workflow).**
-  [`src/workflows/notify-task.ts`](src/workflows/notify-task.ts) is the durable
+  [`src/workflows/handle-task.ts`](src/workflows/handle-task.ts) is the durable
   controller. Its `step.do(...)` steps run `converse()` on the caller's DO
   (native RPC — a Workflow can't touch the DO's SQLite directly, so turn inputs
   ride as the workflow payload and task state is mutated only through DO RPC),
@@ -160,14 +160,14 @@ The card signature is computed over a deterministic serialization:
 
 ## Environment
 
-| Variable          | Where   | Purpose                                                                                              |
-| ----------------- | ------- | ---------------------------------------------------------------------------------------------------- |
-| `A2A_SIGNING_KEY` | secret  | Ed25519 private JWK (with `kid`) that signs the AgentCard.                                           |
-| `GATEWAY_ORIGINS` | secret  | JSON array of trusted gateway origins, e.g. `["https://gw.example.com"]`. Validates `jku` and `iss`. |
-| `AI`              | binding | Workers AI binding (routed via AI Gateway) backing the LLM tool loop + recall embeddings.            |
-| `ReactiveAgent`   | binding | Durable Object namespace — one instance per caller, holding the durable Session + task state.        |
-| `VECTORIZE`       | binding | Vectorize index (`reactive-agent-recall`, 1024-dim/cosine) storing per-instance episodic recall.     |
-| `NOTIFY_WORKFLOW` | binding | Cloudflare Workflow (`NotifyTaskWorkflow`) that generates a turn and delivers the push callback.     |
+| Variable               | Where   | Purpose                                                                                              |
+| ---------------------- | ------- | ---------------------------------------------------------------------------------------------------- |
+| `A2A_SIGNING_KEY`      | secret  | Ed25519 private JWK (with `kid`) that signs the AgentCard.                                           |
+| `GATEWAY_ORIGINS`      | secret  | JSON array of trusted gateway origins, e.g. `["https://gw.example.com"]`. Validates `jku` and `iss`. |
+| `AI`                   | binding | Workers AI binding (routed via AI Gateway) backing the LLM tool loop + recall embeddings.            |
+| `ReactiveAgent`        | binding | Durable Object namespace — one instance per caller, holding the durable Session + task state.        |
+| `VECTORIZE`            | binding | Vectorize index (`reactive-agent-recall`, 1024-dim/cosine) storing per-instance episodic recall.     |
+| `HANDLE_TASK_WORKFLOW` | binding | Cloudflare Workflow (`HandleTaskWorkflow`) that generates a turn and delivers the push callback.     |
 
 > The recall index is created out of band before deploy (it must match the
 > embedding model's output):
@@ -189,7 +189,7 @@ The card signature is computed over a deterministic serialization:
 | [`src/a2a/executor.ts`](src/a2a/executor.ts)                       | `A2AExecutor` — accepts a turn (submitted Task) and starts the notify workflow.                                    |
 | [`src/a2a/task-store.ts`](src/a2a/task-store.ts)                   | `DurableTaskStore` — DO-backed a2a-js `TaskStore` (durable task state across accept→callback).                     |
 | [`src/a2a/notify.ts`](src/a2a/notify.ts)                           | Build the submitted/completed Tasks; sign + POST the gateway push-notification callback.                           |
-| [`src/workflows/notify-task.ts`](src/workflows/notify-task.ts)     | `NotifyTaskWorkflow` — durable controller: converse → complete → notify the gateway.                               |
+| [`src/workflows/handle-task.ts`](src/workflows/handle-task.ts)     | `HandleTaskWorkflow` — durable controller: converse → complete → notify the gateway.                               |
 | [`src/agent/loop.ts`](src/agent/loop.ts)                           | `runTurn` — Session turn runner (primary → fallback, transient handling).                                          |
 | [`src/agent/model.ts`](src/agent/model.ts)                         | Workers-AI primary/fallback model pair (via AI Gateway).                                                           |
 | [`src/agent/prompt.ts`](src/agent/prompt.ts)                       | Soul (identity + rules) + per-request caller context.                                                              |

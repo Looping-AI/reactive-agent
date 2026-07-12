@@ -40,9 +40,9 @@
   // generation + the gateway push-notification callback to this durable Workflow.
   "workflows": [
     {
-      "binding": "NOTIFY_WORKFLOW",
-      "name": "reactive-agent-notify-task",
-      "class_name": "NotifyTaskWorkflow"
+      "binding": "HANDLE_TASK_WORKFLOW",
+      "name": "handle-task",
+      "class_name": "HandleTaskWorkflow"
     }
   ],
   // Episodic recall: the messages each Session compaction displaces are embedded

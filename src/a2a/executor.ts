@@ -6,7 +6,7 @@ import type {
 import type { PushNotificationConfig } from "@a2a-js/sdk";
 import { env } from "cloudflare:workers";
 import type { GatewayIdentity } from "./verify";
-import type { NotifyTaskParams } from "@/workflows/notify-task";
+import type { HandleTaskParams } from "@/workflows/handle-task";
 import { getAgent } from "@/reactive-agent";
 import { textOf } from "./inbound";
 
@@ -19,19 +19,19 @@ export interface ExecutorConfig {
 }
 
 /**
- * Derive the deterministic {@link NotifyTaskWorkflow} instance id for a turn. Keyed
+ * Derive the deterministic {@link HandleTaskWorkflow} instance id for a turn. Keyed
  * on the gateway's `messageId` (stable across dispatch retries), so re-creating it
  * is a no-op — the turn runs exactly once. Sanitized to the id charset.
  */
 export function workflowIdForMessage(messageId: string): string {
-  return `notify-${messageId.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+  return `handle-${messageId.replace(/[^A-Za-z0-9_-]/g, "-")}`;
 }
 
 /**
  * A2A executor for the **async accept + notify** contract. On `message/send` it no
  * longer blocks on generation: it records a `submitted` Task in the caller's DO
  * (idempotent on `messageId`), hands the turn to a durable
- * {@link file://../workflows/notify-task.ts NotifyTaskWorkflow}, and publishes the
+ * {@link file://../workflows/handle-task.ts HandleTaskWorkflow}, and publishes the
  * accepted Task immediately as the response. The workflow generates the reply and
  * POSTs it to the gateway's push-notification webhook out of band.
  *
@@ -88,10 +88,10 @@ export class A2AExecutor implements AgentExecutor {
   /** Start the turn workflow; swallow the "instance already exists" retry race. */
   private async startWorkflow(
     messageId: string,
-    params: NotifyTaskParams
+    params: HandleTaskParams
   ): Promise<void> {
     try {
-      await env.NOTIFY_WORKFLOW.create({
+      await env.HANDLE_TASK_WORKFLOW.create({
         id: workflowIdForMessage(messageId),
         params
       });

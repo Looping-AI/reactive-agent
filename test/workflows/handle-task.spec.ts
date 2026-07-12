@@ -4,7 +4,7 @@ import { env } from "cloudflare:workers";
 import type { WorkflowStep } from "cloudflare:workers";
 import type { Task } from "@a2a-js/sdk";
 import type { ReactiveAgent } from "@/reactive-agent";
-import { runNotifyTask, type NotifyTaskParams } from "@/workflows/notify-task";
+import { runHandleTask, type HandleTaskParams } from "@/workflows/handle-task";
 import {
   TEST_AGENT_PRIVATE_JWK,
   GATEWAY_ORIGIN,
@@ -30,7 +30,7 @@ const inlineStep = {
   }) as WorkflowStep["do"]
 } as unknown as WorkflowStep;
 
-function params(): NotifyTaskParams {
+function params(): HandleTaskParams {
   return {
     taskId: "task-1",
     text: "hi there",
@@ -76,7 +76,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("NotifyTaskWorkflow", () => {
+describe("HandleTaskWorkflow", () => {
   it("generates the reply and POSTs a signed completed-Task callback to the gateway", async () => {
     const cap: StubCapture = { reply: "the answer" };
     mockAgent(cap);
@@ -91,7 +91,7 @@ describe("NotifyTaskWorkflow", () => {
       })
     );
 
-    await runNotifyTask(params(), inlineStep);
+    await runHandleTask(params(), inlineStep);
 
     // Drove the DO: working → converse(text, identity) → completeTask.
     expect(cap.working).toBe("task-1");
@@ -137,7 +137,7 @@ describe("NotifyTaskWorkflow", () => {
     const fetchSpy = vi.fn(async () => new Response("ok", { status: 200 }));
     vi.stubGlobal("fetch", fetchSpy);
 
-    await runNotifyTask(params(), inlineStep);
+    await runHandleTask(params(), inlineStep);
 
     expect(cap.completed).toBeUndefined();
     expect(fetchSpy).not.toHaveBeenCalled();

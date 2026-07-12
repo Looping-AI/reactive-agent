@@ -25,7 +25,7 @@ import {
 /**
  * Everything the DO needs to stream **intermediate** `working` push notifications
  * live during a turn (see {@link file://../a2a/notify.ts}). Threaded in from the
- * {@link file://../workflows/notify-task.ts NotifyTaskWorkflow}, which owns the
+ * {@link file://../workflows/handle-task.ts HandleTaskWorkflow}, which owns the
  * terminal `completed` callback; these are the progress messages before it.
  * RPC-serializable (crosses the workflow → DO boundary).
  */

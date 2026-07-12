@@ -4,7 +4,7 @@ import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core";
  * Durable state for async A2A tasks (accept + notify lifecycle).
  *
  * One row per task: written by the Worker's accept path (`beginTask`, keyed by
- * `message_id` for gateway-dedup) and mutated by the `NotifyTaskWorkflow` via
+ * `message_id` for gateway-dedup) and mutated by the `HandleTaskWorkflow` via
  * DO RPC (`markWorking`, `completeTask`, `cancelTask`). `tasks/get` reads it
  * via `DurableTaskStore`. Table lives in the caller's DO SQLite (`this.ctx.storage`).
  */
