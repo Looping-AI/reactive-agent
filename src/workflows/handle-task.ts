@@ -1,6 +1,7 @@
 import { WorkflowEntrypoint, env } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import type { GatewayIdentity } from "@/a2a/verify";
+import type { ConversationPart } from "@/a2a/parts";
 import { parsePrivateJwk } from "@/a2a/card";
 import {
   buildCompletedTask,
@@ -34,6 +35,8 @@ export interface HandleTaskParams {
   taskId: string;
   /** The user turn text to answer. */
   text: string;
+  /** Metadata-free original A2A parts preserved for Phase 1 decomposition. */
+  parts: ConversationPart[];
   /** The verified calling gateway-agent identity (keys the DO + the Session). */
   identity: GatewayIdentity;
   /** A2A context id, echoed on the completed Task. */

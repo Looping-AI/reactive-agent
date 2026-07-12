@@ -8,7 +8,7 @@ import { env } from "cloudflare:workers";
 import type { GatewayIdentity } from "./verify";
 import type { HandleTaskParams } from "@/workflows/handle-task";
 import { getAgent } from "@/reactive-agent";
-import { textOf } from "./inbound";
+import { InboundPartError, sanitizeParts, textOf } from "./inbound";
 
 /** Per-request config the outer Worker extracts from `message/send` and injects. */
 export interface ExecutorConfig {
@@ -54,6 +54,10 @@ export class A2AExecutor implements AgentExecutor {
       throw new Error("pushNotificationConfig url and token are required");
     }
 
+    const parts = sanitizeParts(requestContext.userMessage);
+    if (parts.length === 0) {
+      throw new InboundPartError("message has no usable parts");
+    }
     const text = textOf(requestContext.userMessage);
     const messageId = requestContext.userMessage.messageId;
     const contextId = requestContext.contextId;
@@ -73,6 +77,7 @@ export class A2AExecutor implements AgentExecutor {
     await this.startWorkflow(messageId, {
       taskId: task.id,
       text,
+      parts,
       identity: this.identity,
       contextId,
       pushUrl: pushConfig.url,
