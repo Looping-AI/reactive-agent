@@ -24,7 +24,7 @@ function requestContext(parts: unknown[]): RequestContext {
 afterEach(() => vi.restoreAllMocks());
 
 describe("A2AExecutor", () => {
-  it("passes metadata-free structured parts to the Workflow payload", async () => {
+  it("passes the user-turn text to the Workflow payload", async () => {
     vi.spyOn(env.ReactiveAgent, "get").mockReturnValue({
       beginTask: vi.fn(async () => ({ id: "task-1" }))
     } as unknown as DurableObjectStub<ReactiveAgent>);
@@ -43,12 +43,7 @@ describe("A2AExecutor", () => {
 
     await executor.execute(
       requestContext([
-        { kind: "text", text: "hello", metadata: { ignored: true } },
-        {
-          kind: "data",
-          data: { nested: [1, true] },
-          metadata: { ignored: true }
-        }
+        { kind: "text", text: "hello", metadata: { ignored: true } }
       ]),
       { publish, finished } as unknown as ExecutionEventBus
     );
@@ -57,18 +52,14 @@ describe("A2AExecutor", () => {
       id: "handle-message-1",
       params: expect.objectContaining<Partial<HandleTaskParams>>({
         taskId: "task-1",
-        text: "hello",
-        parts: [
-          { kind: "text", text: "hello" },
-          { kind: "data", data: { nested: [1, true] } }
-        ]
+        text: "hello"
       })
     });
     expect(publish).toHaveBeenCalledWith({ id: "task-1" });
     expect(finished).toHaveBeenCalledOnce();
   });
 
-  it("rejects a message with no usable parts before creating a task", async () => {
+  it("rejects a message with no usable text before creating a task", async () => {
     const get = vi.spyOn(env.ReactiveAgent, "get");
     const create = vi.spyOn(env.HANDLE_TASK_WORKFLOW, "create");
     const executor = new A2AExecutor(identity, {
@@ -84,7 +75,7 @@ describe("A2AExecutor", () => {
         publish: vi.fn(),
         finished: vi.fn()
       } as unknown as ExecutionEventBus)
-    ).rejects.toThrow(/no usable parts/);
+    ).rejects.toThrow(/no usable text/);
 
     expect(get).not.toHaveBeenCalled();
     expect(create).not.toHaveBeenCalled();

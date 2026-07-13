@@ -34,7 +34,6 @@ function params(): HandleTaskParams {
   return {
     taskId: "task-1",
     text: "hi there",
-    parts: [{ kind: "text", text: "hi there" }],
     identity: { key: "custom:1:ada", name: "Ada", kind: "custom" },
     contextId: "ctx-1",
     pushUrl: PUSH_URL,
