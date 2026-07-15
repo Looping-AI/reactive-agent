@@ -9,6 +9,13 @@ export default tseslint.config(
     rules: {
       "@typescript-eslint/no-explicit-any": "error",
       "no-unused-expressions": "off",
+      // The Agents SDK's `this.sql`…`` statements are tagged templates run for
+      // their side effect (CREATE TABLE / INSERT); keep the rule for everything
+      // else.
+      "@typescript-eslint/no-unused-expressions": [
+        "error",
+        { allowTaggedTemplates: true }
+      ],
       "@typescript-eslint/no-unused-vars": [
         "error",
         {

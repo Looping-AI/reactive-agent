@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildTools, recall } from "@/agent/tools";
+import { buildRecipeTools, buildTools, recall } from "@/agent/tools";
 import type { RecallDeps } from "@/agent/tools";
 import type { RecallIndex } from "@/agent/recall";
 import type { QuickActionBinding } from "agents/browser";
@@ -93,5 +93,40 @@ describe("buildTools", () => {
       "browser_scrape",
       "recall"
     ]);
+  });
+});
+
+describe("buildRecipeTools", () => {
+  it("builds the browser tools for the browser family", () => {
+    const tools = buildRecipeTools(["browser"], browserStub);
+    expect(Object.keys(tools).sort()).toEqual([
+      "browser_extract",
+      "browser_links",
+      "browser_markdown",
+      "browser_scrape"
+    ]);
+  });
+
+  it("skips the browser family when no binding is available", () => {
+    expect(Object.keys(buildRecipeTools(["browser"]))).toEqual([]);
+  });
+
+  it("ignores unknown families — recall/set_context can never appear", () => {
+    const tools = buildRecipeTools(
+      ["recall", "set_context", "warp", "browser"],
+      browserStub
+    );
+    expect(Object.keys(tools).sort()).toEqual([
+      "browser_extract",
+      "browser_links",
+      "browser_markdown",
+      "browser_scrape"
+    ]);
+    expect(tools.recall).toBeUndefined();
+    expect(tools.set_context).toBeUndefined();
+  });
+
+  it("builds an empty toolset for no families", () => {
+    expect(Object.keys(buildRecipeTools([], browserStub))).toEqual([]);
   });
 });

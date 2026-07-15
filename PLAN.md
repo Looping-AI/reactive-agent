@@ -10,15 +10,15 @@ Refactor `HandleTaskWorkflow` into five explicit runtime phases:
 3. Compose Task
 4. Deliver Task
 
-The caller-owned `ReactiveAgent` remains the durable main agent and owner of the continuous Session. Every incoming Task is decomposed into one to eight durable Subtasks. Dependency-ready Subtasks run concurrently through caller-local, database-backed Recipe configuration and isolated Agents SDK subagents. The main agent composes multiple outcomes, while a single successful Subtask bypasses composition. Phase 4 retains the signed asynchronous A2A delivery contract.
+The caller-owned `ReactiveAgent` remains the durable main agent and owner of the continuous Session. Every incoming Task is decomposed into one to eight durable Subtasks. Dependency-ready Subtasks run concurrently through code-owned Recipe configuration and isolated Agents SDK subagents. The main agent composes multiple outcomes, while a single successful Subtask bypasses composition. Phase 4 retains the signed asynchronous A2A delivery contract.
 
 ## Status
 
 Legend: ✅ done · 🚧 partial · ⬜ not started. Section headings below carry the same marker.
 
 - ✅ **A1** core contracts · ✅ **A2** text ingress · ✅ **A3** reference catalog · ✅ **A4** durable Subtask storage
-- 🚧 **A1** remainder: decomposition output, dependency-result records, Recipe execution request/result, and composition input/output contracts are deferred to the phases that consume them (B/C).
-- ⬜ **Phase B** (Recipes + managed Subagents) · ⬜ **Phase C** (decomposition + composition) · ⬜ **Phase D** (Workflow DAG) · ⬜ **Phase E** (verification + docs)
+- 🚧 **A1** remainder: dependency-result records and the Recipe execution request/result contracts landed with Phase B; decomposition output and composition input/output contracts are deferred to Phase C, which consumes them.
+- ✅ **Phase B** (code-owned Recipe validation + managed Subagents) · ⬜ **Phase C** (decomposition + composition) · ⬜ **Phase D** (Workflow DAG) · ⬜ **Phase E** (verification + docs)
 
 ## Core Invariants
 
@@ -32,9 +32,9 @@ Legend: ✅ done · 🚧 partial · ⬜ not started. Section headings below carr
 - The decomposition model selects catalog indices only. Application code copies each selected message's exact text verbatim onto the Subtask; the model never rewrites, summarizes, fabricates, or relabels reference content.
 - References are resolved and persisted once, at decomposition. Execution never re-reads the Session, so mid-task compaction cannot affect a Subtask already in flight. There are no durable part IDs, no lazy resolution, and no second-copy concern.
 - Information about summaries, recall, or tool output can reach a Subtask only through the `prompt` input, at main-agent discretion.
-- A Recipe configures an isolated subagent invocation: an enabled state, version, primary/fallback model ID strings, soul text, and a set of tool families. The `default` Recipe is a **code constant** (`DEFAULT_RECIPE` in `src/agent/subtasks/recipe.ts`, sourced from `config.ts`), not a database row — so it never goes stale against the configured model IDs and needs no migration seed. Caller-local database Recipe rows and semantic-type associations are added in Phase B1, for custom Recipes only.
-- Decomposition assigns only a semantic Subtask `type`; it never names a Recipe. When a pending Subtask starts, its type resolves to one enabled Recipe — through the caller's `subtask_type_recipes` associations once B1 adds them, otherwise to the code-owned `default` Recipe.
-- The resolved Recipe ID and version are recorded on the Subtask after-the-fact, at execution start. Model IDs and tool families remain code-validated: invalid model IDs fall back independently to existing defaults, unknown or removed tool families are ignored, and `recall` and Session `set_context` are never Recipe-selectable.
+- A Recipe configures an isolated subagent invocation: an enabled state, version, primary/fallback model ID strings, soul text, and a set of tool families. The `default` Recipe is a **code constant** (`DEFAULT_RECIPE` in `src/agent/subtasks/recipe.ts`, sourced from `config.ts`), not a database row — so it never goes stale against the configured model IDs and needs no migration seed. Caller-local database Recipe rows and semantic-type associations are deferred until a Recipe admin surface (a real writer) exists — see Out of Scope.
+- Decomposition assigns only a semantic Subtask `type`; it never names a Recipe. When a pending Subtask starts, its type resolves to one enabled Recipe via the code-owned `resolveRecipeForType` — always the `default` Recipe until caller-local associations exist.
+- The resolved Recipe ID and version are recorded on the Subtask after-the-fact, at execution start. Model IDs and tool families remain code-validated (`validateRecipe`): the model allowlist is exactly the two config IDs, a non-allowlisted ID is substituted with its slot's config default independently per slot, unknown or removed tool families are ignored, and `recall` and Session `set_context` are never Recipe-selectable.
 - Subagents have no Session, durable memory, recall access, or access to parent history beyond the supplied references.
 - Managed subagents are deleted with `deleteSubAgent()` after their terminal result is durably copied into the parent.
 - Dependency edges form a validated DAG through `dependsOn: SubtaskId[]`.
@@ -63,7 +63,7 @@ flowchart TD
 
 ### A1. Define RPC-safe Subtask contracts — 🚧 core done
 
-> Core contracts (`SubtaskStatus`, `SubtaskId`, `SubtaskReference`, `SubtaskResultPart`, `Subtask`) are in `src/agent/subtasks/types.ts`, along with `SubtaskDraft` and `ResolvedRecipe` (added by A4). Remaining execution/composition contracts below (decomposition output, dependency-result records, Recipe execution request/result, composition input/output) are deferred to Phases B/C.
+> Core contracts (`SubtaskStatus`, `SubtaskId`, `SubtaskReference`, `SubtaskResultPart`, `Subtask`) are in `src/agent/subtasks/types.ts`, along with `SubtaskDraft` and `ResolvedRecipe` (added by A4). Phase B added the execution contracts it consumes (`DependencyResult`, `RecipeExecutionRequest`, `RecipeExecutionResult`). Decomposition output and composition input/output contracts are deferred to Phase C.
 
 Add `src/agent/subtasks/types.ts` with plain, serializable contracts suitable for native Durable Object RPC.
 
@@ -131,8 +131,8 @@ The main agent may read summaries and recall while reasoning, but it delegates o
 > hand-appended migration `INSERT`, and forms a second source of truth. With the
 > default in code and recipe mutation Out of Scope, the `recipes` /
 > `subtask_type_recipes` tables would be created empty and stay empty — so they
-> are **deferred to B1**, where a real writer (custom Recipes / associations)
-> introduces them.
+> are **deferred until a Recipe admin surface (a real writer) exists**. Phase B
+> re-examined and kept this call: B1 had no real writer either (see Phase B note).
 
 Extend `src/db/schema.ts` with a caller-local `subtasks` table. It uses an SQLite
 integer primary key (`AUTOINCREMENT`) to assign a unique, monotonically
@@ -156,8 +156,8 @@ Persist:
 Add the code-owned default Recipe in `src/agent/subtasks/recipe.ts` (not a
 `src/recipes/` registry): `DEFAULT_RECIPE` (model IDs from `config.ts`, a
 `STATELESS_SUBAGENT_SOUL`, and the `browser` tool family) plus
-`resolveRecipeForType(type)`, which returns the default for now and is the seam
-B1 extends to consult the DB.
+`resolveRecipeForType(type)`, which returns the default and is the seam a
+future Recipe admin phase extends to consult the DB.
 
 Add `src/db/models/subtasks.ts` with:
 
@@ -172,7 +172,7 @@ Recipe resolution and execution-time recording (`resolveRecipeForType(type)` the
 the `pending → running` transition that records Recipe ID/version) are composed by
 the caller in C3 — kept as two synchronous calls rather than coupling recipe logic
 into the subtask-table writer; still atomic. Recipe version increments and DB-backed
-type-mapping lookup arrive with the recipe tables in B1.
+type-mapping lookup arrive with the recipe tables (deferred past this plan).
 
 Wire the data layer as `db.subtasks` in `src/db/db.ts`. Extend the existing 30-day
 cleanup so expired parent Task rows and their Subtasks are removed together (both
@@ -192,88 +192,113 @@ stays clean.
 - Invalid states and invalid JSON payloads are rejected before persistence.
 - Focused ingress and database tests pass.
 
-## Phase B: Database-backed Recipe Configuration and Managed Subagents — ⬜ not started
+## Phase B: Code-Owned Recipe Contracts and Managed Subagents — ✅ done
 
-### B1. Resolve Recipe configuration safely
+> **As decided — supersedes the original "Database-backed Recipe Configuration"
+> (user-approved, 2026-07-15).** The `recipes` / `subtask_type_recipes` tables are
+> deferred **again**, past this plan: Recipe administration is Out of Scope, so
+> nothing would ever write them, and production behavior is identical without
+> them — every Subtask type resolves to the code-owned `DEFAULT_RECIPE`. The same
+> "no writer, no table" rationale that moved the tables out of A4 applies to B1.
+> They land in a future phase together with a real admin writer;
+> `resolveRecipeForType` remains the seam. The model allowlist is deliberately
+> exactly the two config IDs — the only models proven with this pipeline.
 
-> **Updated by A4.** The original premise ("keep Recipes as data in the caller's
-> database") is superseded: the `default` Recipe is already a code constant
-> (`DEFAULT_RECIPE` in `src/agent/subtasks/recipe.ts`). B1 now **introduces** the
-> caller-local `recipes` and `subtask_type_recipes` tables (a new migration,
-> `m0002`) for _custom_ Recipes only, and extends the existing
-> `resolveRecipeForType(type)` to consult them before falling back to the code
-> default. Still no `src/recipes/` registry.
+### B1. Recipe execution contracts and code-owned validation — ✅ done
 
-Add the caller-local `recipes` and `subtask_type_recipes` tables and adapt the
-existing model and tool seams so a resolved Recipe configures an isolated subagent
-invocation. `recipes` has a unique key, enabled state, version, primary/fallback
-model IDs, soul, and `tool_families_json`; `subtask_type_recipes` maps one unique
-semantic Subtask type to a Recipe. Both are empty until a future admin surface
-writes them; resolution falls back to the code-owned `default` Recipe.
+Add the deferred A1 contracts Phase B consumes to `src/agent/subtasks/types.ts`:
 
-A Recipe (row or the code default) contains:
+- `DependencyResult`: `{ subtaskId, type, resultParts }` — generated output of one
+  completed prerequisite Subtask; `type` only labels the rendered section.
+- `RecipeExecutionRequest`: `{ taskId, subtaskId, recipe, prompt, references, dependencyResults }` — RPC-safe input for one isolated execution.
+- `RecipeExecutionResult`: terminal `completed` (≥1 non-empty text part) or
+  `failed` (diagnostic `error`), each with a diagnostic `modelId` (nullable on
+  `failed`; never persisted on the Subtask row).
 
-- Unique key, enabled state, and version.
-- Primary and fallback Workers AI model ID strings.
-- Dedicated stateless soul text.
-- A set of allowed tool-family keys.
+Add code-owned validation in `src/agent/subtasks/recipe.ts`:
 
-Parameterize `createModelPair` so it accepts the stored IDs. Code owns the supported model allowlist and independently substitutes the existing primary or fallback default when one stored ID is unsupported or unavailable. Recipe data never provides arbitrary bindings, tools, or secrets.
+- `SUBAGENT_MODEL_ALLOWLIST` — exactly `CHAT_MODEL_ID` and `CHAT_FALLBACK_MODEL_ID`.
+- `KNOWN_TOOL_FAMILIES` — `browser` only; `recall` and Session `set_context` are
+  structurally impossible (never in the map).
+- `validateRecipe(recipe)` — pure, returns a normalized copy: a non-allowlisted
+  model ID is substituted with its slot's config default independently per slot;
+  unknown tool families are dropped (deduped, order-preserving); a blank soul
+  falls back to `STATELESS_SUBAGENT_SOUL`; a disabled Recipe throws
+  `RecipeValidationError` (the child maps it to a terminal failed result).
 
-Add a code-owned tool-family resolver:
+Parameterize `createModelPair` (`src/agent/model.ts`) with optional
+`primaryModelId` / `fallbackModelId` (pre-validated — `validateRecipe` is the
+single validation owner); `primaryId()` / `fallbackId()` report the per-Recipe
+IDs. Add `buildRecipeTools(toolFamilies, browser?)` to `src/agent/tools.ts`,
+reusing `buildBrowserTools` and gating on binding presence. Recipe data never
+provides arbitrary bindings, tools, or secrets.
 
-- `browser` is initially recognized and enabled by the seeded `default` Recipe.
-- Unknown or removed families are ignored.
-- `recall` and Session `set_context` are never valid Recipe families.
+### B2. Add `RecipeSubagent` — ✅ done
 
-The parent resolves semantic type to an enabled Recipe only at execution start. The child receives the resolved, RPC-safe Recipe configuration and validates it defensively with the same code-owned model and tool rules.
+The `src/subagent/` module, exported from `src/index.ts` — required so
+`ctx.exports` can resolve the facet class by name. **No production wrangler
+changes**: no `durable_objects` binding, no `new_sqlite_classes` entry; facets
+are created beneath the bound `ReactiveAgent`.
 
-### B2. Add `RecipeSubagent`
+- `prompt.ts` — `renderSubagentPrompt(request)`: pure and deterministic. The
+  validated Recipe soul verbatim as the system prompt; a sectioned user message
+  (`# Task`, `# Conversation references` with `[ref N] (role):` verbatim
+  snapshots, `# Dependency results` explicitly labeled as generated output —
+  never conversation evidence); empty sections omitted. No summarizing,
+  rewriting, or interpolation; user-turn provenance is already inline in the
+  reference text.
+- `run.ts` — `runRecipeExecution(request, deps)`: the Session-less bounded loop
+  (`generateText`, `stopWhen: stepCountIs(MAX_STEPS)`, `maxRetries: 0`),
+  deliberately not extracted from the Session-coupled `runTurn`. An empty prompt
+  fails without inference; an attempt succeeds only on a non-empty, non-truncated
+  final text; primary → fallback on any failure; with both exhausted, a transient
+  fault (`isTransientAiError`) is rethrown for the Workflow step and everything
+  else returns a terminal `failed` result carrying both diagnostics.
+- `index.ts` — `RecipeSubagent extends Agent<Env>` with the single RPC
+  `execute(request)`. It never constructs a Session, never reads parent history
+  beyond the supplied references, never uses recall or durable memory, never
+  resolves a Recipe by type, and accepts no configuration beyond the parent's
+  resolved Recipe data (defensively re-validated with `validateRecipe`).
+  `subagentName(taskId, subtaskId)` → `subtask:<taskId>:<subtaskId>` is the
+  child-name convention shared with C3. A test-only `modelsOverride?: ModelPair`
+  field (never on the RPC stub) injects models for specs.
 
-Create `src/subagent/index.ts` with `RecipeSubagent extends Agent<Env>` and export it from `src/index.ts`.
+Subagent tool activity is observed through Cloudflare AI Gateway logging — the
+schema persists no step log.
 
-Its domain RPC `execute(request)` must:
+### B3. Make Subagent execution retry-safe — ✅ done
 
-1. Validate the already-resolved Recipe configuration.
-2. Build a fresh invocation with clearly separated sections:
+Persist exactly one terminal result in the managed child, keyed by a
+deterministic request fingerprint.
 
-- Resolved Recipe soul.
-- Main-agent instruction prompt.
-  - Conversation references rendered from the Subtask's `references` snapshots, each with a `[ref N]` label and its role. User-turn provenance is already inline in the reference text.
-- Generated dependency results, explicitly labeled as generated.
+- `fingerprint.ts` — `canonicalRequest` (identity fields rebuilt in fixed key
+  order; array order is semantic — the parent builds from ordinal-ordered rows)
+  and `fingerprintRequest` (SHA-256 hex via `crypto.subtle`) over the **raw**
+  request, so the key matches exactly what the parent re-sends on retry.
+- The cache is a single-row `execution_cache` table in the child's own SQLite
+  (`this.sql`; no drizzle in the child). Terminal results — completed **and**
+  failed — are cached and replayed with zero inference; transient faults throw
+  and cache nothing, so a Workflow retry re-runs inference by design.
+- A different request for the same child name throws with the
+  `FINGERPRINT_MISMATCH` message prefix (the cross-RPC contract — error classes
+  don't survive DO RPC). It signals a parent lifecycle bug: C3 must delete stale
+  children before starting a genuinely new execution.
+- `RecipeSubagent` is **not** in production `durable_objects.bindings` or
+  `new_sqlite_classes`. Facets work under the Workers Vitest pool with a
+  **test-only** miniflare DO binding (`RECIPE_SUBAGENT` in `vitest.config.ts`)
+  plus the test-local `test/env.d.ts` Env augmentation (picked up only by
+  `test/tsconfig.json`).
 
-3. Run the Recipe's bounded model/tool loop.
-4. Return terminal completed or failed output.
+### Phase B Exit Criteria — all met
 
-Render the Subtask's `references` snapshots directly from the row — they were captured at decomposition, so there is no live lookup, no null omission, and no compaction handling here. Reference rendering must not summarize, rewrite, interpolate, or present dependency output as user-authored evidence. Subagent tool activity is observed through Cloudflare AI Gateway logging — the schema persists no step log.
-
-The Subagent must never:
-
-- Construct a Session.
-- Read parent history beyond supplied references.
-- Use recall or durable memory.
-- Resolve a Recipe by semantic type or read the parent's Recipe catalog.
-- Accept arbitrary model, binding, or tool configuration beyond the parent's resolved Recipe data.
-
-### B3. Make Subagent execution retry-safe
-
-Persist only one temporary terminal result in the managed child, keyed by a deterministic request fingerprint.
-
-- A retry with the same fingerprint returns the cached result.
-- A different request for the same child name is rejected.
-- Primary-model failure falls back to the resolved, code-validated fallback model.
-- A valid exhausted Recipe error becomes a terminal failed result.
-- Genuine RPC/platform faults throw so the enclosing Workflow step can retry.
-
-Do not add `RecipeSubagent` to production `durable_objects.bindings` or `new_sqlite_classes`; Agents SDK facets are created beneath the bound `ReactiveAgent`. Add a test-only binding only if the Workers Vitest runtime requires it for `ctx.exports`.
-
-### Phase B Exit Criteria
-
-- Recipe capabilities are determined by validated caller-local configuration and code-owned model/tool allowlists.
-- The seeded `default` Recipe runs without Session or parent-memory access.
+- Recipe capabilities are determined by code-owned model/tool allowlists
+  (`validateRecipe` / `buildRecipeTools`).
+- The code-owned `default` Recipe runs without Session or parent-memory access.
 - Reference, prompt, and dependency sections remain distinguishable in tests.
-- Repeating the same execution does not repeat inference after a cached terminal result.
-- The Subagent can be created and deleted through the Agents SDK lifecycle.
+- Repeating the same execution does not repeat inference after a cached terminal
+  result — completed and failed alike.
+- The Subagent is created and deleted through the Agents SDK facet lifecycle;
+  deletion wipes its storage (`test/subagent/subagent.spec.ts`).
 
 ## Phase C: Main-Agent Decomposition and Composition — ⬜ not started
 
@@ -334,7 +359,7 @@ Add narrow RPC methods to `ReactiveAgent`:
 
 1. Return immediately when the parent already has a terminal Subtask result.
 2. Load successful dependency results separately from original references.
-3. Resolve the latest enabled Recipe mapping for the Subtask's semantic type, falling back to `default`, and atomically record its ID/version while marking the Subtask running.
+3. Resolve the Subtask's semantic type via the code-owned `resolveRecipeForType` (always the `default` Recipe today) and `validateRecipe`, and atomically record its ID/version while marking the Subtask running.
 4. Reset stale managed-child state when beginning a genuinely new execution.
 5. Create/get the child through `subAgent(RecipeSubagent, name)`.
 6. Invoke the child.
@@ -485,22 +510,20 @@ Add or extend:
   - Missing/self/cyclic dependency rejection.
   - Failed-node skip propagation.
   - Cancellation.
-- `test/db/recipes.spec.ts`
-  - Per-caller migration seed and unique `default` Recipe.
-  - Semantic-type mapping and default fallback.
-  - Execution-time Recipe ID/version recording.
-  - Model allowlist and independent fallback behavior.
-  - Tool-family resolution, including ignored unknown families and excluded recall/context tools.
-- `test/subagent/subagent.spec.ts`
-  - Fresh stateless prompts.
-  - Exact reference rendering from row snapshots.
-  - Role preservation (user-turn provenance inline in the text).
-  - Separate dependency results.
-  - No reference mutation.
-  - Primary/fallback behavior.
+- `test/agent/subtasks/recipe.spec.ts` — ✅ B
+  - Default-Recipe/config drift guard and code-only type resolution.
+  - Model allowlist and independent per-slot substitution.
+  - Tool-family filtering, including ignored unknown families and excluded recall/context tools.
+  - Blank-soul fallback and disabled-Recipe rejection.
+- `test/subagent/{prompt,fingerprint,run,subagent}.spec.ts` — ✅ B
+  - Fresh stateless prompts (soul as system; sectioned user message).
+  - Exact reference rendering from row snapshots; role preservation (user-turn provenance inline in the text); no reference mutation.
+  - Separate, explicitly-generated dependency results.
+  - Fingerprint determinism and single-field sensitivity.
+  - Primary/fallback behavior and the transient-vs-deterministic split.
   - Required text result part.
-  - Terminal cache reuse and fingerprint mismatch rejection.
-  - Managed-child deletion and storage cleanup.
+  - Terminal cache reuse (completed and failed) and fingerprint mismatch rejection.
+  - Managed-child deletion and storage cleanup (fresh cache after re-create).
 - `test/agent/`
   - Ephemeral catalog numbering (eligible turns only; compaction summaries excluded).
   - Structured decomposition.
@@ -523,7 +546,7 @@ Add or extend:
   - User-turn text crossing executor to Workflow.
   - Unchanged immediate submitted Task contract.
 
-Where facet support permits, add a real integration assertion that `ReactiveAgent.listSubAgents(RecipeSubagent)` is empty after success, failure, cancellation, and replay. If Workers Vitest requires a test-only binding for `ctx.exports`, configure it without adding a production migration.
+Facet support under Workers Vitest is proven (Phase B): the test-only `RECIPE_SUBAGENT` miniflare binding in `vitest.config.ts` (no production migration) makes `ctx.exports` facet-compatible, and `test/subagent/subagent.spec.ts` already asserts the create/list/delete lifecycle. E1 extends this with the workflow-level assertion that `ReactiveAgent.listSubAgents(RecipeSubagent)` is empty after success, failure, cancellation, and replay.
 
 ### E2. Documentation
 
@@ -539,7 +562,7 @@ Document:
 - Parent/managed-child ownership.
 - Subtask contract and status lifecycle.
 - Ephemeral decomposition-time reference catalog and verbatim snapshotting onto Subtasks.
-- Caller-local Recipe configuration, semantic-type mapping, execution-time resolution, and code-owned validation boundary.
+- Code-owned Recipe configuration and validation boundary (model allowlist, tool families), semantic-type resolution, and execution-time Recipe recording.
 - DAG scheduling semantics.
 - Child retry cache and deletion lifecycle.
 - Failure and cancellation behavior.
@@ -566,7 +589,7 @@ Also scan the repository for stale one-step Workflow documentation and verify th
 Land the work in this order so each phase leaves a coherent, testable repository:
 
 1. Contracts, text-only ingress, reference catalog, schema, and database model.
-2. Caller-local Recipe configuration, model/tool validation, and stateless managed Subagent.
+2. Code-owned Recipe contracts, model/tool validation, and the stateless managed Subagent.
 3. Main-agent decomposition and exact reference resolution.
 4. Parent-owned execution lifecycle and DAG scheduler.
 5. Composition and A2A completed/failed builders.
@@ -577,6 +600,7 @@ Land the work in this order so each phase leaves a coherent, testable repository
 
 - Recipe administration APIs or UI.
 - Runtime mutation endpoints for creating, deleting, or fine-tuning Recipes or their semantic-type associations.
+- Caller-local `recipes` / `subtask_type_recipes` tables and DB-backed semantic-type mapping — deferred until a Recipe admin surface (a real writer) exists; `resolveRecipeForType` is the seam.
 - Authorization policy for future domain-specific tools.
 - Cross-parent or shared Subagents.
 - Human approval Workflow events.

@@ -22,16 +22,6 @@ function workersai() {
   }));
 }
 
-/** The model used by the agent tool loop. */
-export function chatModel(): LanguageModel {
-  return workersai()(CHAT_MODEL_ID);
-}
-
-/** Fallback model used when the primary model is over capacity or errors. */
-export function fallbackChatModel(): LanguageModel {
-  return workersai()(CHAT_FALLBACK_MODEL_ID);
-}
-
 /**
  * Embed a batch of texts for episodic recall. Uses the same Workers-AI + AI
  * Gateway path as the chat models so embeddings get the same gateway
@@ -54,6 +44,16 @@ export async function embedTexts(texts: string[]): Promise<number[][]> {
 export interface ModelOverrides {
   model?: LanguageModel; // test override for the primary
   fallbackModel?: LanguageModel; // test override for the fallback
+  /**
+   * Workers-AI id for the primary slot (a Recipe's, already code-validated
+   * against the allowlist by `validateRecipe`). Defaults to `CHAT_MODEL_ID`.
+   */
+  primaryModelId?: string;
+  /**
+   * Workers-AI id for the fallback slot (already code-validated). Defaults to
+   * `CHAT_FALLBACK_MODEL_ID`.
+   */
+  fallbackModelId?: string;
 }
 
 /** The primary/fallback models (lazily memoized) plus their ids for logging. */
@@ -64,16 +64,22 @@ export interface ModelPair {
   fallbackId: () => string;
 }
 
-/** Lazily build + memoize the primary/fallback model pair (overridable in tests). */
+/**
+ * Lazily build + memoize the primary/fallback model pair (overridable in
+ * tests, id-parameterized for Recipes). No allowlisting happens here —
+ * `validateRecipe` is the single validation owner for Recipe-supplied ids.
+ */
 export function createModelPair(overrides: ModelOverrides = {}): ModelPair {
+  const primaryId = overrides.primaryModelId ?? CHAT_MODEL_ID;
+  const fallbackId = overrides.fallbackModelId ?? CHAT_FALLBACK_MODEL_ID;
   let primary: LanguageModel | undefined;
   let fallback: LanguageModel | undefined;
   return {
-    primary: () => (primary ??= overrides.model ?? chatModel()),
+    primary: () => (primary ??= overrides.model ?? workersai()(primaryId)),
     fallback: () =>
       (fallback ??=
-        overrides.fallbackModel ?? overrides.model ?? fallbackChatModel()),
-    primaryId: () => CHAT_MODEL_ID,
-    fallbackId: () => CHAT_FALLBACK_MODEL_ID
+        overrides.fallbackModel ?? overrides.model ?? workersai()(fallbackId)),
+    primaryId: () => primaryId,
+    fallbackId: () => fallbackId
   };
 }

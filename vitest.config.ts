@@ -54,7 +54,18 @@ export default defineConfig({
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
       remoteBindings: false,
-      miniflare: { fetchMock }
+      miniflare: {
+        fetchMock,
+        // Test-only Durable Object binding for the RecipeSubagent facet class.
+        // In production it needs NO binding and NO new_sqlite_classes entry —
+        // facet storage is created beneath the bound ReactiveAgent — but the
+        // Vitest pool only marks bound classes as DO classes, so without this
+        // `ctx.exports.RecipeSubagent` is not facet-compatible and `subAgent()`
+        // throws (see "Notes for testing" in node_modules/agents/docs/sub-agents.md).
+        durableObjects: {
+          RECIPE_SUBAGENT: { className: "RecipeSubagent", useSQLite: true }
+        }
+      }
     })
   ],
   test: {

@@ -19,6 +19,7 @@ import { A2AExecutor } from "./a2a/executor";
 import { DurableTaskStore } from "./a2a/task-store";
 
 export { ReactiveAgent } from "./reactive-agent";
+export { RecipeSubagent } from "./subagent";
 export { HandleTaskWorkflow } from "./workflows/handle-task";
 
 /**

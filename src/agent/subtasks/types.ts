@@ -43,8 +43,9 @@ export interface SubtaskDraft {
 /**
  * A fully-resolved Recipe configuration handed to a subagent invocation. Today
  * this is always the code-owned `DEFAULT_RECIPE` (see `agent/subtasks/recipe.ts`);
- * B1 adds caller-local DB rows that also map into this shape. Model ids and tool
- * families remain code-validated downstream.
+ * caller-local DB rows mapping into this shape are deferred until a Recipe
+ * admin surface exists. Model ids and tool families remain code-validated
+ * downstream (`validateRecipe`).
  */
 export interface ResolvedRecipe {
   key: string;
@@ -55,6 +56,46 @@ export interface ResolvedRecipe {
   toolFamilies: string[];
   enabled: boolean;
 }
+
+/**
+ * Generated output of one completed prerequisite Subtask, loaded by the parent
+ * from its durable row for a dependent's invocation. `type` is the
+ * prerequisite's semantic type — used only to label the rendered section;
+ * dependency output is always presented as generated, never as conversation
+ * evidence.
+ */
+export interface DependencyResult {
+  subtaskId: SubtaskId;
+  type: string;
+  resultParts: SubtaskResultPart[];
+}
+
+/**
+ * RPC-safe input for one isolated `RecipeSubagent` execution, assembled by the
+ * parent at execution start: the already-resolved (and code-validated) Recipe,
+ * the Subtask's non-session prompt, its verbatim reference snapshots, and the
+ * generated results of its completed dependencies. The child re-validates the
+ * Recipe defensively but never resolves one itself.
+ */
+export interface RecipeExecutionRequest {
+  taskId: string;
+  subtaskId: SubtaskId;
+  recipe: ResolvedRecipe;
+  prompt: string;
+  references: SubtaskReference[];
+  dependencyResults: DependencyResult[];
+}
+
+/**
+ * Terminal outcome of one `RecipeSubagent` execution (RPC-safe). `modelId` is a
+ * diagnostic only — which model produced the outcome (null when validation
+ * failed before any model call); it is never persisted on the Subtask row.
+ * Transient platform faults are not results: they throw so the enclosing
+ * Workflow step can retry.
+ */
+export type RecipeExecutionResult =
+  | { status: "completed"; resultParts: SubtaskResultPart[]; modelId: string }
+  | { status: "failed"; error: string; modelId: string | null };
 
 /** Durable state owned by the main agent for one decomposed unit of work. */
 export interface Subtask {

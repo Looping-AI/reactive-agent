@@ -18,8 +18,8 @@ export const STATELESS_SUBAGENT_SOUL = [
 /**
  * The code-owned default Recipe. Model ids come from {@link file://../../config.ts}
  * so the default always reflects the current configuration — there is no DB seed
- * to go stale. Every Subtask type resolves here until B1 introduces caller-local
- * Recipe rows and type associations.
+ * to go stale. Every Subtask type resolves here until a future Recipe admin
+ * phase introduces caller-local Recipe rows and type associations.
  */
 export const DEFAULT_RECIPE: ResolvedRecipe = {
   key: "default",
@@ -32,10 +32,70 @@ export const DEFAULT_RECIPE: ResolvedRecipe = {
 };
 
 /**
- * Resolve a semantic Subtask type to its Recipe configuration. Code-only for now
- * (always the {@link DEFAULT_RECIPE}); this is the seam B1 extends to consult the
- * caller's `subtask_type_recipes`/`recipes` tables before falling back here.
+ * Resolve a semantic Subtask type to its Recipe configuration. Code-only
+ * (always the {@link DEFAULT_RECIPE}); this is the seam a future Recipe admin
+ * phase extends to consult caller-local `subtask_type_recipes`/`recipes` tables
+ * before falling back here.
  */
 export function resolveRecipeForType(_type: string): ResolvedRecipe {
   return DEFAULT_RECIPE;
+}
+
+/**
+ * The Workers-AI model ids a Recipe may select — exactly the ids configured in
+ * {@link file://../../config.ts}, the only models proven with this tool-loop
+ * pipeline. Extend deliberately, one validated model at a time.
+ */
+export const SUBAGENT_MODEL_ALLOWLIST: ReadonlySet<string> = new Set([
+  CHAT_MODEL_ID,
+  CHAT_FALLBACK_MODEL_ID
+]);
+
+/**
+ * The tool-family keys code recognizes for subagent Recipes. `recall` and the
+ * Session's `set_context` are never valid families — a subagent has no Session
+ * or durable memory to reach — and their absence here makes them structurally
+ * impossible to enable through Recipe data.
+ */
+export const KNOWN_TOOL_FAMILIES: ReadonlySet<string> = new Set(["browser"]);
+
+/**
+ * Thrown by {@link validateRecipe} for a disabled Recipe — a deterministic
+ * caller bug (the parent must only hand enabled Recipes to a subagent), so the
+ * child maps it to a terminal failed result rather than retrying.
+ */
+export class RecipeValidationError extends Error {}
+
+/**
+ * Code-owned defensive validation of an already-resolved Recipe. Returns a
+ * normalized copy (never mutates the input): a model id outside
+ * {@link SUBAGENT_MODEL_ALLOWLIST} is substituted with the config default for
+ * its slot — independently per slot — unknown tool families are dropped
+ * (deduped, order-preserving), and a blank soul falls back to
+ * {@link STATELESS_SUBAGENT_SOUL}. Applied by the parent when it resolves a
+ * Recipe and re-applied by the subagent on its inbound request, so Recipe data
+ * can never select arbitrary models or tools.
+ */
+export function validateRecipe(recipe: ResolvedRecipe): ResolvedRecipe {
+  if (!recipe.enabled) {
+    throw new RecipeValidationError(
+      `recipe "${recipe.key}" (v${recipe.version}) is disabled`
+    );
+  }
+  const soul =
+    recipe.soul.trim() === "" ? STATELESS_SUBAGENT_SOUL : recipe.soul;
+  const toolFamilies = [...new Set(recipe.toolFamilies)].filter((family) =>
+    KNOWN_TOOL_FAMILIES.has(family)
+  );
+  return {
+    ...recipe,
+    primaryModelId: SUBAGENT_MODEL_ALLOWLIST.has(recipe.primaryModelId)
+      ? recipe.primaryModelId
+      : CHAT_MODEL_ID,
+    fallbackModelId: SUBAGENT_MODEL_ALLOWLIST.has(recipe.fallbackModelId)
+      ? recipe.fallbackModelId
+      : CHAT_FALLBACK_MODEL_ID,
+    soul,
+    toolFamilies
+  };
 }
