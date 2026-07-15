@@ -25,6 +25,37 @@ export interface SubtaskResultPart {
   text: string;
 }
 
+/**
+ * Creation input for one Subtask, before it is persisted. `dependsOn` uses
+ * draft-local keys (not yet-unknown {@link SubtaskId}s); the data layer resolves
+ * them to SQLite-assigned ids when the decomposition is created. `ordinal` is
+ * derived from the draft's position in the decomposition array.
+ */
+export interface SubtaskDraft {
+  localKey: string;
+  type: string;
+  prompt: string;
+  references: SubtaskReference[];
+  /** Draft-local keys of prerequisite drafts. */
+  dependsOn: string[];
+}
+
+/**
+ * A fully-resolved Recipe configuration handed to a subagent invocation. Today
+ * this is always the code-owned `DEFAULT_RECIPE` (see `agent/subtasks/recipe.ts`);
+ * B1 adds caller-local DB rows that also map into this shape. Model ids and tool
+ * families remain code-validated downstream.
+ */
+export interface ResolvedRecipe {
+  key: string;
+  version: number;
+  primaryModelId: string;
+  fallbackModelId: string;
+  soul: string;
+  toolFamilies: string[];
+  enabled: boolean;
+}
+
 /** Durable state owned by the main agent for one decomposed unit of work. */
 export interface Subtask {
   id: SubtaskId;

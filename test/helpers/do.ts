@@ -31,3 +31,17 @@ export function withTasks<T>(
     return fn(tasks);
   });
 }
+
+/**
+ * Run `fn` inside a fresh DO instance with `AgentDB.subtasks` already wired up.
+ * Mirrors {@link withTasks} for the subtasks data layer.
+ */
+export function withSubtasks<T>(
+  label: string,
+  fn: (subtasks: AgentDB["subtasks"]) => T
+) {
+  return runInDurableObject(freshStub(label), (instance) => {
+    const { subtasks } = new AgentDB(doStorage(instance));
+    return fn(subtasks);
+  });
+}

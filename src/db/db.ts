@@ -6,6 +6,7 @@ import { migrate } from "drizzle-orm/durable-sqlite/migrator";
 import * as schema from "@/db/schema";
 import dbMigrations from "@/db/migrations";
 import { makeTasks } from "@/db/models/tasks";
+import { makeSubtasks } from "@/db/models/subtasks";
 
 export type DB = DrizzleSqliteDODatabase<typeof schema>;
 
@@ -26,6 +27,7 @@ export class AgentDB {
   private readonly db: DB;
   private readonly _ready: Promise<void>;
   private _tasks?: ReturnType<typeof makeTasks>;
+  private _subtasks?: ReturnType<typeof makeSubtasks>;
 
   constructor(storage: DurableObjectStorage) {
     this.db = drizzle(storage, { schema });
@@ -38,5 +40,9 @@ export class AgentDB {
 
   get tasks() {
     return (this._tasks ??= makeTasks(this.db));
+  }
+
+  get subtasks() {
+    return (this._subtasks ??= makeSubtasks(this.db));
   }
 }

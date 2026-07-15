@@ -84,12 +84,18 @@ export class ReactiveAgent extends Agent<Env> {
     }
   }
 
-  /** Cron handler: delete notify_tasks rows older than 30 days. Runs Sunday 01:00 UTC. */
+  /**
+   * Cron handler: delete notify_tasks and their Subtasks older than 30 days.
+   * Both are keyed on their own `created_at` (written in the same Task
+   * lifecycle), so a parent Task and its Subtasks age out together. Runs
+   * Sunday 01:00 UTC.
+   */
   async cleanupOldTasks(
     _payload: Record<string, never>,
     _schedule: Schedule
   ): Promise<void> {
     this.db.tasks.cleanup();
+    this.db.subtasks.cleanup();
   }
 
   private modelPair(): ModelPair {

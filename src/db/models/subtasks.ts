@@ -1,0 +1,269 @@
+import { and, eq, lt } from "drizzle-orm";
+import { z } from "zod";
+import { subtasks } from "@/db/schema";
+import type { DB } from "@/db/db";
+import type {
+  Subtask,
+  SubtaskDraft,
+  SubtaskId,
+  SubtaskReference,
+  SubtaskResultPart,
+  SubtaskStatus
+} from "@/agent/subtasks/types";
+
+/** Upper bound on Subtasks per parent Task (a Core Invariant of the plan). */
+const MAX_SUBTASKS = 8;
+
+const referenceSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  text: z.string()
+});
+
+const resultPartSchema = z.object({
+  kind: z.literal("text"),
+  text: z.string()
+});
+
+const referencesSchema = z.array(referenceSchema);
+const resultPartsSchema = z.array(resultPartSchema);
+const dependsOnSchema = z.array(z.number().int());
+
+type SubtaskRow = typeof subtasks.$inferSelect;
+
+/**
+ * Query methods for the `subtasks` table (durable decomposed units of work).
+ *
+ * Bound to a drizzle handle by {@link AgentDB} and reached as `db.subtasks.*`.
+ * durable-sqlite is synchronous; the multi-statement `createDecomposition` runs
+ * inside an explicit `db.transaction` (drizzle maps it to
+ * `storage.transactionSync`), so a mid-create failure rolls back every statement
+ * instead of leaving a partial DAG. Guarded transitions filter on the expected
+ * current `status`, so a disallowed transition matches no row and is a no-op.
+ */
+export function makeSubtasks(db: DB) {
+  const rowToSubtask = (row: SubtaskRow): Subtask => ({
+    id: row.id,
+    taskId: row.taskId,
+    ordinal: row.ordinal,
+    type: row.type,
+    recipeId: row.recipeId,
+    recipeVersion: row.recipeVersion,
+    prompt: row.prompt,
+    references: referencesSchema.parse(
+      JSON.parse(row.referencesJson)
+    ) as SubtaskReference[],
+    dependsOn: dependsOnSchema.parse(JSON.parse(row.dependsOnJson)),
+    status: row.status as SubtaskStatus,
+    resultParts:
+      row.resultPartsJson === null
+        ? null
+        : (resultPartsSchema.parse(
+            JSON.parse(row.resultPartsJson)
+          ) as SubtaskResultPart[]),
+    error: row.error,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    completedAt: row.completedAt
+  });
+
+  const list = (taskId: string): Subtask[] =>
+    db
+      .select()
+      .from(subtasks)
+      .where(eq(subtasks.taskId, taskId))
+      .orderBy(subtasks.ordinal)
+      .all()
+      .map(rowToSubtask);
+
+  /** Guarded status update: applies only from `from` status, returns whether it did. */
+  const transition = (
+    id: SubtaskId,
+    from: SubtaskStatus,
+    set: Partial<SubtaskRow>
+  ): boolean => {
+    const now = Date.now();
+    const updated = db
+      .update(subtasks)
+      .set({ ...set, updatedAt: now })
+      .where(and(eq(subtasks.id, id), eq(subtasks.status, from)))
+      .returning({ id: subtasks.id })
+      .all();
+    return updated.length > 0;
+  };
+
+  return {
+    /**
+     * Create a whole decomposition atomically: the entire check-validate-insert
+     * sequence runs in one synchronous `db.transaction`, so a failure anywhere
+     * rolls back every statement — no truncated subtask set, no nodes left with
+     * unwritten dependency edges. Idempotent on `taskId`: if this Task already
+     * has Subtasks, returns them unchanged (a Workflow-step retry must not
+     * duplicate work); the unique `(task_id, ordinal)` index is the schema-level
+     * backstop. Enforces the 1..8 bound, unique local keys, and resolvable
+     * non-self dependency edges, then resolves draft-local dependency keys to
+     * the SQLite-assigned {@link SubtaskId}s. Full cycle/edge DAG validation
+     * lives in the decomposition operation (C1); this is the storage guard.
+     */
+    createDecomposition(taskId: string, drafts: SubtaskDraft[]): Subtask[] {
+      return db.transaction(() => {
+        const existing = list(taskId);
+        if (existing.length > 0) return existing;
+
+        if (drafts.length < 1 || drafts.length > MAX_SUBTASKS) {
+          throw new Error(
+            `decomposition must have 1..${MAX_SUBTASKS} subtasks, got ${drafts.length}`
+          );
+        }
+
+        // Register every local key first, rejecting duplicates. This is its own
+        // pass because the dependency check below reads the complete key set: an
+        // edge may point forward to a draft defined later, so every key must be
+        // known before any edge is validated.
+        const keys = new Set<string>();
+        for (const d of drafts) {
+          if (keys.has(d.localKey)) {
+            throw new Error(`duplicate draft local key: ${d.localKey}`);
+          }
+          keys.add(d.localKey);
+        }
+
+        for (const d of drafts) {
+          for (const dep of d.dependsOn) {
+            // A subtask cannot depend on itself.
+            if (dep === d.localKey) {
+              throw new Error(`subtask ${d.localKey} depends on itself`);
+            }
+            // Every edge must resolve to a key in this decomposition.
+            if (!keys.has(dep)) {
+              throw new Error(
+                `subtask ${d.localKey} depends on unknown key: ${dep}`
+              );
+            }
+          }
+          // References must match the persisted shape before we serialize them.
+          referencesSchema.parse(d.references);
+        }
+
+        const now = Date.now();
+        const keyToId = new Map<string, SubtaskId>();
+
+        // Pass 1: insert nodes (deps empty for now) to assign ids.
+        drafts.forEach((d, ordinal) => {
+          const { id } = db
+            .insert(subtasks)
+            .values({
+              taskId,
+              ordinal,
+              type: d.type,
+              recipeId: null,
+              recipeVersion: null,
+              prompt: d.prompt,
+              referencesJson: JSON.stringify(d.references),
+              dependsOnJson: "[]",
+              status: "pending" satisfies SubtaskStatus,
+              resultPartsJson: null,
+              error: null,
+              createdAt: now,
+              updatedAt: now,
+              completedAt: null
+            })
+            .returning({ id: subtasks.id })
+            .get();
+          keyToId.set(d.localKey, id);
+        });
+
+        // Pass 2: rewrite dependency edges to real ids.
+        for (const d of drafts) {
+          if (d.dependsOn.length === 0) continue;
+          const ids = d.dependsOn.map((k) => keyToId.get(k) as SubtaskId);
+          db.update(subtasks)
+            .set({ dependsOnJson: JSON.stringify(ids) })
+            .where(eq(subtasks.id, keyToId.get(d.localKey) as SubtaskId))
+            .run();
+        }
+
+        return list(taskId);
+      });
+    },
+
+    /** Load one Subtask by id. */
+    get(id: SubtaskId): Subtask | null {
+      const row = db.select().from(subtasks).where(eq(subtasks.id, id)).get();
+      return row ? rowToSubtask(row) : null;
+    },
+
+    /** List a Task's Subtasks in ordinal order. */
+    list(taskId: string): Subtask[] {
+      return list(taskId);
+    },
+
+    /**
+     * Begin execution: guarded `pending -> running`, recording the resolved
+     * Recipe id/version after-the-fact. Returns false if the Subtask was not
+     * pending (already started, terminal, or unknown).
+     */
+    start(
+      id: SubtaskId,
+      recipe: { recipeId: string; recipeVersion: number }
+    ): boolean {
+      return transition(id, "pending", {
+        status: "running",
+        recipeId: recipe.recipeId,
+        recipeVersion: recipe.recipeVersion
+      });
+    },
+
+    /**
+     * Persist a successful terminal result: guarded `running -> completed`.
+     * Requires at least one non-empty text result part (a successful Recipe
+     * output invariant).
+     */
+    complete(id: SubtaskId, resultParts: SubtaskResultPart[]): boolean {
+      const parts = resultPartsSchema.parse(resultParts);
+      if (!parts.some((p) => p.text.trim().length > 0)) {
+        throw new Error("completed subtask requires a non-empty text part");
+      }
+      return transition(id, "running", {
+        status: "completed",
+        resultPartsJson: JSON.stringify(parts),
+        completedAt: Date.now()
+      });
+    },
+
+    /** Persist a failure: guarded `running -> failed` with a diagnostic message. */
+    fail(id: SubtaskId, error: string): boolean {
+      return transition(id, "running", {
+        status: "failed",
+        error,
+        completedAt: Date.now()
+      });
+    },
+
+    /** Skip a Subtask blocked by a failed/skipped dependency: guarded `pending -> skipped`. */
+    skip(id: SubtaskId): boolean {
+      return transition(id, "pending", { status: "skipped" });
+    },
+
+    /**
+     * Cancel every still-pending Subtask of a Task (parent cancellation).
+     * Running Subtasks are left alone — their late results are discarded by the
+     * caller, not transitioned here. Returns the number canceled.
+     */
+    cancelPending(taskId: string): number {
+      const now = Date.now();
+      const canceled = db
+        .update(subtasks)
+        .set({ status: "canceled", updatedAt: now })
+        .where(and(eq(subtasks.taskId, taskId), eq(subtasks.status, "pending")))
+        .returning({ id: subtasks.id })
+        .all();
+      return canceled.length;
+    },
+
+    /** Delete Subtasks older than 30 days (called by the weekly maintenance cron). */
+    cleanup(): void {
+      const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+      db.delete(subtasks).where(lt(subtasks.createdAt, cutoff)).run();
+    }
+  };
+}

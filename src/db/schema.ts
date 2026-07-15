@@ -1,4 +1,10 @@
-import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core";
+import {
+  sqliteTable,
+  text,
+  integer,
+  index,
+  uniqueIndex
+} from "drizzle-orm/sqlite-core";
 
 /**
  * Durable state for async A2A tasks (accept + notify lifecycle).
@@ -20,4 +26,45 @@ export const notifyTasks = sqliteTable(
     updatedAt: integer("updated_at").notNull()
   },
   (table) => [index("idx_notify_tasks_created_at").on(table.createdAt)]
+);
+
+/**
+ * Durable Subtasks: the 1–8 units a parent A2A Task is decomposed into.
+ *
+ * One row per Subtask, owned by the caller's `ReactiveAgent` DO SQLite. The
+ * integer primary key assigns a caller-local, monotonically increasing
+ * {@link file://../agent/subtasks/types.ts SubtaskId} (autoincrement, so ids are
+ * never reused after cleanup deletes rows). References, dependency edges, and
+ * result parts are stored as JSON text and parsed back into the `Subtask`
+ * contract by `src/db/models/subtasks.ts`. `recipe_id`/`recipe_version` are null
+ * until execution starts, then record the resolved Recipe after-the-fact.
+ */
+export const subtasks = sqliteTable(
+  "subtasks",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    taskId: text("task_id").notNull(),
+    ordinal: integer("ordinal").notNull(),
+    type: text("type").notNull(),
+    /** Resolved Recipe key, written only at execution start. */
+    recipeId: text("recipe_id"),
+    /** Resolved Recipe version, written only at execution start. */
+    recipeVersion: integer("recipe_version"),
+    prompt: text("prompt").notNull(),
+    /** JSON `SubtaskReference[]` — verbatim role+text snapshots from decomposition. */
+    referencesJson: text("references_json").notNull(),
+    /** JSON `SubtaskId[]` — resolved dependency edges. */
+    dependsOnJson: text("depends_on_json").notNull(),
+    status: text("status").notNull(),
+    /** JSON `SubtaskResultPart[]` — text-only terminal output; null until complete. */
+    resultPartsJson: text("result_parts_json"),
+    error: text("error"),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    completedAt: integer("completed_at")
+  },
+  (table) => [
+    uniqueIndex("idx_subtasks_task_ordinal").on(table.taskId, table.ordinal),
+    index("idx_subtasks_status").on(table.status)
+  ]
 );
