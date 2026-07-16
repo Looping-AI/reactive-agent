@@ -4,6 +4,7 @@ import { tool } from "ai";
 import type { LanguageModel, ToolSet } from "ai";
 import { runDecompose, renderDecompositionMessages } from "@/agent/decompose";
 import { createModelPair, type ModelPair } from "@/agent/model";
+import { MAX_SUBTASKS } from "@/config";
 import {
   decomposeReplyMessageId,
   deterministicSessionMessage,
@@ -186,6 +187,47 @@ describe("runDecompose — happy path", () => {
     expect(seen).toContain("Calling agent instance: Ada");
     expect(seen).toContain("Task decomposition");
     expect(seen).toContain("[ref 1] book me a flight");
+  });
+
+  /**
+   * The structured-output wiring: `Output.object()` must reach the provider as a
+   * JSON `responseFormat` **while tools are attached**, since that combination
+   * rides on every step of the decomposition loop.
+   *
+   * Boundary: this proves the AI SDK passes the schema through, and that
+   * `workers-ai-provider` will therefore see a `json` response format to map onto
+   * `response_format: { type: "json_schema" }`. It cannot prove the real
+   * Workers-AI models *honor* it — `MockLanguageModelV3` ignores `responseFormat`
+   * and returns scripted text regardless, and `env.AI` has no local mode. That
+   * remains unverified until a live run (see PLAN.md, Phase E known risks).
+   */
+  it("sends the decomposition schema as a json responseFormat alongside tools", async () => {
+    const capturing = mockModel({ text: proposal() });
+    const orig = capturing.doGenerate.bind(capturing);
+    let seen: Parameters<typeof orig>[0] | undefined;
+    capturing.doGenerate = async (options: Parameters<typeof orig>[0]) => {
+      seen ??= options;
+      return orig(options);
+    };
+    await run(capturing, { tools: ECHO_TOOL });
+
+    if (seen?.responseFormat?.type !== "json") {
+      throw new Error("expected a json responseFormat");
+    }
+    // The decomposition contract itself, not just "some JSON".
+    const schema = seen.responseFormat.schema;
+    expect(Object.keys(schema?.properties ?? {}).sort()).toEqual([
+      "reply",
+      "subtasks"
+    ]);
+    // The 1..8 bound the model is held to, mirroring MAX_SUBTASKS.
+    expect(schema?.properties?.subtasks).toMatchObject({
+      minItems: 1,
+      maxItems: MAX_SUBTASKS
+    });
+    // ...and the reasoning tools ride on the same call. This pairing is the
+    // untested-in-production risk, so assert it rather than the schema alone.
+    expect(seen.tools?.map((t) => t.name)).toContain("echo");
   });
 
   it("streams intermediate content while reasoning", async () => {

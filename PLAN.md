@@ -17,7 +17,14 @@ The caller-owned `ReactiveAgent` remains the durable main agent and owner of the
 Legend: ✅ done · 🚧 partial · ⬜ not started. Section headings below carry the same marker.
 
 - ✅ **A1** contracts · ✅ **A2** text ingress · ✅ **A3** reference catalog · ✅ **A4** durable Subtask storage
-- ✅ **Phase B** (code-owned Recipe validation + managed Subagents) · ✅ **Phase C** (decomposition + composition) · ✅ **Phase D** (Workflow DAG) · ⬜ **Phase E** (verification + docs)
+- ✅ **Phase B** (code-owned Recipe validation + managed Subagents) · ✅ **Phase C** (decomposition + composition) · ✅ **Phase D** (Workflow DAG) · ✅ **Phase E** (verification + docs)
+
+**This plan is complete.** Its durable design rationale now lives in
+`ARCHITECTURE.md` and `AGENTS.md`; what remains here is the historical record of
+how the phases were reasoned through, including the deletions (`converse`,
+`runTurn`, `loop.ts`) that the `## Status` and "As built" notes reference. Two
+characteristics were consciously left unverified — see **Phase E** and
+ARCHITECTURE.md → _Known risks_.
 
 A1's contracts landed incrementally with their consumers: the execution request/result shapes with Phase B, the decomposition and composition shapes with Phase C.
 
@@ -500,11 +507,16 @@ If no Subtask succeeds, produce a terminal parent failure instead of invoking co
 - Multi-Subtask partial success composes a useful final response.
 - Re-running any phase is safe: decomposition recovers its rows and reply with zero inference, execution recovers from the parent row or the child's cache, and composition returns its durable reply.
 
-> **Deferred to Phase E:** live Workers-AI behavior of a JSON `responseFormat`
-> riding alongside tools on every step. `Output.object` is proven against
-> `MockLanguageModelV3`, but the test suite is hermetic (`env.AI` has no local
-> mode), so the real model's structured-output compliance is unverified until a
-> live run.
+> **Deferred to Phase E → not closed (user-approved, 2026-07-16).** Live
+> Workers-AI behavior of a JSON `responseFormat` riding alongside tools on every
+> step. `Output.object` is proven against `MockLanguageModelV3`, and Phase E added
+> an assertion that the schema and the tools reach the model together — but the
+> suite is hermetic (`env.AI` has no local mode), so the real model's
+> structured-output _compliance_ stays unverified. A live run was judged not worth
+> the tunnel/gateway/paid-plan setup against watching the first production tasks.
+> Recorded as known risk #1 in ARCHITECTURE.md → _Known risks_; it is the
+> highest-risk unknown in this design, since both models ignoring the schema fails
+> **every** Task.
 
 ## Phase D: Workflow DAG and Terminal Delivery — ✅ done
 
@@ -567,10 +579,19 @@ dependsOn}`), which `skipBlockedSubtasks` now returns; `listSubtasks` still
 > looping until `done`: a `ready` wave always retires ≥1 active node, so exhausting
 > the budget means the same corruption `stuck` names.
 >
-> **Deferred to Phase E:** the default per-attempt step timeout is **10 minutes**
-> (with `retries: {limit: 5, delay: 10s, backoff: exponential}`); no `StepConfig`
-> is set anywhere. Whether a real `execute:<id>` — a subagent loop of up to
-> `MAX_STEPS: 8` with browser tools — fits inside it is unproven until a live run.
+> **Deferred to Phase E → not closed (user-approved, 2026-07-16).** The default
+> per-attempt step timeout is **10 minutes** (with `retries: {limit: 5, delay: 10s,
+backoff: exponential}`); no `StepConfig` is set anywhere. Whether a real
+> `execute:<id>` fits inside it is unproven — and Phase E sharpened the arithmetic:
+> the loop is up to **16** model steps, not 8 (`MAX_STEPS` on the primary, then
+> again on the fallback), each potentially making a Browser Rendering call. A
+> timeout is also the one failure mode that caches **nothing**, so all 5 retries
+> re-run the whole loop (~1h before the branch fails). Left as-is deliberately:
+> picking timeout numbers with no measured step latencies is the speculative config
+> this plan has rejected throughout, and the behavior is _bounded_ — the branch
+> fails and composition still discloses the gap, so it is a latency/cost
+> characteristic, not a correctness hole. Recorded as known risk #2 in
+> ARCHITECTURE.md → _Known risks_; revisit with production evidence.
 
 ### D1. Refactor `HandleTaskWorkflow`
 
@@ -667,20 +688,68 @@ On cancellation:
 > a large reference snapshot. Every phase recovers from the durable rows and the
 > Session rather than from Workflow state.
 
-## Phase E: Verification and Documentation — ⬜ not started
+## Phase E: Verification and Documentation — ✅ done
 
-### E1. Focused tests
+> **As built (user-approved, 2026-07-16).** Four decisions were settled during
+> planning and are reflected below:
+>
+> 1. **E1's list was a specification of what was already built, not a to-do.** An
+>    audit found 28 spec files / ~340 cases, with every file E1 named already
+>    present and covering its bullets (`inbound.spec.ts` 5/5 · `db/subtasks.spec.ts`
+>    27 cases over all 5 · `index.spec.ts` + `executor.spec.ts` both). Each phase
+>    had landed its own tests, so E1 reduced to closing two genuine gaps.
+> 2. **The workflow-level facet promise is dropped as unachievable** — see E1 below.
+> 3. **No live run; both deferrals become documented risks.** The structured-output
+>    and step-timing questions are unanswerable by a hermetic suite. Rather than
+>    build a tunnel/gateway smoke path or pick timeout numbers with no measurement
+>    behind them, both are recorded in ARCHITECTURE.md → _Known risks_ with the
+>    production signal to watch. Phase E therefore changed **no `src/` runtime
+>    behavior**: it is tests, docs, and one stale comment.
+> 4. **Durable rationale migrated out of this plan.** The "why" that outlives the
+>    refactor — single-node bypass, degrade-rather-than-discard, projections not
+>    rows, the `pending -> running` claim deciding child deletion, the fingerprint
+>    cache contract, `appendMessage` id-dedupe — now lives in ARCHITECTURE.md, where
+>    maintainers look. This plan stays as the historical record.
+
+### E1. Focused tests — ✅ done
+
+> **As built.** The listed coverage already existed (see note 1 above). Two real
+> gaps were closed, and one promise was withdrawn:
+>
+> - **Added** (`test/agent/decompose.spec.ts`): `responseFormat` was asserted
+>   **nowhere** in the repo — `mock-model.ts` ignores it and the spec's existing
+>   `doGenerate` intercept only checked `options.prompt`. One case now asserts the
+>   decomposition schema (including the 1..8 `MAX_SUBTASKS` bound) reaches the model
+>   as a `json` responseFormat **on a call that also carries tools** — that pairing
+>   being the risk. Mutation-checked: removing `Output.object` from `decompose.ts`
+>   fails it. This is the only guard on known risk #1.
+> - **Fixed** (`vitest.config.ts`): the comment documenting the sync-throw
+>   error-injection pattern pointed at `test/agent/loop.spec.ts`, deleted in Phase D.
+>   Re-anchored to `decompose.spec.ts` / `subagent/run.spec.ts`. The technique is
+>   still required; only the pointer was dead.
+> - **Dropped:** _"E1 extends this to the workflow level: empty after success,
+>   failure, cancellation, and replay."_ **Structurally impossible hermetically.**
+>   `handle-task.spec.ts` fakes the DO, so no facets exist there to list.
+>   `subtasks-rpc.spec.ts` drives a real facet only down the _failure_ path — and
+>   only because `env.AI` has no local mode, so the child exhausts both models. A
+>   real facet cannot **succeed** without a real model: `modelsOverride` is a field,
+>   so it never crosses the RPC stub when the parent calls `subAgent()`. There is no
+>   seam to inject a mock into a parent-created child. Facet cleanup is already
+>   proven where it lives: the real-failure path, `deleteSubAgent` spies with
+>   `mock.invocationCallOrder` for success/cancellation/retry ordering, and
+>   `test/subagent/subagent.spec.ts` for create/list/delete + storage wipe. Do not
+>   re-attempt this without a live-model harness.
 
 Add or extend:
 
-- `test/a2a/inbound.spec.ts`
+- `test/a2a/inbound.spec.ts` — ✅ A2
   - Text extraction and trimming.
   - Empty-text rejection.
   - UTF-8 size-bound rejection.
-- `test/db/subtasks.spec.ts`
-  - Migration and schema.
-  - Idempotent decomposition creation.
-  - Ordering and transitions.
+- `test/db/subtasks.spec.ts` — ✅ A4
+  - Migration and schema (incl. the unique `(task_id, ordinal)` backstop).
+  - Idempotent decomposition creation; whole-create rollback on a mid-create fault.
+  - Ordering and guarded transitions.
   - Result/error persistence.
   - Cancellation and cleanup.
 - `test/agent/subtasks/scheduler.spec.ts` — ✅ D
@@ -710,8 +779,10 @@ Add or extend:
   - Ascending/unique/unknown index validation.
   - Invalid DAG rejection (duplicate keys; unknown/duplicate/self/cyclic edges; 2- and 3-node cycles); diamond accepted.
   - Schema bounds (1..8) and blank-field rejection.
-- `test/agent/{decompose,compose}.spec.ts` — ✅ C
+- `test/agent/{decompose,compose}.spec.ts` — ✅ C · ✅ E (`responseFormat`)
   - Structured decomposition end-to-end; `[ref N]` marking of eligible turns only, with compaction summaries present but unmarked.
+  - The decomposition schema (incl. the 1..8 bound) reaches the model as a `json`
+    `responseFormat` **alongside tools** — the hermetic half of known risk #1.
   - Session append semantics: deterministic ids, no duplicate user turn on re-run, first attempt's reply wins.
   - Decomposition failures (invalid output on both models ⇒ typed failure, no synthesized Subtask) and the transient-vs-deterministic split.
   - Single-result bypass and zero-success failure, both without inference.
@@ -735,17 +806,39 @@ Add or extend:
     canceled, nothing delivered), and after the DAG.
   - Replay against a durable step cache: no repeated inference, persistence, or
     delivery, and an identical step sequence.
-- `test/index.spec.ts`
+- `test/index.spec.ts` + `test/a2a/executor.spec.ts` — ✅ A2/D
   - User-turn text crossing executor to Workflow.
   - Unchanged immediate submitted Task contract.
 
-Facet support under Workers Vitest is proven (Phase B): the test-only `RECIPE_SUBAGENT` miniflare binding in `vitest.config.ts` (no production migration) makes `ctx.exports` facet-compatible, and `test/subagent/subagent.spec.ts` already asserts the create/list/delete lifecycle. Phase C added a parent-side real-facet case (`test/reactive-agent/subtasks-rpc.spec.ts`) proving `listSubAgents` is empty after a recorded failure. E1 extends this to the workflow level: empty after success, failure, cancellation, and replay.
+Facet support under Workers Vitest is proven (Phase B): the test-only `RECIPE_SUBAGENT` miniflare binding in `vitest.config.ts` (no production migration) makes `ctx.exports` facet-compatible, and `test/subagent/subagent.spec.ts` already asserts the create/list/delete lifecycle. Phase C added a parent-side real-facet case (`test/reactive-agent/subtasks-rpc.spec.ts`) proving `listSubAgents` is empty after a recorded failure — the **only** real-facet path a hermetic suite can drive, since the child reaches terminal failure precisely because `env.AI` has no local mode. E1 deliberately does **not** extend this to the workflow level (see the E1 note above).
 
 Phase C's DO-level specs establish two reusable patterns: `vi.spyOn(instance, "subAgent" | "deleteSubAgent")` inside `runInDurableObject` for the execution matrix (with `mock.invocationCallOrder` for ordering guarantees), and a **constructible** counting `ModelPair` — `getSession` builds its compaction summarizer from `primary()`, so a throwing factory would break session setup rather than prove a path ran no inference; counting `doGenerate` measures the actual promise.
 
-### E2. Documentation
+### E2. Documentation — ✅ done
 
-Update:
+> **As built.** `ARCHITECTURE.md` was the priority: it predated Phases B, C, and D
+> entirely (last touched 2026-07-12), and both `README.md` and `AGENTS.md` point
+> readers to it. It gained a **The task pipeline** section (the five phases, the
+> Subtask contract + lifecycle table, references/catalog, Recipes, subagent
+> lifecycle + retry safety, failure/cancellation), a **Durable state** section (the
+> `subtasks` table — previously documented nowhere but this plan — plus the inline
+> index rule and per-instance self-migration), a **Known risks** section, the
+> missing `BROWSER` binding with its paid-plan constraint, and a Files table
+> covering `agent/subtasks/`, `subagent/`, and the whole `src/db/` tree (omitted
+> since before this refactor).
+>
+> `AGENTS.md` had dead symbols in load-bearing tables — `converse`, `runTurn`,
+> `completeTask` (its last reference repo-wide), `loop.spec.ts` — and, worse, the
+> **wrong durable step names**, which are cache keys. It gained the real sequence,
+> the subtask modules, the `test/subagent/**` and workflow test tiers, and two new
+> non-negotiable constraints: references are snapshotted at decomposition and never
+> re-resolved; a managed child is deleted only after its result is durably copied.
+>
+> `README.md` was left setup-only by design — one sentence on the pipeline plus the
+> paid-plan warning for Browser Rendering, which affects anyone following "Run
+> locally" and was documented nowhere.
+
+Updated:
 
 - `ARCHITECTURE.md`
 - `AGENTS.md`
@@ -765,12 +858,12 @@ Document:
 
 Re-read `ARCHITECTURE.md` immediately before editing so concurrent user changes are preserved.
 
-### E3. Final validation
+### E3. Final validation — ✅ done
 
 Run:
 
 ```sh
-npx drizzle-kit generate
+npx drizzle-kit generate   # must be a no-op — a new migration means schema drift
 npm run types
 npm run check
 npm run test
@@ -778,6 +871,40 @@ git diff --check
 ```
 
 Also scan the repository for stale one-step Workflow documentation and verify that the test suite remains hermetic: no real AI, Browser Rendering, or network calls.
+
+> **As built.** `drizzle-kit generate` is asserted as a **no-op**: emitting a
+> migration would mean `schema.ts` drifted from the committed SQL, which is a
+> finding, not a file to commit. (Inline index declaration is what keeps it clean —
+> a standalone `index()` export makes the pinned drizzle-kit emit a phantom
+> `DROP INDEX`.)
+>
+> The stale-doc scan is
+> `grep -rn "converse\|runTurn\|loop\.ts\|completeTask" --include="*.md" .` (quote
+> the glob; unquoted zsh errors). It must hit **only** this file's history and the
+> vendored `.agents/skills/`. A "was `loop.ts`" parenthetical was removed from
+> AGENTS.md for exactly this reason — the rename is in git history, and leaving the
+> string behind would permanently poison the scan future audits depend on.
+>
+> Hermeticity needed no audit: it is guaranteed **by construction** —
+> `fetchMock.disableNetConnect()` makes any unmocked request throw, and models are
+> injected rather than module-mocked (zero `vi.mock` in the suite). The check is
+> that nothing new bypasses it.
+
+### Phase E Exit Criteria — all met
+
+- No doc names `converse`, `runTurn`, `completeTask`, `src/agent/loop.ts`, or
+  `test/agent/loop.spec.ts` outside this plan's history.
+- `ARCHITECTURE.md` and `AGENTS.md` carry the real durable step sequence, the real
+  RPC surface, the `subtasks` table, and the `BROWSER` binding + its paid-plan
+  constraint.
+- The five phases, Subtask lifecycle, Recipe validation boundary, DAG semantics,
+  child retry-cache/deletion lifecycle, and failure/cancellation behavior are
+  documented outside this plan.
+- Both unclosed deferrals are recorded as explicit known risks with the production
+  signal to watch.
+- `drizzle-kit generate` is a no-op; `npm run check`, `npm run test`, and
+  `git diff --check` pass.
+- The suite stays hermetic — no real AI, Browser Rendering, or network.
 
 ## Implementation Order
 

@@ -10,7 +10,10 @@ Replies are **asynchronous** (A2A push notifications): the agent accepts a turn
 immediately with a `submitted` task and delivers the answer later by POSTing the
 completed task to the gateway's `/a2a/notifications` webhook, authenticated with a
 callback JWT signed by the same card key. Generation + delivery run in a durable
-Cloudflare Workflow. See [ARCHITECTURE.md](ARCHITECTURE.md) → _Async task delivery_.
+Cloudflare Workflow, which decomposes each task into up to eight durable subtasks,
+runs the dependency-ready ones concurrently in isolated subagents, and composes
+their results into the reply. See [ARCHITECTURE.md](ARCHITECTURE.md) →
+_The task pipeline_ and _Async task delivery_.
 
 ## Getting Started
 
@@ -45,6 +48,11 @@ multiple entries for multi-worker setups or domain transitions.
 ```sh
 npm run dev
 ```
+
+> **Requires a paid Workers plan.** Subagents use **Browser Rendering** (the
+> `BROWSER` binding), which is not available on the free tier. Workers AI,
+> Browser Rendering, and Vectorize have no local mode either, so `wrangler dev`
+> reaches the real remote resources for all three.
 
 The gateway is deployed to production, so it needs a publicly reachable URL to call back into your local machine. You need a tunnel.
 

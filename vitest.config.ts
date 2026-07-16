@@ -27,11 +27,12 @@ process.env.GATEWAY_ORIGINS ??= JSON.stringify([GATEWAY_ORIGIN]);
 
 // The whole suite runs in the Workers runtime (workerd via miniflare) through a
 // single `cloudflareTest()` pool — including the agent-runtime specs under
-// `test/agent/**`, which drive `runTurn` against an injected mock model + a fake
-// `SessionLike`. Error-path tests inject failure by throwing synchronously from
-// the model factory (see test/agent/loop.spec.ts) rather than passing a model
-// whose `doGenerate` rejects into `generateText` — the latter leaks an unhandled
-// rejection through the AI SDK telemetry span that workerd flags as a failure.
+// `test/agent/**`, which drive the decompose/compose operations against an
+// injected mock model + a fake `SessionLike`. Error-path tests inject failure by
+// throwing synchronously from the model factory (see test/agent/decompose.spec.ts
+// and test/subagent/run.spec.ts) rather than passing a model whose `doGenerate`
+// rejects into `generateText` — the latter leaks an unhandled rejection through
+// the AI SDK telemetry span that workerd flags as a failure.
 //
 // The pool reads wrangler.jsonc directly (main, compat settings, the AI binding,
 // and the ReactiveAgent DO + its SQLite migration) so this config can't drift from
