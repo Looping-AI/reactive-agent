@@ -96,8 +96,9 @@ describe("normalizeGatewayOrigins", () => {
     ).resolves.toBeTruthy();
   });
 
-  it("rejects empty configured origins", () => {
+  it("rejects empty or invalid configured origins", () => {
     expect(() => normalizeGatewayOrigins([" "])).toThrow(GatewayAuthError);
+    expect(() => normalizeGatewayOrigins(["http://"])).toThrow(GatewayAuthError);
   });
 });
 
