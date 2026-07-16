@@ -28,6 +28,16 @@ export function workflowIdForMessage(messageId: string): string {
 }
 
 /**
+ * The one create failure that means "the retry already won": Workflows rejects a
+ * duplicate instance id with the `instance.already_exists` code, worded as
+ * `(instance.already_exists) ... already exists`. Kept narrow on purpose — the
+ * runtime also raises `instance.not_found` / "Instance does not exist", which a
+ * loose `/exist/i` would swallow, reporting a broken binding as an accepted turn
+ * and stranding the task in `submitted` with nothing to run it.
+ */
+const ALREADY_EXISTS = /already[\s_]exists/i;
+
+/**
  * A2A executor for the **async accept + notify** contract. On `message/send` it no
  * longer blocks on generation: it records a `submitted` Task in the caller's DO
  * (idempotent on `messageId`), hands the turn to a durable
@@ -96,7 +106,8 @@ export class A2AExecutor implements AgentExecutor {
         params
       });
     } catch (err) {
-      if (err instanceof Error && /exist/i.test(err.message)) return;
+      const message = err instanceof Error ? err.message : String(err);
+      if (ALREADY_EXISTS.test(message)) return;
       throw err;
     }
   }
