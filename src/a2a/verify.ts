@@ -83,10 +83,20 @@ export interface VerifyOptions {
  * with a trailing slash while keeping the verification allowlist exact.
  */
 export function normalizeGatewayOrigins(origins: string[]): string[] {
-  return origins.map(
-    (origin) =>
-      new URL(`https://${origin.trim().replace(/^https?:\/\//i, "")}`).origin
-  );
+  return origins.map((origin) => {
+    const trimmed = origin.trim();
+    if (!trimmed) {
+      throw new GatewayAuthError("allowed gateway origin cannot be empty");
+    }
+    try {
+      return new URL(`https://${trimmed.replace(/^https?:\/\//i, "")}`).origin;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new GatewayAuthError(
+        `invalid allowed gateway origin '${origin}': ${message}`
+      );
+    }
+  });
 }
 
 /**
