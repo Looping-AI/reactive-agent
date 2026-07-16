@@ -212,9 +212,19 @@ describe("RecipeSubagent facet lifecycle", () => {
       const result = await child.execute(makeRequest());
       expect(result.status).toBe("failed");
       expect(await child.execute(makeRequest())).toEqual(result);
-      await expect(
-        child.execute(makeRequest({ prompt: "A different task." }))
-      ).rejects.toThrow(FINGERPRINT_MISMATCH);
+
+      // Settle the RPC promise into a plain one before asserting. A stub call
+      // returns workerd's RpcPromise, whose property access is pipelined into
+      // further RPC calls — letting `expect().rejects` inspect it spawns
+      // pipelined promises that reject with no handler, which Vitest reports as
+      // an unhandled rejection and fails the run on.
+      const mismatch = await child
+        .execute(makeRequest({ prompt: "A different task." }))
+        .then(
+          () => undefined,
+          (err: unknown) => err
+        );
+      expect(String(mismatch)).toContain(FINGERPRINT_MISMATCH);
 
       expect(instance.hasSubAgent(RecipeSubagent, name)).toBe(true);
       expect(instance.listSubAgents(RecipeSubagent).map((s) => s.name)).toEqual(
