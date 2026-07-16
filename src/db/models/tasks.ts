@@ -91,16 +91,15 @@ export function makeTasks(db: DB) {
       upsert(task);
     },
 
-    /** Move a task to `working` (the workflow's first step). No-op if unknown. */
+    /**
+     * Move a task to `working` (the workflow's first step). No-op if unknown or
+     * not in `submitted` state. Rejects transitions from any terminal state
+     * (`canceled`, `completed`, `failed`) or from `working` itself.
+     */
     markWorking(taskId: string): void {
       const task = readOne(taskId);
-      if (!task) return;
+      if (!task || task.status.state !== "submitted") return;
       task.status = { ...task.status, state: "working", timestamp: nowIso() };
-      upsert(task);
-    },
-
-    /** Persist the terminal completed Task (the workflow's `complete` step). */
-    complete(task: Task): void {
       upsert(task);
     },
 

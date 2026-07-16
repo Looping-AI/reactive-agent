@@ -9,27 +9,31 @@ import { freshStub } from "../helpers/do";
  * ownership — everything `test/index.spec.ts`'s fake-DO test deliberately does NOT
  * exercise. That test unit-tests the outer Worker's own routing/identity forwarding
  * in isolation; this one integration-tests the DO's internals for real (real
- * SQLite-backed Session), driving a turn via the `converse(...)` native RPC method
- * and reading state directly with `runInDurableObject`. It doesn't care how a
- * caller got here, so no gateway JWT is involved.
+ * SQLite-backed Session), driving Phase 1 via the `decomposeTask(...)` native RPC
+ * method and reading state directly with `runInDurableObject`. It doesn't care how
+ * a caller got here, so no gateway JWT is involved.
+ *
+ * `env.AI.run()` throws "needs to be run remotely" immediately (no network), and
+ * that is not a transient fault, so decomposition exhausts both models and returns
+ * a typed `failed` — the same graceful path production takes when both models
+ * produce nothing usable, minus the model.
  */
 
-/** The verified caller a real Worker would pass to `converse`. */
+/** The verified caller a real Worker would pass to `decomposeTask`. */
 const IDENTITY = { key: "test:1:ada", name: "Ada", kind: "custom" };
-
-/** Drive one turn through the DO's public RPC method. */
-function converse(stub: ReturnType<typeof freshStub>, text: string) {
-  return stub.converse(text, IDENTITY);
-}
 
 describe("ReactiveAgent — Session persistence (real SQLite)", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it("persists the raw user turn before the (unavailable) model is called", async () => {
     const stub = freshStub("session");
-    // No working AI binding, so the turn takes its graceful error path and no
-    // assistant reply is appended — but the user turn is persisted first.
-    await converse(stub, "remember: my favorite color is teal");
+    // Decomposition appends the inbound turn first, then infers — so the turn is
+    // durable even though the model never answers and no reply is appended.
+    await stub.decomposeTask({
+      taskId: "t-session",
+      text: "remember: my favorite color is teal",
+      identity: IDENTITY
+    });
 
     const history = await runInDurableObject(stub, (instance) =>
       instance.getSession(IDENTITY).getHistory()
@@ -39,24 +43,29 @@ describe("ReactiveAgent — Session persistence (real SQLite)", () => {
     expect(sessionText(history[0])).toBe("remember: my favorite color is teal");
   });
 
-  it("accepts a push context without posting when the turn never emits intermediate content", async () => {
-    // With no AI binding the turn hits its error path (no tool-call steps), so
-    // streaming must post nothing — the push context must be harmless. (The
-    // streaming path itself is unit-covered by loop.spec's `onContent` and
-    // notify.spec's build/sign/post helpers.)
+  it("accepts a push context without posting when decomposition never succeeds", async () => {
+    // With no AI binding decomposition fails before any reply exists, so nothing
+    // may be posted — the push context must be harmless. (The streaming path
+    // itself is unit-covered by inference.spec's `onContent` and notify.spec's
+    // build/sign/post helpers.)
     const fetchSpy = vi.fn(async () => new Response("ok", { status: 200 }));
     vi.stubGlobal("fetch", fetchSpy);
 
     const stub = freshStub("push-ctx");
-    const reply = await stub.converse("hello", IDENTITY, {
+    const result = await stub.decomposeTask({
       taskId: "t-push",
-      contextId: "c-push",
-      pushUrl: "https://gateway.test/a2a/notifications",
-      pushToken: "tok",
-      jku: "https://agent.test/.well-known/jwks.json"
+      text: "hello",
+      identity: IDENTITY,
+      push: {
+        taskId: "t-push",
+        contextId: "c-push",
+        pushUrl: "https://gateway.test/a2a/notifications",
+        pushToken: "tok",
+        jku: "https://agent.test/.well-known/jwks.json"
+      }
     });
 
-    expect(typeof reply).toBe("string");
+    expect(result.status).toBe("failed");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
@@ -87,13 +96,13 @@ describe("ReactiveAgent — async task state (real SQLite)", () => {
     expect(retry.id).toBe("t-1");
   });
 
-  it("completeTask persists the terminal Task readable via getTask", async () => {
+  it("saveTask persists the terminal Task readable via getTask", async () => {
     const stub = freshStub("tasks-complete");
     await runInDurableObject(stub, (instance) =>
       instance.beginTask({ messageId: "m-2", taskId: "t-9", contextId: "c-2" })
     );
     await runInDurableObject(stub, (instance) =>
-      instance.completeTask({
+      instance.saveTask({
         kind: "task",
         id: "t-9",
         contextId: "c-2",

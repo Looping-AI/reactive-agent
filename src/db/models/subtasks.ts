@@ -1,4 +1,4 @@
-import { and, eq, lt } from "drizzle-orm";
+import { and, eq, inArray, lt } from "drizzle-orm";
 import { z } from "zod";
 import { subtasks } from "@/db/schema";
 import { MAX_SUBTASKS } from "@/config";
@@ -73,17 +73,18 @@ export function makeSubtasks(db: DB) {
       .all()
       .map(rowToSubtask);
 
-  /** Guarded status update: applies only from `from` status, returns whether it did. */
+  /** Guarded status update: applies only from a `from` status, returns whether it did. */
   const transition = (
     id: SubtaskId,
-    from: SubtaskStatus,
+    from: SubtaskStatus | SubtaskStatus[],
     set: Partial<SubtaskRow>
   ): boolean => {
     const now = Date.now();
+    const statuses = Array.isArray(from) ? from : [from];
     const updated = db
       .update(subtasks)
       .set({ ...set, updatedAt: now })
-      .where(and(eq(subtasks.id, id), eq(subtasks.status, from)))
+      .where(and(eq(subtasks.id, id), inArray(subtasks.status, statuses)))
       .returning({ id: subtasks.id })
       .all();
     return updated.length > 0;
@@ -228,9 +229,22 @@ export function makeSubtasks(db: DB) {
       });
     },
 
-    /** Persist a failure: guarded `running -> failed` with a diagnostic message. */
+    /**
+     * Persist a failure from either non-terminal status, with a diagnostic message.
+     *
+     * Both sides are reachable and both must land. A child's failed result arrives
+     * on a `running` row. The Workflow's last resort — `failSubtask`, once
+     * `execute:<id>` has exhausted every retry — can arrive on either:
+     * `executeSubtask` may throw before its `pending -> running` claim (a
+     * dependency-invariant fault) or after it (a transient child fault). Leaving
+     * either behind strands the row: a `pending` node re-enters the next wave
+     * forever, and a `running` node blocks its dependents, which {@link skip} only
+     * propagates past *failed* prerequisites.
+     *
+     * Returns false once the row is terminal — a late loser to the real result.
+     */
     fail(id: SubtaskId, error: string): boolean {
-      return transition(id, "running", {
+      return transition(id, ["running", "pending"], {
         status: "failed",
         error,
         completedAt: Date.now()

@@ -11,7 +11,7 @@ import {
  *
  * One row per task: written by the Worker's accept path (`beginTask`, keyed by
  * `message_id` for gateway-dedup) and mutated by the `HandleTaskWorkflow` via
- * DO RPC (`markWorking`, `completeTask`, `cancelTask`). `tasks/get` reads it
+ * DO RPC (`markWorking`, `saveTask`, `cancelTask`). `tasks/get` reads it
  * via `DurableTaskStore`. Table lives in the caller's DO SQLite (`this.ctx.storage`).
  */
 export const notifyTasks = sqliteTable(

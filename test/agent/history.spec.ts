@@ -1,11 +1,10 @@
 import { describe, it, expect } from "vitest";
 import type { SessionMessage } from "agents/experimental/memory/session";
 import {
-  assistantSessionMessage,
+  deterministicSessionMessage,
   parseTurn,
   sessionText,
-  toModelMessages,
-  userSessionMessage
+  toModelMessages
 } from "@/agent/history";
 
 describe("parseTurn", () => {
@@ -42,20 +41,6 @@ describe("parseTurn", () => {
 });
 
 describe("session message glue", () => {
-  it("builds a user session message with a text part and unique id", () => {
-    const a = userSessionMessage("hi");
-    const b = userSessionMessage("hi");
-    expect(a.role).toBe("user");
-    expect(sessionText(a)).toBe("hi");
-    expect(a.id).not.toBe(b.id);
-  });
-
-  it("builds an assistant session message", () => {
-    const m = assistantSessionMessage("reply");
-    expect(m.role).toBe("assistant");
-    expect(sessionText(m)).toBe("reply");
-  });
-
   it("concatenates multiple text parts in sessionText", () => {
     const m = {
       id: "x",
@@ -69,7 +54,10 @@ describe("session message glue", () => {
   });
 
   it("converts stored history to user/assistant model messages", () => {
-    const history = [userSessionMessage("q"), assistantSessionMessage("a")];
+    const history = [
+      deterministicSessionMessage("m-1", "user", "q"),
+      deterministicSessionMessage("m-2", "assistant", "a")
+    ];
     expect(toModelMessages(history)).toEqual([
       { role: "user", content: "q" },
       { role: "assistant", content: "a" }
@@ -79,7 +67,7 @@ describe("session message glue", () => {
   it("drops non-user/assistant roles when converting", () => {
     const history = [
       { id: "s", role: "system", parts: [{ type: "text", text: "sys" }] },
-      userSessionMessage("q")
+      deterministicSessionMessage("m-1", "user", "q")
     ] as unknown as SessionMessage[];
     expect(toModelMessages(history)).toEqual([{ role: "user", content: "q" }]);
   });

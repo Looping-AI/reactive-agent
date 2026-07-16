@@ -159,6 +159,24 @@ export interface CompositionBranch {
 export type ComposeTaskResult =
   { status: "completed"; reply: string } | { status: "failed"; error: string };
 
+/**
+ * The scheduler's view of one Subtask (Phase 2) — everything needed to pick the
+ * next dependency-ready wave, and nothing else.
+ *
+ * Deliberately excludes `prompt`, `references`, and `resultParts`: a Workflow
+ * step return is capped at 1 MiB, and a reference is a verbatim history snapshot
+ * bounded only by `MAX_INBOUND_TEXT_BYTES`, so a wave scan returning full rows
+ * would overflow on a large task. The durable rows — not Workflow state — are the
+ * source of truth, so the Workflow carries ids and statuses and re-reads the rest
+ * through the parent when it actually needs it.
+ */
+export interface SubtaskNode {
+  id: SubtaskId;
+  ordinal: number;
+  status: SubtaskStatus;
+  dependsOn: SubtaskId[];
+}
+
 /** Durable state owned by the main agent for one decomposed unit of work. */
 export interface Subtask {
   id: SubtaskId;

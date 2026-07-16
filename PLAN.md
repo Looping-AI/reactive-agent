@@ -17,11 +17,12 @@ The caller-owned `ReactiveAgent` remains the durable main agent and owner of the
 Legend: ✅ done · 🚧 partial · ⬜ not started. Section headings below carry the same marker.
 
 - ✅ **A1** contracts · ✅ **A2** text ingress · ✅ **A3** reference catalog · ✅ **A4** durable Subtask storage
-- ✅ **Phase B** (code-owned Recipe validation + managed Subagents) · ✅ **Phase C** (decomposition + composition) · ⬜ **Phase D** (Workflow DAG) · ⬜ **Phase E** (verification + docs)
+- ✅ **Phase B** (code-owned Recipe validation + managed Subagents) · ✅ **Phase C** (decomposition + composition) · ✅ **Phase D** (Workflow DAG) · ⬜ **Phase E** (verification + docs)
 
 A1's contracts landed incrementally with their consumers: the execution request/result shapes with Phase B, the decomposition and composition shapes with Phase C.
 
-Phase C left `src/workflows/handle-task.ts` untouched by design: `converse` remains the live path, and Phase D rewires the five phases onto the RPCs C landed (`decomposeTask`, `executeSubtask`, `listSubtasks`, `skipBlockedSubtasks`, `cancelPendingSubtasks`, `composeTask`).
+Phase D rewired `src/workflows/handle-task.ts` onto the RPCs C landed and deleted
+`converse` — the pipeline is now the only inference path in the repository.
 
 ## Core Invariants
 
@@ -505,7 +506,71 @@ If no Subtask succeeds, produce a terminal parent failure instead of invoking co
 > mode), so the real model's structured-output compliance is unverified until a
 > live run.
 
-## Phase D: Workflow DAG and Terminal Delivery — ⬜ not started
+## Phase D: Workflow DAG and Terminal Delivery — ✅ done
+
+> **As built (user-approved, 2026-07-16).** Six decisions were settled during
+> planning and are reflected below:
+>
+> 1. **Steps return projections, never rows.** A `step.do` return is capped at
+>    **1 MiB**, and the Cloudflare docs say to "store large structured data
+>    externally and return a reference". A `Subtask` carries verbatim reference
+>    snapshots bounded only by `MAX_INBOUND_TEXT_BYTES` (256 KB), so returning
+>    `Subtask[]` from a wave scan would overflow on a large task. This is the Core
+>    Invariant restated as a platform limit — the rows are the source of truth,
+>    "Workflow state is not". Hence `SubtaskNode` (`{id, ordinal, status,
+dependsOn}`), which `skipBlockedSubtasks` now returns; `listSubtasks` still
+>    returns full rows for tests/debugging. `decomposeTask`'s reply never crosses
+>    a step at all — the DO posts it as the `decompose` callback itself.
+> 2. **D1's Phase 3 text was stale and is not implemented as written.** "Directly
+>    return one successful Subtask's parts" and "fail the parent when no branch
+>    succeeded" both moved _inside_ `runCompose` in Phase C (single-node bypass;
+>    zero-success typed failure). The Workflow calls `composeTask` unconditionally
+>    and routes the result; re-implementing either would duplicate C.
+> 3. **The scheduler does not re-validate the DAG.** `createDecomposition` already
+>    rejects missing, self, and cyclic edges before a row exists, and all three
+>    manifest identically as _no progress possible_ — so `selectWave`'s single
+>    "active nodes but none ready" check subsumes them. Three detectors that can
+>    never fire would be untestable dead weight. It lives at
+>    `src/agent/subtasks/scheduler.ts` (not `src/subtasks/`), beside every other
+>    subtask module.
+> 4. **A branch that exhausts its step retries fails the branch, not the Task.**
+>    `executeSubtask` throws only on transient faults and lifecycle bugs, so a
+>    throw surviving all 5 retries means nobody is left to resolve that row. The
+>    Workflow catches it and runs a `fail:<id>` step (new `failSubtask` RPC →
+>    `db.subtasks.fail`), letting composition disclose the gap while sibling
+>    branches keep their durable work — Phase C's "degrade rather than discard"
+>    applied to Phase 2. `fail` is guarded from **either** non-terminal status
+>    because `executeSubtask` can throw on both sides of its `pending -> running`
+>    claim.
+> 5. **`converse` + `runTurn` are deleted.** Phase D orphaned them, so Phase D
+>    buried them, along with `TRANSIENT_REPLY`/`UNEXPECTED_REPLY` and
+>    `userSessionMessage`/`assistantSessionMessage` (random-id variants of
+>    `deterministicSessionMessage`; the `<turn>` wrapper is gateway-authored, so
+>    nothing was lost). `src/agent/loop.ts` kept no loop and became
+>    `src/agent/inference.ts` — `isTransientAiError` +
+>    `buildIntermediateContentHandler`, with `RunTurnArgs["onContent"]` replaced by
+>    a standalone `OnContent` type. `ReactiveAgent.completeTask` went too: it and
+>    `db.tasks.complete` were character-for-character duplicates of `saveTask` /
+>    `db.tasks.save`, and with a failed terminal state the real operation is
+>    "persist the terminal Task".
+> 6. **`db.tasks.markWorking` was unguarded — a real bug, now fixed.** A
+>    `tasks/cancel` landing between the executor's `begin` and the Workflow's first
+>    step would be silently overwritten back to `working`, after which the pipeline
+>    ran to completion and delivered a terminal callback for an already-canceled
+>    Task. The model now refuses to move a `canceled` row, and Phase 0 returns
+>    early.
+>
+> Two smaller things fell out of building it. The terminal Task is now built
+> **inside** the `complete` step and returned, so `notify` posts exactly what was
+> persisted — building it in the body re-stamped `new Date()` on every replay.
+> And the wave loop is bounded by `MAX_SUBTASKS + 1` iterations rather than
+> looping until `done`: a `ready` wave always retires ≥1 active node, so exhausting
+> the budget means the same corruption `stuck` names.
+>
+> **Deferred to Phase E:** the default per-attempt step timeout is **10 minutes**
+> (with `retries: {limit: 5, delay: 10s, backoff: exponential}`); no `StepConfig`
+> is set anywhere. Whether a real `execute:<id>` — a subagent loop of up to
+> `MAX_STEPS: 8` with browser tools — fits inside it is unproven until a live run.
 
 ### D1. Refactor `HandleTaskWorkflow`
 
@@ -527,7 +592,7 @@ Implement the existing phase markers in `src/workflows/handle-task.ts`.
 
 #### Phase 2: Execute Subtasks
 
-Add a pure scheduler in `src/subtasks/scheduler.ts`.
+Add a pure scheduler in `src/agent/subtasks/scheduler.ts` (see note 3 above).
 
 For each DAG wave:
 
@@ -590,13 +655,17 @@ On cancellation:
 - Discard late results from already-running model calls.
 - Do not send completed or failed terminal output after cancellation.
 
-### Phase D Exit Criteria
+### Phase D Exit Criteria — all met
 
 - The Workflow survives replay without duplicating decomposition, inference, persistence, or delivery effects.
 - Dependency-ready branches run concurrently and in dependency order.
 - Failed branches skip descendants while independent branches finish.
 - Canceled Tasks stop accruing new work.
 - Completed and failed terminal callbacks are signed and deterministic.
+
+> No step return carries a Subtask row, so the 1 MiB step cap cannot be reached by
+> a large reference snapshot. Every phase recovers from the durable rows and the
+> Session rather than from Workflow state.
 
 ## Phase E: Verification and Documentation — ⬜ not started
 
@@ -614,13 +683,13 @@ Add or extend:
   - Ordering and transitions.
   - Result/error persistence.
   - Cancellation and cleanup.
-- `test/subtasks/scheduler.spec.ts`
-  - Independent fan-out.
-  - Multiple dependencies and fan-in.
-  - Wave ordering.
-  - Missing/self/cyclic dependency rejection.
-  - Failed-node skip propagation.
-  - Cancellation.
+- `test/agent/subtasks/scheduler.spec.ts` — ✅ D
+  - Independent fan-out; multiple dependencies and fan-in; wave ordering.
+  - Ready ids ordinal-sorted (step names are cache keys — the traversal must be
+    deterministic).
+  - `running` treated as re-runnable, and not deadlocking its dependents.
+  - Missing/self/cyclic edges all reported as `stuck` by the one progress check —
+    including that a corrupt sub-graph never stalls a branch that can still run.
 - `test/agent/subtasks/recipe.spec.ts` — ✅ B
   - Default-Recipe/config drift guard and code-only type resolution.
   - Model allowlist and independent per-slot substitution.
@@ -653,14 +722,19 @@ Add or extend:
   - `executeSubtask` edge matrix: lifecycle ordering (reset → execute → persist → delete), fresh-vs-ambiguous retry, fingerprint-mismatch recreate, transient propagation, malformed-result handling, dependency-order and scheduler-invariant throws, cancellation discard via `cancelRunning`.
   - `skipBlockedSubtasks` chain/diamond fixpoint and independent-branch isolation.
   - Real-facet integration: terminal failure recorded, `listSubAgents` empty afterward.
-- `test/workflows/handle-task.spec.ts`
-  - All five phases.
-  - First working callback.
-  - Single-node bypass.
-  - Parallel waves and dependencies.
-  - Partial and total failure.
-  - Cancellation between waves.
-  - Deterministic terminal notification.
+- `test/workflows/handle-task.spec.ts` — ✅ D
+  - All five phases, asserted as the exact durable step-name sequence.
+  - Push context threaded into decomposition (which emits the first callback).
+  - Parallel waves (max in-flight), chains, and diamond fan-in.
+  - Failed-branch skip propagation with an independent branch still finishing.
+  - Retry exhaustion ⇒ `fail:<id>` ⇒ composition still runs.
+  - Decomposition failure and zero-success ⇒ signed `failed` callback carrying
+    user-safe text, with the diagnostic logged and absent from the body.
+  - A `stuck` DAG routed to failed delivery.
+  - Cancellation before decomposition (no resurrection), mid-DAG (pending
+    canceled, nothing delivered), and after the DAG.
+  - Replay against a durable step cache: no repeated inference, persistence, or
+    delivery, and an identical step sequence.
 - `test/index.spec.ts`
   - User-turn text crossing executor to Workflow.
   - Unchanged immediate submitted Task contract.

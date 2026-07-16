@@ -740,6 +740,57 @@ describe("composeTask", () => {
   });
 });
 
+describe("failSubtask", () => {
+  // The Workflow calls this only after `execute:<id>` exhausted every retry, so
+  // nobody else is left to resolve the row.
+  it("fails a running subtask and sweeps its managed child", async () => {
+    await runInDurableObject(freshStub("fail-running"), async (instance) => {
+      const { rows, db } = seed(instance, [draft()]);
+      db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
+      const del = vi
+        .spyOn(instance, "deleteSubAgent")
+        .mockResolvedValue(undefined);
+
+      await instance.failSubtask(rows[0].id, "retries exhausted");
+
+      const row = (await instance.listSubtasks(TASK_ID))[0];
+      expect(row.status).toBe("failed");
+      expect(row.error).toBe("retries exhausted");
+      expect(del).toHaveBeenCalledWith(
+        RecipeSubagent,
+        subagentName(TASK_ID, rows[0].id)
+      );
+    });
+  });
+
+  it("fails a subtask that threw before it was ever claimed", async () => {
+    await runInDurableObject(freshStub("fail-pending"), async (instance) => {
+      const { rows } = seed(instance, [draft()]);
+      vi.spyOn(instance, "deleteSubAgent").mockResolvedValue(undefined);
+
+      await instance.failSubtask(rows[0].id, "dependency invariant");
+
+      expect((await instance.listSubtasks(TASK_ID))[0].status).toBe("failed");
+    });
+  });
+
+  it("leaves a terminal result alone and never throws on an unknown id", async () => {
+    await runInDurableObject(freshStub("fail-terminal"), async (instance) => {
+      const { rows, db } = seed(instance, [draft()]);
+      db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
+      db.subtasks.complete(rows[0].id, [{ kind: "text", text: "done" }]);
+      vi.spyOn(instance, "deleteSubAgent").mockResolvedValue(undefined);
+
+      await instance.failSubtask(rows[0].id, "too late");
+      expect((await instance.listSubtasks(TASK_ID))[0].status).toBe(
+        "completed"
+      );
+
+      await expect(instance.failSubtask(9999, "who?")).resolves.toBeUndefined();
+    });
+  });
+});
+
 describe("executeSubtask — real facet integration", () => {
   it("records a terminal failure and leaves no child behind", async () => {
     await runInDurableObject(freshStub("exec-real"), async (instance) => {

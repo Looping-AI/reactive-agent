@@ -2,7 +2,11 @@ import type { LanguageModel, ModelMessage, ToolSet } from "ai";
 import { generateText, Output, stepCountIs } from "ai";
 import type { SessionMessage } from "agents/experimental/memory/session";
 import { MAX_STEPS, MAX_SUBTASKS } from "@/config";
-import { buildIntermediateContentHandler, isTransientAiError } from "./loop";
+import {
+  buildIntermediateContentHandler,
+  isTransientAiError,
+  type OnContent
+} from "./inference";
 import {
   decomposeReplyMessageId,
   deterministicSessionMessage,
@@ -25,13 +29,14 @@ import type { DecompositionProposal, SubtaskDraft } from "./subtasks/types";
  * Phase 1: turn one inbound task into a validated 1..8-node Subtask DAG plus the
  * first user-visible reply.
  *
- * Deliberately **not** an extension of {@link file://./loop.ts runTurn}: this has a
- * different output contract (structured, schema-validated), a different failure
- * contract (a typed failure fails the parent Task — it never resolves to a
- * friendly string), and different Session semantics (deterministic, replay-safe
- * message ids). It reuses what genuinely is shared: the model pair and manual
- * fallback shape, the tool set, the history conversion, and the intermediate
- * content handler.
+ * Deliberately **not** layered on a shared turn loop with {@link
+ * file://./compose.ts compose.ts}: this has a different output contract
+ * (structured, schema-validated), a different failure contract (a typed failure
+ * fails the parent Task — it never resolves to a friendly string), and different
+ * Session semantics (deterministic, replay-safe message ids). It reuses what
+ * genuinely is shared: the model pair and manual fallback shape, the tool set,
+ * the history conversion, and the intermediate content handler from
+ * {@link file://./inference.ts inference.ts}.
  *
  * The model reasons over the whole conversation but delegates by **catalog index
  * only** — see {@link renderDecompositionMessages}.
@@ -124,7 +129,7 @@ export interface RunDecomposeArgs {
   /** Primary + fallback model pair. */
   models: ModelPair;
   /** Streams intermediate content while the model reasons. Best-effort. */
-  onContent?: (text: string, stepIndex: number) => void | Promise<void>;
+  onContent?: OnContent;
 }
 
 /**

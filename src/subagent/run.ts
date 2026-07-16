@@ -1,7 +1,7 @@
 import type { ToolSet } from "ai";
 import { generateText, stepCountIs } from "ai";
 import { MAX_STEPS } from "@/config";
-import { isTransientAiError } from "@/agent/loop";
+import { isTransientAiError } from "@/agent/inference";
 import type { ModelPair } from "@/agent/model";
 import type {
   RecipeExecutionRequest,
@@ -64,8 +64,8 @@ async function runAttempt(
 /**
  * Run one Session-less recipe execution: render the sectioned invocation, run
  * the bounded model/tool loop on the primary model, fall back on any failure,
- * and return a terminal result. Unlike `runTurn` this loop has no Session —
- * nothing is appended anywhere; the caller owns persistence.
+ * and return a terminal result. Unlike the main agent's phases this loop has no
+ * Session — nothing is appended anywhere; the caller owns persistence.
  *
  * **Throws only on a transient platform fault** (Workers-AI capacity/timeout)
  * so the enclosing Workflow step retries. Every deterministic outcome —

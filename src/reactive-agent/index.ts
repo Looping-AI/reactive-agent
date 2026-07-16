@@ -15,7 +15,6 @@ import { createModelPair, embedTexts, type ModelPair } from "@/agent/model";
 import { callerContext, soulPrompt } from "@/agent/prompt";
 import { buildTools } from "@/agent/tools";
 import { archiveMessages } from "@/agent/recall";
-import { runTurn } from "@/agent/loop";
 import { runDecompose } from "@/agent/decompose";
 import { runCompose } from "@/agent/compose";
 import { decomposeReplyMessageId, sessionText } from "@/agent/history";
@@ -30,6 +29,7 @@ import type {
   RecipeExecutionResult,
   Subtask,
   SubtaskId,
+  SubtaskNode,
   SubtaskStatus
 } from "@/agent/subtasks/types";
 import { FINGERPRINT_MISMATCH, RecipeSubagent, subagentName } from "@/subagent";
@@ -59,11 +59,6 @@ export interface TurnPushContext {
   jku: string;
 }
 
-/** Reply the DO returns when an unexpected (non-transient) failure aborts a turn. */
-const UNEXPECTED_REPLY =
-  "Sorry, I hit an unexpected error handling that request. Please try again, " +
-  "and check the agent's logs if it keeps happening.";
-
 /**
  * Stand-in acknowledgement for the unreachable case where a Task's Subtasks are
  * durable but its decomposition reply is not in the Session (the reply is always
@@ -79,10 +74,11 @@ const RECOVERED_REPLY = "Working on your request.";
  * `this.sql`. All of a caller's turns (any channel/thread) accumulate into this
  * single conversation.
  *
- * The outer Worker reaches this DO with a single native Cloudflare RPC call —
- * `stub.converse(text, identity)` — not HTTP: the DO is a private implementation
- * detail of the Worker, never exposed over the network, so it needs no internal
- * A2A/JSON-RPC layer of its own.
+ * The {@link file://../workflows/handle-task.ts HandleTaskWorkflow} drives the
+ * five task phases here through native Cloudflare RPC (`decomposeTask`,
+ * `executeSubtask`, `composeTask`, …) — not HTTP: the DO is a private
+ * implementation detail of the Worker, never exposed over the network, so it
+ * needs no internal A2A/JSON-RPC layer of its own.
  *
  * History is compacted automatically once it grows past {@link COMPACT_AFTER_TOKENS}
  * (the Sessions `compactAfter` mechanism). (Phase 5 will also serve a self-generated
@@ -180,38 +176,6 @@ export class ReactiveAgent extends Agent<Env> {
       },
       this.env.BROWSER
     );
-  }
-
-  /**
-   * Answer one turn for this caller and return the reply text. Runs the
-   * Workers-AI tool loop over the continuous Session (append → generate →
-   * persist).
-   *
-   * The turn loop {@link runTurn} never throws — transient/unexpected failures
-   * resolve to a friendly reply — so this method rejects only on a genuine
-   * RPC/transport fault, keeping the Worker-side caller trivial.
-   *
-   * When `push` is supplied, intermediate assistant content (text emitted on a
-   * step that also makes tool calls) is streamed live to the gateway as `working`
-   * callbacks — best-effort, so a failed progress post never fails the turn. The
-   * returned string is the terminal reply, delivered separately as the durable
-   * `completed` callback by the workflow.
-   */
-  async converse(
-    text: string,
-    identity: GatewayIdentity,
-    push?: TurnPushContext
-  ): Promise<string> {
-    const session = this.getSession(identity);
-    return await runTurn({
-      session,
-      text,
-      systemSuffix: callerContext(identity),
-      tools: await this.mainAgentTools(session, identity),
-      models: this.modelPair(),
-      unexpectedReply: UNEXPECTED_REPLY,
-      onContent: push ? this.streamWorking(push) : undefined
-    });
   }
 
   /**
@@ -373,14 +337,18 @@ export class ReactiveAgent extends Agent<Env> {
 
   /**
    * Skip every pending Subtask blocked by a dependency that did not succeed, and
-   * return the refreshed DAG.
+   * return the refreshed DAG as scheduler {@link SubtaskNode}s.
    *
    * Runs to a fixpoint because skipping propagates: a node skipped for a failed
    * prerequisite blocks *its* dependents in turn. Bounded by the 8-Subtask
    * maximum. Independent branches are untouched — one branch's failure never
    * stops work that does not depend on it.
+   *
+   * Returns the **projection**, not the rows: this is the Workflow's per-wave
+   * scan, and its return crosses a `step.do` boundary capped at 1 MiB (see
+   * {@link SubtaskNode}). Use {@link listSubtasks} when the full rows are wanted.
    */
-  async skipBlockedSubtasks(taskId: string): Promise<Subtask[]> {
+  async skipBlockedSubtasks(taskId: string): Promise<SubtaskNode[]> {
     const blocked = new Set<SubtaskStatus>(["failed", "skipped", "canceled"]);
     for (;;) {
       const current = this.db.subtasks.list(taskId);
@@ -393,7 +361,7 @@ export class ReactiveAgent extends Agent<Env> {
             return parent !== undefined && blocked.has(parent.status);
           })
       );
-      if (next.length === 0) return current;
+      if (next.length === 0) return current.map(toSubtaskNode);
       for (const s of next) this.db.subtasks.skip(s.id);
     }
   }
@@ -401,6 +369,23 @@ export class ReactiveAgent extends Agent<Env> {
   /** Parent cancellation: cancel every still-pending Subtask. Returns the count. */
   async cancelPendingSubtasks(taskId: string): Promise<number> {
     return this.db.subtasks.cancelPending(taskId);
+  }
+
+  /**
+   * Force one branch terminal after the Workflow gave up on it: its
+   * `execute:<id>` step exhausted every retry, so `executeSubtask` will not be
+   * called again and no one else will resolve the row.
+   *
+   * The Workflow fails the *branch* rather than the Task so composition can
+   * disclose the gap while sibling branches keep their durable results. The
+   * managed child is swept best-effort — nothing will read its cache now.
+   * Idempotent: a no-op once the row is terminal.
+   */
+  async failSubtask(id: SubtaskId, error: string): Promise<void> {
+    const subtask = this.db.subtasks.get(id);
+    if (!subtask) return;
+    this.db.subtasks.fail(id, error);
+    await this.deleteChildQuietly(subagentName(subtask.taskId, id));
   }
 
   /**
@@ -687,13 +672,19 @@ export class ReactiveAgent extends Agent<Env> {
     this.db.tasks.markWorking(taskId);
   }
 
-  async completeTask(task: Task): Promise<void> {
-    this.db.tasks.complete(task);
-  }
-
   async cancelTask(taskId: string): Promise<PlainTask | null> {
     return this.db.tasks.cancel(taskId);
   }
+}
+
+/** Project a durable row to the scheduler's view. See {@link SubtaskNode}. */
+function toSubtaskNode(s: Subtask): SubtaskNode {
+  return {
+    id: s.id,
+    ordinal: s.ordinal,
+    status: s.status,
+    dependsOn: s.dependsOn
+  };
 }
 
 /**

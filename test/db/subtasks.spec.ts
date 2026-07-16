@@ -289,19 +289,6 @@ describe("subtasks transitions", () => {
     ).rejects.toThrow(/non-empty/);
   });
 
-  it("fail persists the error from running", async () => {
-    const row = await withSubtasks("fail", (s) => {
-      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
-      s.start(a.id, { recipeId: "default", recipeVersion: 1 });
-      s.fail(a.id, "model exhausted");
-      return s.get(a.id);
-    });
-
-    expect(row?.status).toBe("failed");
-    expect(row?.error).toBe("model exhausted");
-    expect(row?.completedAt).not.toBeNull();
-  });
-
   it("skip moves pending -> skipped", async () => {
     const row = await withSubtasks("skip", (s) => {
       const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
@@ -371,6 +358,46 @@ describe("subtasks transitions", () => {
 
     expect(applied).toBe(false);
     expect(status).toBe("completed");
+  });
+
+  it("fail persists the error from running", async () => {
+    const { applied, row } = await withSubtasks("fail-running", (s) => {
+      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      s.start(a.id, { recipeId: "default", recipeVersion: 1 });
+      const applied = s.fail(a.id, "retries exhausted");
+      return { applied, row: s.get(a.id) };
+    });
+
+    expect(applied).toBe(true);
+    expect(row?.status).toBe("failed");
+    expect(row?.error).toBe("retries exhausted");
+    expect(row?.completedAt).not.toBeNull();
+  });
+
+  it("fail lands on a subtask that threw before it was ever claimed", async () => {
+    const { applied, row } = await withSubtasks("fail-pending", (s) => {
+      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      const applied = s.fail(a.id, "never started");
+      return { applied, row: s.get(a.id) };
+    });
+
+    expect(applied).toBe(true);
+    expect(row?.status).toBe("failed");
+    expect(row?.error).toBe("never started");
+  });
+
+  it("fail cannot overwrite a terminal result", async () => {
+    const { applied, row } = await withSubtasks("fail-done", (s) => {
+      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      s.start(a.id, { recipeId: "default", recipeVersion: 1 });
+      s.complete(a.id, [{ kind: "text", text: "done" }]);
+      const applied = s.fail(a.id, "too late");
+      return { applied, row: s.get(a.id) };
+    });
+
+    expect(applied).toBe(false);
+    expect(row?.status).toBe("completed");
+    expect(row?.resultParts).toEqual([{ kind: "text", text: "done" }]);
   });
 });
 

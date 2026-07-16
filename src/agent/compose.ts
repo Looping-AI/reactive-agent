@@ -1,6 +1,6 @@
 import type { LanguageModel, ModelMessage } from "ai";
 import { generateText } from "ai";
-import { isTransientAiError } from "./loop";
+import { isTransientAiError } from "./inference";
 import {
   deterministicSessionMessage,
   finalReplyMessageId,

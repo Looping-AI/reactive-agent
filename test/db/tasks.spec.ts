@@ -115,13 +115,27 @@ describe("tasks.markWorking", () => {
       })
     ).resolves.not.toThrow();
   });
+
+  // `tasks/cancel` can land between the executor's `begin` and the workflow's
+  // first step. An unguarded write would resurrect the task and the pipeline
+  // would deliver a terminal callback for work the caller already canceled.
+  it("refuses to resurrect a canceled task", async () => {
+    const result = await withTasks("mark-working-canceled", (tasks) => {
+      tasks.begin({ messageId: "msg-4b", taskId: "t-4b", contextId: "ctx-4b" });
+      tasks.cancel("t-4b");
+      tasks.markWorking("t-4b");
+      return tasks.get("t-4b");
+    });
+
+    expect(result?.status.state).toBe("canceled");
+  });
 });
 
 // ---------------------------------------------------------------------------
-// complete
+// save (terminal persistence)
 // ---------------------------------------------------------------------------
 
-describe("tasks.complete", () => {
+describe("tasks.save", () => {
   it("persists the terminal completed Task with its reply message", async () => {
     const result = await withTasks("complete", (tasks) => {
       const task = tasks.begin({
@@ -129,7 +143,7 @@ describe("tasks.complete", () => {
         taskId: "t-5",
         contextId: "ctx-5"
       });
-      tasks.complete({
+      tasks.save({
         ...task,
         status: {
           state: "completed",

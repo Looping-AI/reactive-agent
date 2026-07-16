@@ -4,10 +4,12 @@ import type { Task } from "@a2a-js/sdk";
 import {
   buildSubmittedTask,
   buildCompletedTask,
+  buildFailedTask,
   buildWorkingTask,
   signCallbackJwt,
   postNotification,
-  NOTIFICATION_TOKEN_HEADER
+  NOTIFICATION_TOKEN_HEADER,
+  TASK_FAILED_TEXT
 } from "@/a2a/notify";
 import { TEST_AGENT_PRIVATE_JWK } from "../fixtures";
 
@@ -50,6 +52,32 @@ describe("buildCompletedTask", () => {
     const b = buildCompletedTask("task-1", "ctx-1", "the answer");
     expect(a.status.message?.messageId).toBe("task-1:final");
     expect(b.status.message?.messageId).toBe("task-1:final");
+  });
+});
+
+describe("buildFailedTask", () => {
+  it("is a failed Task carrying user-safe text in status.message", () => {
+    const task = buildFailedTask("task-1", "ctx-1", TASK_FAILED_TEXT);
+    expect(task.status.state).toBe("failed");
+    expect(task.status.message?.role).toBe("agent");
+    expect(task.status.message?.parts?.[0]).toMatchObject({
+      text: TASK_FAILED_TEXT
+    });
+  });
+
+  it("shares the deterministic ${taskId}:final messageId with the completed builder", () => {
+    // A Task terminates exactly once and the two states are mutually exclusive,
+    // so the delivery step only ever builds one of them — reusing the key keeps
+    // the gateway's dedupe correct across notify retries either way.
+    const failed = buildFailedTask("task-1", "ctx-1", "nope");
+    expect(failed.status.message?.messageId).toBe("task-1:final");
+    expect(failed.status.message?.messageId).toBe(
+      buildCompletedTask("task-1", "ctx-1", "yep").status.message?.messageId
+    );
+  });
+
+  it("never leaks an internal diagnostic into the default text", () => {
+    expect(TASK_FAILED_TEXT).not.toMatch(/model|subtask|branch|error:/i);
   });
 });
 

@@ -71,26 +71,6 @@ export function parseTurn(text: string): ParsedTurn | null {
   };
 }
 
-/** A user turn as a Sessions-store message (text persisted verbatim, `<turn>` and all). */
-export function userSessionMessage(text: string): SessionMessage {
-  return {
-    id: crypto.randomUUID(),
-    role: "user",
-    createdAt: new Date(),
-    parts: [{ type: "text", text }]
-  };
-}
-
-/** The assistant's final reply as a Sessions-store message. */
-export function assistantSessionMessage(text: string): SessionMessage {
-  return {
-    id: crypto.randomUUID(),
-    role: "assistant",
-    createdAt: new Date(),
-    parts: [{ type: "text", text }]
-  };
-}
-
 /**
  * Deterministic Session-message ids for the phased task pipeline.
  *
