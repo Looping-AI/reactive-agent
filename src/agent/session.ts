@@ -3,6 +3,7 @@ import { generateText } from "ai";
 import { Session } from "agents/experimental/memory/session";
 import type { SessionMessage } from "agents/experimental/memory/session";
 import { createCompactFunction } from "agents/experimental/memory/utils";
+import { sessionText } from "./history";
 
 /**
  * The one continuous {@link Session} an agent Durable Object owns. Ported from
@@ -29,10 +30,39 @@ export interface SessionLike {
     parentId?: string | null
   ): Promise<unknown> | unknown;
   getHistory(): Promise<SessionMessage[]>;
+  /**
+   * Read one message by id, or null. Reads the **raw stored row**, so it is
+   * unaffected by compaction overlays — a message folded into a summary is still
+   * readable here. That is what makes {@link appendOnce}'s read-back a reliable
+   * recovery path for a phase whose Workflow step re-ran.
+   */
+  getMessage(id: string): Promise<SessionMessage | null>;
   refreshSystemPrompt(): Promise<string>;
   tools(): Promise<ToolSet>;
   /** Compaction overlays so far — non-empty ⇒ an episodic archive exists. */
   getCompactions(): Promise<unknown[]>;
+}
+
+/**
+ * Append a message with a deterministic id exactly once, and return the text that
+ * is **durably stored** under that id.
+ *
+ * `Session.appendMessage` is already idempotent by id: appending an id that
+ * exists is a no-op. The read-back is what matters for a re-run phase — if the
+ * step crashed after appending and the retry re-inferred a *different* reply, the
+ * append no-ops and this returns the original, durable text. The Session and the
+ * value the caller goes on to deliver therefore never disagree.
+ *
+ * Falls back to the message's own text if the read-back returns null (it cannot,
+ * having just been appended) rather than failing a phase over a missing echo.
+ */
+export async function appendOnce(
+  session: SessionLike,
+  message: SessionMessage
+): Promise<string> {
+  await session.appendMessage(message);
+  const stored = await session.getMessage(message.id);
+  return stored ? sessionText(stored) : sessionText(message);
 }
 
 export interface AgentSessionOptions {

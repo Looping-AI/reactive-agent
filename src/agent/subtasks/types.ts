@@ -97,6 +97,68 @@ export type RecipeExecutionResult =
   | { status: "completed"; resultParts: SubtaskResultPart[]; modelId: string }
   | { status: "failed"; error: string; modelId: string | null };
 
+/**
+ * One Subtask as the decomposition model emits it. The model selects references
+ * by **catalog index only** — it never emits reference text, and application code
+ * snapshots the catalog entry's exact role+text onto the Subtask (see
+ * `agent/subtasks/decomposition.ts`). `dependsOn` uses draft-local keys, resolved
+ * to SQLite-assigned {@link SubtaskId}s by the data layer.
+ */
+export interface SubtaskProposal {
+  localKey: string;
+  type: string;
+  prompt: string;
+  /** 1-based indices into the ephemeral decomposition-time reference catalog. */
+  referenceIndexes: number[];
+  /** Draft-local keys of prerequisite proposals. */
+  dependsOn: string[];
+}
+
+/**
+ * The decomposition model's complete structured output (Phase 1): the first
+ * user-visible reply plus one through eight Subtask proposals. Validated against
+ * the ephemeral catalog before anything is persisted; invalid output fails the
+ * attempt (and, with both models exhausted, the parent Task) rather than being
+ * silently repaired.
+ */
+export interface DecompositionProposal {
+  reply: string;
+  subtasks: SubtaskProposal[];
+}
+
+/**
+ * Terminal outcome of Phase 1 (RPC-safe). `failed` means both models produced
+ * unusable output and the parent Task must fail — no Subtask is ever synthesized.
+ * Transient platform faults are not results: they throw so the enclosing Workflow
+ * step can retry (mirrors {@link RecipeExecutionResult}).
+ */
+export type DecomposeTaskResult =
+  | { status: "completed"; reply: string; subtasks: Subtask[] }
+  | { status: "failed"; error: string };
+
+/**
+ * One branch's outcome as composition (Phase 3) sees it — a plain, RPC-safe
+ * subset of the durable {@link Subtask} row, loaded in stable ordinal order.
+ * Completed, failed, and skipped branches are all included so the composed reply
+ * can use available successes and disclose relevant failures.
+ */
+export interface CompositionBranch {
+  subtaskId: SubtaskId;
+  ordinal: number;
+  type: string;
+  status: SubtaskStatus;
+  resultParts: SubtaskResultPart[] | null;
+  error: string | null;
+}
+
+/**
+ * Terminal outcome of Phase 3 (RPC-safe). `failed` means no branch succeeded —
+ * composition inference is never invoked in that case. Transient platform faults
+ * throw for the Workflow step to retry.
+ */
+export type ComposeTaskResult =
+  { status: "completed"; reply: string } | { status: "failed"; error: string };
+
 /** Durable state owned by the main agent for one decomposed unit of work. */
 export interface Subtask {
   id: SubtaskId;

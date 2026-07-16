@@ -2,11 +2,10 @@ import { describe, it, expect } from "vitest";
 import { z } from "zod";
 import { tool } from "ai";
 import type { LanguageModel, ToolSet } from "ai";
-import type { SessionMessage } from "agents/experimental/memory/session";
 import { runTurn, TRANSIENT_REPLY } from "@/agent/loop";
 import { createModelPair, type ModelPair } from "@/agent/model";
-import type { SessionLike } from "@/agent/session";
 import { sessionText } from "@/agent/history";
+import { FakeSession } from "../helpers/fake-session";
 import { mockModel } from "./mock-model";
 
 /** Minimal real tool used to exercise the multi-step tool-call loop. */
@@ -24,28 +23,6 @@ const CALLER_SUFFIX = "\n\nCalling agent instance: Ada.";
 /** Reply the DO returns on an unexpected (non-transient) failure — asserted by substring. */
 const UNEXPECTED_REPLY =
   "Sorry, I hit an unexpected error handling that request.";
-
-/** An in-memory SessionLike standing in for the DO's real continuous Session. */
-class FakeSession implements SessionLike {
-  messages: SessionMessage[] = [];
-  system = "SOUL BLOCK\n\n## memory\n(empty)";
-
-  appendMessage(m: SessionMessage) {
-    this.messages.push(m);
-  }
-  async getHistory() {
-    return this.messages;
-  }
-  async refreshSystemPrompt() {
-    return this.system;
-  }
-  async tools(): Promise<ToolSet> {
-    return {};
-  }
-  async getCompactions() {
-    return [] as unknown[];
-  }
-}
 
 function run(
   models: { model: LanguageModel; fallbackModel?: LanguageModel },

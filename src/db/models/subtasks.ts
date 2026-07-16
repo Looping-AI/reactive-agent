@@ -1,6 +1,7 @@
 import { and, eq, lt } from "drizzle-orm";
 import { z } from "zod";
 import { subtasks } from "@/db/schema";
+import { MAX_SUBTASKS } from "@/config";
 import type { DB } from "@/db/db";
 import type {
   Subtask,
@@ -10,9 +11,6 @@ import type {
   SubtaskResultPart,
   SubtaskStatus
 } from "@/agent/subtasks/types";
-
-/** Upper bound on Subtasks per parent Task (a Core Invariant of the plan). */
-const MAX_SUBTASKS = 8;
 
 const referenceSchema = z.object({
   role: z.enum(["user", "assistant"]),
@@ -245,9 +243,24 @@ export function makeSubtasks(db: DB) {
     },
 
     /**
+     * Discard a late result after parent cancellation: guarded
+     * `running -> canceled`. The parent calls this when a child returned a
+     * terminal result but the Task was canceled while it ran — the result is
+     * dropped, and this leaves the row in a truthful terminal state instead of a
+     * `running` that never resolves. Returns false if the Subtask was not running.
+     */
+    cancelRunning(id: SubtaskId): boolean {
+      return transition(id, "running", {
+        status: "canceled",
+        completedAt: Date.now()
+      });
+    },
+
+    /**
      * Cancel every still-pending Subtask of a Task (parent cancellation).
-     * Running Subtasks are left alone — their late results are discarded by the
-     * caller, not transitioned here. Returns the number canceled.
+     * Running Subtasks are left alone here — the parent transitions those with
+     * {@link cancelRunning} once their in-flight result comes back and is
+     * discarded. Returns the number canceled.
      */
     cancelPending(taskId: string): number {
       const now = Date.now();

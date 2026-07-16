@@ -329,6 +329,49 @@ describe("subtasks transitions", () => {
     expect(canceled).toBe(2);
     expect(states).toEqual(["running", "canceled", "canceled"]);
   });
+
+  it("cancelRunning transitions a running subtask whose late result was discarded", async () => {
+    const { applied, row } = await withSubtasks("cancel-running", (s) => {
+      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      s.start(a.id, { recipeId: "default", recipeVersion: 1 });
+      const applied = s.cancelRunning(a.id);
+      return { applied, row: s.get(a.id) };
+    });
+
+    expect(applied).toBe(true);
+    expect(row?.status).toBe("canceled");
+    expect(row?.completedAt).not.toBeNull();
+  });
+
+  it("cancelRunning is a no-op on a pending subtask", async () => {
+    const { applied, status } = await withSubtasks(
+      "cancel-running-pending",
+      (s) => {
+        const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+        const applied = s.cancelRunning(a.id);
+        return { applied, status: s.get(a.id)?.status };
+      }
+    );
+
+    expect(applied).toBe(false);
+    expect(status).toBe("pending");
+  });
+
+  it("cancelRunning cannot overwrite a terminal result", async () => {
+    const { applied, status } = await withSubtasks(
+      "cancel-running-done",
+      (s) => {
+        const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+        s.start(a.id, { recipeId: "default", recipeVersion: 1 });
+        s.complete(a.id, [{ kind: "text", text: "done" }]);
+        const applied = s.cancelRunning(a.id);
+        return { applied, status: s.get(a.id)?.status };
+      }
+    );
+
+    expect(applied).toBe(false);
+    expect(status).toBe("completed");
+  });
 });
 
 // ---------------------------------------------------------------------------

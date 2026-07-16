@@ -15,6 +15,27 @@ export interface ReferenceCatalogEntry extends SubtaskReference {
 }
 
 /**
+ * Whether a history message is a referenceable turn: a verbatim `user` or
+ * `assistant` turn with actual content.
+ *
+ * Compaction summaries are excluded via the SDK's `isCompactionMessage` (their
+ * `compaction_` id prefix) — they are generated text, never original conversation
+ * evidence. Whitespace-only turns are excluded because there is nothing to
+ * reference.
+ *
+ * This is the single eligibility rule: {@link buildReferenceCatalog} numbers the
+ * messages it accepts, and the decomposition prompt renderer marks exactly those
+ * messages with their `[ref N]` index. Sharing one predicate is what keeps the
+ * marked messages and the catalog indices aligned — the two walk the same history
+ * and must agree on which messages count.
+ */
+export function isCatalogEligible(message: SessionMessage): boolean {
+  if (message.role !== "user" && message.role !== "assistant") return false;
+  if (isCompactionMessage(message)) return false;
+  return sessionText(message).trim().length > 0;
+}
+
+/**
  * Turn the live Session history into a numbered reference catalog for Phase 1
  * decomposition. Pure and ephemeral: no persistence, no IDs, no Session mutation.
  *
@@ -38,14 +59,11 @@ export function buildReferenceCatalog(
   const catalog: ReferenceCatalogEntry[] = [];
   let index = 0;
   for (const message of history) {
-    if (message.role !== "user" && message.role !== "assistant") continue;
-    if (isCompactionMessage(message)) continue;
-    const text = sessionText(message);
-    if (text.trim().length === 0) continue;
+    if (!isCatalogEligible(message)) continue;
     catalog.push({
       index: ++index,
       role: message.role as "user" | "assistant",
-      text
+      text: sessionText(message)
     });
   }
   return catalog;

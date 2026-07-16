@@ -65,7 +65,8 @@ CREATE INDEX \`idx_notify_tasks_created_at\` ON \`notify_tasks\` (\`created_at\`
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX \`idx_subtasks_task_ordinal\` ON \`subtasks\` (\`task_id\`,\`ordinal\`);--> statement-breakpoint
-CREATE INDEX \`idx_subtasks_status\` ON \`subtasks\` (\`status\`);`
+CREATE INDEX \`idx_subtasks_status\` ON \`subtasks\` (\`status\`);--> statement-breakpoint
+CREATE INDEX \`idx_subtasks_created_at\` ON \`subtasks\` (\`created_at\`);`
   }
 };
 

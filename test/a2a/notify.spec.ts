@@ -55,12 +55,12 @@ describe("buildCompletedTask", () => {
 
 describe("buildWorkingTask", () => {
   it("is a working Task carrying the given intermediate text + messageId", () => {
-    const task = buildWorkingTask("task-1", "ctx-1", "progress…", 0);
+    const task = buildWorkingTask("task-1", "ctx-1", "progress…", "step:0");
     expect(task.status.state).toBe("working");
     expect(task.id).toBe("task-1");
     expect(task.contextId).toBe("ctx-1");
     expect(task.status.message?.role).toBe("agent");
-    expect(task.status.message?.messageId).toBe("task-1:0");
+    expect(task.status.message?.messageId).toBe("task-1:step:0");
     const parts = task.status.message?.parts ?? [];
     const text = parts
       .filter(
@@ -69,6 +69,24 @@ describe("buildWorkingTask", () => {
       .map((p) => p.text)
       .join("");
     expect(text).toBe("progress…");
+  });
+
+  it("keys milestone messages by their semantic phase", () => {
+    const task = buildWorkingTask("task-1", "ctx-1", "On it.", "decompose");
+    expect(task.status.message?.messageId).toBe("task-1:decompose");
+  });
+
+  it("keeps phase, tool-step, and terminal ids in distinct namespaces", () => {
+    // The gateway dedupes on messageId, so a milestone must never collide with a
+    // tool-loop step or the terminal message.
+    const ids = [
+      buildWorkingTask("task-1", "ctx-1", "a", "step:0").status.message
+        ?.messageId,
+      buildWorkingTask("task-1", "ctx-1", "b", "decompose").status.message
+        ?.messageId,
+      buildCompletedTask("task-1", "ctx-1", "c").status.message?.messageId
+    ];
+    expect(new Set(ids).size).toBe(3);
   });
 });
 

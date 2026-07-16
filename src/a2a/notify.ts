@@ -85,23 +85,29 @@ function buildTaskUpdate(
 }
 
 /**
- * A non-terminal `working` Task snapshot carrying an intermediate content message.
- * Streamed live from the DO as the tool loop emits content before the final reply.
- * `messageId` is derived from `${taskId}:${stepIndex}` — stable across re-runs (see
- * {@link buildTaskUpdate}) so the gateway dedupes correctly on workflow replay.
+ * A non-terminal `working` Task snapshot carrying a progress message. Streamed
+ * live from the DO as the tool loop emits content, and emitted once per phase for
+ * milestone replies (the Phase 1 decomposition acknowledgement).
+ *
+ * `key` is a **stable semantic key** naming what produced the message, not a
+ * counter: the tool loop passes `step:<n>`, decomposition passes `decompose`, and
+ * the terminal callback uses `final` ({@link buildCompletedTask}). The resulting
+ * `${taskId}:${key}` messageId is stable across re-runs (see
+ * {@link buildTaskUpdate}) so the gateway dedupes correctly on workflow replay,
+ * and the namespaces cannot collide by construction.
  */
 export function buildWorkingTask(
   taskId: string,
   contextId: string,
   text: string,
-  stepIndex: number
+  key: string
 ): PlainTask {
   return buildTaskUpdate(
     taskId,
     contextId,
     "working",
     text,
-    `${taskId}:${stepIndex}`
+    `${taskId}:${key}`
   );
 }
 

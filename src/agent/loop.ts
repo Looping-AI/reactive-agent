@@ -59,8 +59,11 @@ function isIntermediateStep(step: { finishReason: FinishReason }): boolean {
  * calls); the final step is skipped because its text is the return value.
  * A fresh handler per attempt resets the 0-based `stepIndex` counter so a
  * primary→fallback re-run reuses the same indices and the gateway dedupes.
+ *
+ * Shared with the decomposition operation ({@link file://./decompose.ts}), which
+ * runs its own tool loop and streams progress the same way.
  */
-function buildIntermediateContentHandler(
+export function buildIntermediateContentHandler(
   onContent: NonNullable<RunTurnArgs["onContent"]>
 ): (step: StepResult<ToolSet>) => Promise<void> {
   let stepIndex = 0;

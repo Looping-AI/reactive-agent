@@ -16,9 +16,12 @@ The caller-owned `ReactiveAgent` remains the durable main agent and owner of the
 
 Legend: ✅ done · 🚧 partial · ⬜ not started. Section headings below carry the same marker.
 
-- ✅ **A1** core contracts · ✅ **A2** text ingress · ✅ **A3** reference catalog · ✅ **A4** durable Subtask storage
-- 🚧 **A1** remainder: dependency-result records and the Recipe execution request/result contracts landed with Phase B; decomposition output and composition input/output contracts are deferred to Phase C, which consumes them.
-- ✅ **Phase B** (code-owned Recipe validation + managed Subagents) · ⬜ **Phase C** (decomposition + composition) · ⬜ **Phase D** (Workflow DAG) · ⬜ **Phase E** (verification + docs)
+- ✅ **A1** contracts · ✅ **A2** text ingress · ✅ **A3** reference catalog · ✅ **A4** durable Subtask storage
+- ✅ **Phase B** (code-owned Recipe validation + managed Subagents) · ✅ **Phase C** (decomposition + composition) · ⬜ **Phase D** (Workflow DAG) · ⬜ **Phase E** (verification + docs)
+
+A1's contracts landed incrementally with their consumers: the execution request/result shapes with Phase B, the decomposition and composition shapes with Phase C.
+
+Phase C left `src/workflows/handle-task.ts` untouched by design: `converse` remains the live path, and Phase D rewires the five phases onto the RPCs C landed (`decomposeTask`, `executeSubtask`, `listSubtasks`, `skipBlockedSubtasks`, `cancelPendingSubtasks`, `composeTask`).
 
 ## Core Invariants
 
@@ -59,11 +62,11 @@ flowchart TD
     P3 --> P4[Phase 4: Persist and notify]
 ```
 
-## Phase A: Contracts, References, and Persistence — 🚧 nearly done (A1 remainder deferred to B/C)
+## Phase A: Contracts, References, and Persistence — ✅ done (A1 completed by C)
 
-### A1. Define RPC-safe Subtask contracts — 🚧 core done
+### A1. Define RPC-safe Subtask contracts — ✅ done
 
-> Core contracts (`SubtaskStatus`, `SubtaskId`, `SubtaskReference`, `SubtaskResultPart`, `Subtask`) are in `src/agent/subtasks/types.ts`, along with `SubtaskDraft` and `ResolvedRecipe` (added by A4). Phase B added the execution contracts it consumes (`DependencyResult`, `RecipeExecutionRequest`, `RecipeExecutionResult`). Decomposition output and composition input/output contracts are deferred to Phase C.
+> Core contracts (`SubtaskStatus`, `SubtaskId`, `SubtaskReference`, `SubtaskResultPart`, `Subtask`) are in `src/agent/subtasks/types.ts`, along with `SubtaskDraft` and `ResolvedRecipe` (added by A4). Phase B added the execution contracts it consumes (`DependencyResult`, `RecipeExecutionRequest`, `RecipeExecutionResult`). Phase C added the last of them, alongside the operations that consume them: `SubtaskProposal` and `DecompositionProposal` (the model's structured output), `DecomposeTaskResult`, `CompositionBranch`, and `ComposeTaskResult`. Each contract landed with its consumer rather than up front — the phase that uses a shape is the one that knows what it needs.
 
 Add `src/agent/subtasks/types.ts` with plain, serializable contracts suitable for native Durable Object RPC.
 
@@ -300,9 +303,64 @@ deterministic request fingerprint.
 - The Subagent is created and deleted through the Agents SDK facet lifecycle;
   deletion wipes its storage (`test/subagent/subagent.spec.ts`).
 
-## Phase C: Main-Agent Decomposition and Composition — ⬜ not started
+## Phase C: Main-Agent Decomposition and Composition — ✅ done
 
-### C1. Add structured decomposition
+> **As built (user-approved, 2026-07-16).** Four decisions were settled during
+> planning and are reflected below:
+>
+> 1. **Composition bypass is single-node only.** C4's "exactly one successful
+>    Subtask" and D1's "directly return one successful Subtask's parts" conflicted:
+>    bypassing a 1-success/2-failure DAG would return the success's raw text and
+>    silently hide the failures, contradicting "discloses relevant failures". The
+>    bypass now applies only when decomposition produced **exactly one Subtask
+>    total** and it succeeded. Any multi-Subtask Task with ≥1 success composes.
+> 2. **Composition degrades rather than discarding finished work.** If both models
+>    fail _deterministically_, `runCompose` joins the successful branches' text in
+>    ordinal order plus a fixed disclosure note, and the Task completes. Transient
+>    faults still throw for the Workflow step to retry. Failing a Task whose branch
+>    work is already durable would throw away results the user asked for.
+> 3. **Phase C does not touch `src/workflows/handle-task.ts`.** `converse` remains
+>    the live path; the new RPCs land fully tested and Phase D rewires the five
+>    phases onto them. This avoids writing a sequential execution loop that D
+>    deletes.
+> 4. **`cancelRunning` added to `db.subtasks`** (guarded `running -> canceled`, no
+>    schema change). Without it, a late result discarded after parent cancellation
+>    left its row `running` forever — `cancelPending` only touches pending rows.
+>
+> Two mechanisms proved simpler than planned once verified against the SDKs:
+> `Session.appendMessage` **already dedupes by message id**, so deterministic ids
+> (`task:<id>:user`, `…:reply:decompose`, `…:reply:final`) make each phase's append
+> exactly-once with no read-then-write guard — `appendOnce` just reads the stored
+> text back so a re-run returns the _durable_ reply rather than its own. And
+> `MAX_SUBTASKS` moved to `config.ts`, since the decomposition schema and the data
+> layer both enforce the 1–8 bound and must not disagree.
+
+### C1. Add structured decomposition — ✅ done
+
+> Implemented as the pure resolver `src/agent/subtasks/decomposition.ts`
+> (`decompositionProposalSchema`, `resolveDecomposition`,
+> `DecompositionValidationError`) plus the Session-coupled operation
+> `src/agent/decompose.ts` (`runDecompose`, `renderDecompositionMessages`,
+> `DECOMPOSITION_INSTRUCTIONS`). Contracts (`SubtaskProposal`,
+> `DecompositionProposal`, `DecomposeTaskResult`, `CompositionBranch`,
+> `ComposeTaskResult`) landed in `types.ts`, closing the A1 remainder.
+>
+> **How the model sees the catalog.** Rather than duplicating history into a
+> preview list, `renderDecompositionMessages` walks the history **once** and
+> prefixes each referenceable turn with its `[ref N]` index, sharing the
+> `isCatalogEligible` predicate extracted from `catalog.ts`. Marker and catalog
+> index therefore cannot drift. Compaction summaries stay in the messages
+> _unmarked_: readable as context, structurally uncitable as conversation
+> evidence. The prefixes exist only in the transient model input — snapshots come
+> from the catalog, so no `[ref N]` ever reaches a Subtask row.
+>
+> **Structured-output failure modes (ai@6).** `result.output` is read _inside_ the
+> attempt's try: unparseable/schema-mismatched final text rejects `generateText`
+> (`NoObjectGeneratedError`), while a run that never produced a final object
+> (truncated, or the step cap cutting the tool loop) throws
+> `NoOutputGeneratedError` on property access. The model **factory** is likewise
+> resolved inside the try, so a factory throw counts as that attempt failing and
+> still falls back — a bug the specs caught.
 
 Split the current generic turn behavior into explicit main-agent operations while reusing model fallback, Session helpers, history conversion, and tool construction.
 
@@ -338,13 +396,27 @@ Application code must:
 
 If both primary and fallback decomposition fail or return invalid output, the parent Task fails. Do not silently synthesize a general Subtask.
 
-### C2. Persist and deliver the Phase 1 reply
+### C2. Persist and deliver the Phase 1 reply — ✅ done
+
+> `buildWorkingTask(taskId, contextId, text, key: string)` now takes a stable
+> semantic key instead of a numeric `stepIndex`. Three namespaces, collision-free
+> by construction: `step:<n>` (tool-loop progress, from the extracted
+> `ReactiveAgent.postWorking` via `streamWorking`), `decompose` (the Phase 1
+> reply), and `final` (terminal, unchanged). Tool-step ids therefore moved from
+> `task-1:0` to `task-1:step:0` — benign, since gateway dedupe is per-id.
+>
+> The reply is durable in the Session **before** the Subtask rows are persisted. A
+> crash in that window re-runs decomposition and persists the retry's drafts under
+> the first attempt's reply — both are valid outputs of the same input, and the
+> reverse order could strand persisted Subtasks with no recoverable reply. The
+> recovery path re-posts the `decompose` callback (deterministic id ⇒ the gateway
+> dedupes) rather than tracking whether it already fired.
 
 Append the decomposition reply to the main Session and emit it as a deterministic `working` callback before Phase 2.
 
 Refactor progress callback IDs in `src/a2a/notify.ts` to accept stable semantic keys, such as `taskId:decompose`, without colliding with tool-step progress IDs.
 
-### C3. Add parent-owned Subtask execution RPCs
+### C3. Add parent-owned Subtask execution RPCs — ✅ done
 
 Add narrow RPC methods to `ReactiveAgent`:
 
@@ -369,7 +441,30 @@ Add narrow RPC methods to `ReactiveAgent`:
 
 On an ambiguous retry, recover from either the terminal parent row or the child's temporary cached result. Never delete the child before its result is durably copied.
 
-### C4. Add composition
+> **As built.** All six RPCs are on `ReactiveAgent`. A test-only `modelsOverride?:
+ModelPair` field (precedent: `RecipeSubagent`) injects models for DO-level specs;
+> being a field, it never reaches the RPC stub.
+>
+> **Winning the `pending -> running` transition is what distinguishes a fresh
+> execution from a retry** — and that distinction decides whether the child may be
+> deleted. Claiming the row ⇒ fresh ⇒ delete any stale child first. Losing it with
+> the row still `running` ⇒ a previous attempt crashed mid-execution ⇒ **do not**
+> delete: the child's fingerprint cache may hold the terminal result that makes the
+> retry free. A `FINGERPRINT_MISMATCH` is recoverable exactly once (delete,
+> recreate, re-execute); a second one is a genuine lifecycle bug and propagates.
+>
+> Other edges: a terminal row short-circuits and sweeps a possibly-leaked child
+> best-effort; a dependency that has not completed throws (scheduler invariant, not
+> an outcome); a `completed` result with no usable text is recorded as a _failure_
+> rather than retried, since the child would replay the same bad result from its
+> cache forever; `deleteSubAgent` after a durable persist lets errors propagate,
+> because the retry lands on the terminal-row sweep.
+>
+> `skipBlockedSubtasks` runs to a fixpoint — skipping propagates, since a node
+> skipped for a failed prerequisite blocks its own dependents in turn — bounded by
+> the 8-Subtask maximum.
+
+### C4. Add composition — ✅ done
 
 For exactly one successful Subtask:
 
@@ -386,13 +481,29 @@ For multiple Subtasks:
 
 If no Subtask succeeds, produce a terminal parent failure instead of invoking composition.
 
-### Phase C Exit Criteria
+> **As built** in `src/agent/compose.ts` (`runCompose`, `renderCompositionMessage`,
+> `joinSuccessfulBranches`, `COMPOSITION_INSTRUCTIONS`). Per the bypass decision
+> above, "exactly one successful Subtask" means **exactly one Subtask total**;
+> multi-branch always composes. Branch outcomes are rendered into one _ephemeral_
+> user-role message — never appended to the Session — explicitly labeled as
+> generated subtask output, mirroring `src/subagent/prompt.ts`'s dependency
+> section. Internal diagnostics stay on the row: the model is told _that_ a branch
+> failed, not its stack trace, so it discloses the gap in user-safe words.
+
+### Phase C Exit Criteria — all met
 
 - Phase 1 emits and persists a valid one-to-eight-node DAG.
 - The model selects references by catalog index only; the referenced text is snapshotted verbatim onto the Subtask at decomposition.
 - The first reply is both visible and durable in Session history.
 - Single-Subtask completion incurs no composition inference.
 - Multi-Subtask partial success composes a useful final response.
+- Re-running any phase is safe: decomposition recovers its rows and reply with zero inference, execution recovers from the parent row or the child's cache, and composition returns its durable reply.
+
+> **Deferred to Phase E:** live Workers-AI behavior of a JSON `responseFormat`
+> riding alongside tools on every step. `Output.object` is proven against
+> `MockLanguageModelV3`, but the test suite is hermetic (`env.AI` has no local
+> mode), so the real model's structured-output compliance is unverified until a
+> live run.
 
 ## Phase D: Workflow DAG and Terminal Delivery — ⬜ not started
 
@@ -524,16 +635,24 @@ Add or extend:
   - Required text result part.
   - Terminal cache reuse (completed and failed) and fingerprint mismatch rejection.
   - Managed-child deletion and storage cleanup (fresh cache after re-create).
-- `test/agent/`
+- `test/agent/subtasks/{catalog,decomposition}.spec.ts` — ✅ A3/C
   - Ephemeral catalog numbering (eligible turns only; compaction summaries excluded).
-  - Structured decomposition.
-  - Catalog-index-only reference selection.
+  - Catalog-index-only reference selection and exact snapshotting onto the draft.
   - Ascending/unique/unknown index validation.
-  - Exact reference snapshotting onto the Subtask.
-  - Session append semantics.
-  - Invalid DAG and decomposition failures.
-  - Single-result bypass.
-  - Multi-result composition over `resultParts`.
+  - Invalid DAG rejection (duplicate keys; unknown/duplicate/self/cyclic edges; 2- and 3-node cycles); diamond accepted.
+  - Schema bounds (1..8) and blank-field rejection.
+- `test/agent/{decompose,compose}.spec.ts` — ✅ C
+  - Structured decomposition end-to-end; `[ref N]` marking of eligible turns only, with compaction summaries present but unmarked.
+  - Session append semantics: deterministic ids, no duplicate user turn on re-run, first attempt's reply wins.
+  - Decomposition failures (invalid output on both models ⇒ typed failure, no synthesized Subtask) and the transient-vs-deterministic split.
+  - Single-result bypass and zero-success failure, both without inference.
+  - Multi-result composition over `resultParts`; ephemeral results message never persisted; user turn not re-appended.
+  - Deterministic-join degradation when both models fail non-transiently.
+- `test/reactive-agent/subtasks-rpc.spec.ts` — ✅ C
+  - `decomposeTask` persistence, Session durability, and zero-inference recovery.
+  - `executeSubtask` edge matrix: lifecycle ordering (reset → execute → persist → delete), fresh-vs-ambiguous retry, fingerprint-mismatch recreate, transient propagation, malformed-result handling, dependency-order and scheduler-invariant throws, cancellation discard via `cancelRunning`.
+  - `skipBlockedSubtasks` chain/diamond fixpoint and independent-branch isolation.
+  - Real-facet integration: terminal failure recorded, `listSubAgents` empty afterward.
 - `test/workflows/handle-task.spec.ts`
   - All five phases.
   - First working callback.
@@ -546,7 +665,9 @@ Add or extend:
   - User-turn text crossing executor to Workflow.
   - Unchanged immediate submitted Task contract.
 
-Facet support under Workers Vitest is proven (Phase B): the test-only `RECIPE_SUBAGENT` miniflare binding in `vitest.config.ts` (no production migration) makes `ctx.exports` facet-compatible, and `test/subagent/subagent.spec.ts` already asserts the create/list/delete lifecycle. E1 extends this with the workflow-level assertion that `ReactiveAgent.listSubAgents(RecipeSubagent)` is empty after success, failure, cancellation, and replay.
+Facet support under Workers Vitest is proven (Phase B): the test-only `RECIPE_SUBAGENT` miniflare binding in `vitest.config.ts` (no production migration) makes `ctx.exports` facet-compatible, and `test/subagent/subagent.spec.ts` already asserts the create/list/delete lifecycle. Phase C added a parent-side real-facet case (`test/reactive-agent/subtasks-rpc.spec.ts`) proving `listSubAgents` is empty after a recorded failure. E1 extends this to the workflow level: empty after success, failure, cancellation, and replay.
+
+Phase C's DO-level specs establish two reusable patterns: `vi.spyOn(instance, "subAgent" | "deleteSubAgent")` inside `runInDurableObject` for the execution matrix (with `mock.invocationCallOrder` for ordering guarantees), and a **constructible** counting `ModelPair` — `getSession` builds its compaction summarizer from `primary()`, so a throwing factory would break session setup rather than prove a path ran no inference; counting `doGenerate` measures the actual promise.
 
 ### E2. Documentation
 

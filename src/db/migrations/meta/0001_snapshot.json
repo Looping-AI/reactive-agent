@@ -186,6 +186,11 @@
           "name": "idx_subtasks_status",
           "columns": ["status"],
           "isUnique": false
+        },
+        "idx_subtasks_created_at": {
+          "name": "idx_subtasks_created_at",
+          "columns": ["created_at"],
+          "isUnique": false
         }
       },
       "foreignKeys": {},

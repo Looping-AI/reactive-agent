@@ -65,6 +65,7 @@ export const subtasks = sqliteTable(
   },
   (table) => [
     uniqueIndex("idx_subtasks_task_ordinal").on(table.taskId, table.ordinal),
-    index("idx_subtasks_status").on(table.status)
+    index("idx_subtasks_status").on(table.status),
+    index("idx_subtasks_created_at").on(table.createdAt)
   ]
 );

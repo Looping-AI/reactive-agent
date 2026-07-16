@@ -91,6 +91,51 @@ export function assistantSessionMessage(text: string): SessionMessage {
   };
 }
 
+/**
+ * Deterministic Session-message ids for the phased task pipeline.
+ *
+ * A phase runs inside a durable Workflow step that can re-run after a crash, so
+ * its Session appends must be exactly-once. `Session.appendMessage` already
+ * dedupes on message id (an id that exists is not re-written), so deriving the id
+ * from the task id + phase makes the append idempotent for free — no
+ * read-then-write race, no duplicate turns in history on replay. Pair with
+ * {@link file://./session.ts appendOnce}, which reads the durable text back so a
+ * retry that re-inferred still returns the *stored* reply.
+ *
+ * These ids share the Session id-space with random UUIDs (plain turns) and the
+ * SDK's `compaction_`-prefixed summaries; the `task:` prefix cannot collide with
+ * either.
+ */
+
+/** Id of the inbound user turn for a task (appended once, in Phase 1). */
+export function taskUserMessageId(taskId: string): string {
+  return `task:${taskId}:user`;
+}
+
+/** Id of the Phase 1 decomposition reply (the first user-visible message). */
+export function decomposeReplyMessageId(taskId: string): string {
+  return `task:${taskId}:reply:decompose`;
+}
+
+/** Id of the Phase 3 composed final reply. */
+export function finalReplyMessageId(taskId: string): string {
+  return `task:${taskId}:reply:final`;
+}
+
+/** A Sessions-store message with a caller-chosen (deterministic) id. */
+export function deterministicSessionMessage(
+  id: string,
+  role: "user" | "assistant",
+  text: string
+): SessionMessage {
+  return {
+    id,
+    role,
+    createdAt: new Date(),
+    parts: [{ type: "text", text }]
+  };
+}
+
 /** Concatenate the text parts of a stored session message. */
 export function sessionText(m: SessionMessage): string {
   return m.parts
