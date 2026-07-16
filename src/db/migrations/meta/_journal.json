@@ -8,6 +8,13 @@
       "when": 1783508206066,
       "tag": "0000_goofy_squadron_supreme",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1784128150521,
+      "tag": "0001_great_goliath",
+      "breakpoints": true
     }
   ]
 }

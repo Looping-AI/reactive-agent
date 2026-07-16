@@ -16,6 +16,16 @@ export const AI_GATEWAY_ID = "default";
 export const MAX_STEPS = 8;
 
 /**
+ * Upper bound on Subtasks per parent Task — a Core Invariant: every accepted Task
+ * decomposes into 1..8 Subtasks, which is also what bounds Phase 2 fan-out (all
+ * dependency-ready Subtasks run concurrently, with no other concurrency cap).
+ *
+ * Enforced at both ends: the decomposition schema constrains the model's output,
+ * and the data layer re-checks it as the durable guard.
+ */
+export const MAX_SUBTASKS = 8;
+
+/**
  * Sessions memory + compaction tuning (mirrors the admin agent's values).
  *
  * The agent keeps one continuous {@link file://./session.ts Session} per caller:

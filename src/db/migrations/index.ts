@@ -24,6 +24,12 @@ const dbMigrations: MigrationConfig = {
         when: 1783508206066,
         tag: "0000_goofy_squadron_supreme",
         breakpoints: true
+      },
+      {
+        idx: 1,
+        when: 1784128150521,
+        tag: "0001_great_goliath",
+        breakpoints: true
       }
     ]
   },
@@ -39,7 +45,28 @@ const dbMigrations: MigrationConfig = {
 --> statement-breakpoint
 CREATE UNIQUE INDEX \`notify_tasks_message_id_unique\` ON \`notify_tasks\` (\`message_id\`);
 --> statement-breakpoint
-CREATE INDEX \`idx_notify_tasks_created_at\` ON \`notify_tasks\` (\`created_at\`);`
+CREATE INDEX \`idx_notify_tasks_created_at\` ON \`notify_tasks\` (\`created_at\`);`,
+    m0001: `CREATE TABLE \`subtasks\` (
+\t\`id\` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+\t\`task_id\` text NOT NULL,
+\t\`ordinal\` integer NOT NULL,
+\t\`type\` text NOT NULL,
+\t\`recipe_id\` text,
+\t\`recipe_version\` integer,
+\t\`prompt\` text NOT NULL,
+\t\`references_json\` text NOT NULL,
+\t\`depends_on_json\` text NOT NULL,
+\t\`status\` text NOT NULL,
+\t\`result_parts_json\` text,
+\t\`error\` text,
+\t\`created_at\` integer NOT NULL,
+\t\`updated_at\` integer NOT NULL,
+\t\`completed_at\` integer
+);
+--> statement-breakpoint
+CREATE UNIQUE INDEX \`idx_subtasks_task_ordinal\` ON \`subtasks\` (\`task_id\`,\`ordinal\`);--> statement-breakpoint
+CREATE INDEX \`idx_subtasks_status\` ON \`subtasks\` (\`status\`);--> statement-breakpoint
+CREATE INDEX \`idx_subtasks_created_at\` ON \`subtasks\` (\`created_at\`);`
   }
 };
 

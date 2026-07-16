@@ -4,10 +4,12 @@ import type { Task } from "@a2a-js/sdk";
 import {
   buildSubmittedTask,
   buildCompletedTask,
+  buildFailedTask,
   buildWorkingTask,
   signCallbackJwt,
   postNotification,
-  NOTIFICATION_TOKEN_HEADER
+  NOTIFICATION_TOKEN_HEADER,
+  TASK_FAILED_TEXT
 } from "@/a2a/notify";
 import { TEST_AGENT_PRIVATE_JWK } from "../fixtures";
 
@@ -53,14 +55,40 @@ describe("buildCompletedTask", () => {
   });
 });
 
+describe("buildFailedTask", () => {
+  it("is a failed Task carrying user-safe text in status.message", () => {
+    const task = buildFailedTask("task-1", "ctx-1", TASK_FAILED_TEXT);
+    expect(task.status.state).toBe("failed");
+    expect(task.status.message?.role).toBe("agent");
+    expect(task.status.message?.parts?.[0]).toMatchObject({
+      text: TASK_FAILED_TEXT
+    });
+  });
+
+  it("shares the deterministic ${taskId}:final messageId with the completed builder", () => {
+    // A Task terminates exactly once and the two states are mutually exclusive,
+    // so the delivery step only ever builds one of them — reusing the key keeps
+    // the gateway's dedupe correct across notify retries either way.
+    const failed = buildFailedTask("task-1", "ctx-1", "nope");
+    expect(failed.status.message?.messageId).toBe("task-1:final");
+    expect(failed.status.message?.messageId).toBe(
+      buildCompletedTask("task-1", "ctx-1", "yep").status.message?.messageId
+    );
+  });
+
+  it("never leaks an internal diagnostic into the default text", () => {
+    expect(TASK_FAILED_TEXT).not.toMatch(/model|subtask|branch|error:/i);
+  });
+});
+
 describe("buildWorkingTask", () => {
   it("is a working Task carrying the given intermediate text + messageId", () => {
-    const task = buildWorkingTask("task-1", "ctx-1", "progress…", 0);
+    const task = buildWorkingTask("task-1", "ctx-1", "progress…", "step:0");
     expect(task.status.state).toBe("working");
     expect(task.id).toBe("task-1");
     expect(task.contextId).toBe("ctx-1");
     expect(task.status.message?.role).toBe("agent");
-    expect(task.status.message?.messageId).toBe("task-1:0");
+    expect(task.status.message?.messageId).toBe("task-1:step:0");
     const parts = task.status.message?.parts ?? [];
     const text = parts
       .filter(
@@ -69,6 +97,24 @@ describe("buildWorkingTask", () => {
       .map((p) => p.text)
       .join("");
     expect(text).toBe("progress…");
+  });
+
+  it("keys milestone messages by their semantic phase", () => {
+    const task = buildWorkingTask("task-1", "ctx-1", "On it.", "decompose");
+    expect(task.status.message?.messageId).toBe("task-1:decompose");
+  });
+
+  it("keeps phase, tool-step, and terminal ids in distinct namespaces", () => {
+    // The gateway dedupes on messageId, so a milestone must never collide with a
+    // tool-loop step or the terminal message.
+    const ids = [
+      buildWorkingTask("task-1", "ctx-1", "a", "step:0").status.message
+        ?.messageId,
+      buildWorkingTask("task-1", "ctx-1", "b", "decompose").status.message
+        ?.messageId,
+      buildCompletedTask("task-1", "ctx-1", "c").status.message?.messageId
+    ];
+    expect(new Set(ids).size).toBe(3);
   });
 });
 

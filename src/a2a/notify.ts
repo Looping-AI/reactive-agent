@@ -62,7 +62,7 @@ export function buildSubmittedTask(
 function buildTaskUpdate(
   taskId: string,
   contextId: string,
-  state: "working" | "completed",
+  state: "working" | "completed" | "failed",
   text: string,
   messageId: string
 ): PlainTask {
@@ -85,23 +85,29 @@ function buildTaskUpdate(
 }
 
 /**
- * A non-terminal `working` Task snapshot carrying an intermediate content message.
- * Streamed live from the DO as the tool loop emits content before the final reply.
- * `messageId` is derived from `${taskId}:${stepIndex}` — stable across re-runs (see
- * {@link buildTaskUpdate}) so the gateway dedupes correctly on workflow replay.
+ * A non-terminal `working` Task snapshot carrying a progress message. Streamed
+ * live from the DO as the tool loop emits content, and emitted once per phase for
+ * milestone replies (the Phase 1 decomposition acknowledgement).
+ *
+ * `key` is a **stable semantic key** naming what produced the message, not a
+ * counter: the tool loop passes `step:<n>`, decomposition passes `decompose`, and
+ * the terminal callback uses `final` ({@link buildCompletedTask}). The resulting
+ * `${taskId}:${key}` messageId is stable across re-runs (see
+ * {@link buildTaskUpdate}) so the gateway dedupes correctly on workflow replay,
+ * and the namespaces cannot collide by construction.
  */
 export function buildWorkingTask(
   taskId: string,
   contextId: string,
   text: string,
-  stepIndex: number
+  key: string
 ): PlainTask {
   return buildTaskUpdate(
     taskId,
     contextId,
     "working",
     text,
-    `${taskId}:${stepIndex}`
+    `${taskId}:${key}`
   );
 }
 
@@ -123,6 +129,33 @@ export function buildCompletedTask(
     reply,
     `${taskId}:final`
   );
+}
+
+/**
+ * User-safe text for a terminal `failed` Task. The gateway renders this to a
+ * human, so it says *that* the request failed and never *why*: the internal
+ * diagnostics (which model, which branch, which fault) stay on the Subtask rows
+ * and in the logs, where an operator can read them and an end user cannot.
+ */
+export const TASK_FAILED_TEXT =
+  "Sorry, I hit an unexpected error handling that request. Please try again, " +
+  "and check the agent's logs if it keeps happening.";
+
+/**
+ * The terminal `failed` Task POSTed to the gateway callback — decomposition
+ * produced nothing runnable, or no branch survived.
+ *
+ * Shares the `${taskId}:final` messageId with {@link buildCompletedTask} by
+ * design: a Task terminates exactly once, the two states are mutually exclusive,
+ * and the workflow's delivery step is durable — so only one of them is ever built
+ * and posted, and a notify retry re-posts that same one under the same dedupe key.
+ */
+export function buildFailedTask(
+  taskId: string,
+  contextId: string,
+  text: string
+): PlainTask {
+  return buildTaskUpdate(taskId, contextId, "failed", text, `${taskId}:final`);
 }
 
 /**

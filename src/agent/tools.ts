@@ -67,6 +67,27 @@ export function buildBrowserTools(browser: QuickActionBinding): ToolSet {
 }
 
 /**
+ * Build the toolset for a validated Recipe's tool families (subagent
+ * executions). Families are gated on binding presence like {@link buildTools};
+ * unknown families are skipped (defense-in-depth — `validateRecipe` already
+ * dropped them). `recall` and the Session's `set_context` are structurally
+ * impossible here: they are not in the family map, and a subagent has no
+ * Session or recall dependencies to wire them to.
+ */
+export function buildRecipeTools(
+  toolFamilies: string[],
+  browser?: QuickActionBinding
+): ToolSet {
+  const tools: ToolSet = {};
+  for (const family of toolFamilies) {
+    if (family === "browser" && browser) {
+      Object.assign(tools, buildBrowserTools(browser));
+    }
+  }
+  return tools;
+}
+
+/**
  * Build the toolset for a turn. Tools are gated on their per-instance
  * dependency: `recall` only once this caller's history has been compacted at
  * least once (`recallDeps.hasArchive`) — nothing to search before that — and the

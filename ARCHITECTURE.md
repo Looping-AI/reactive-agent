@@ -21,9 +21,9 @@ sequenceDiagram
     Agent->>Gateway: GET /.well-known/jwks.json (gateway public JWKS)
     Gateway-->>Agent: gateway public JWKS
     Agent->>Agent: verify JWT (sig + iss + aud + exp)
-    Agent->>Agent: record submitted Task (DO) + start NotifyTaskWorkflow
+    Agent->>Agent: record submitted Task (DO) + start HandleTaskWorkflow
     Agent-->>Gateway: submitted Task (the accept — returns immediately)
-    Note over Agent: workflow: converse() over the caller's Session (out of band)
+    Note over Agent: workflow: decompose → execute subtasks → compose (out of band)
     Agent->>Gateway: POST pushNotificationConfig.url (/a2a/notifications)<br/>x-a2a-notification-token + Bearer(card-key JWT), body = completed Task
     Gateway->>Gateway: verify token row + callback JWT (pinned card key), post reply to Slack
 ```
@@ -46,25 +46,30 @@ This agent therefore does three things:
 > with a signed JWT; this agent proves it is itself with a signed card. Each side
 > only needs the other's **public** JWKS.
 
-## Agent runtime (Durable Object + LLM tool loop)
+## Agent runtime (Durable Object + continuous Session)
 
 Once the JWT is verified, [`src/index.ts`](src/index.ts) runs the A2A JSON-RPC
-server for the call, and its [`A2AExecutor`](src/a2a/executor.ts) dispatches the
-turn into the [`ReactiveAgent`](src/reactive-agent/index.ts) Durable Object with a
-single native RPC call, passing the **verified** caller identity as a typed
-argument — **one instance per calling gateway-agent**, keyed by the verified
-`identity.key`. If the token carries no `key` the Worker refuses the call (400):
-there is no shared/default instance to route to.
+server for the call, and its [`A2AExecutor`](src/a2a/executor.ts) accepts the
+turn into the [`ReactiveAgent`](src/reactive-agent/index.ts) Durable Object,
+passing the **verified** caller identity as a typed argument — **one instance per
+calling gateway-agent**, keyed by the verified `identity.key`. If the token
+carries no `key` the Worker refuses the call (400): there is no shared/default
+instance to route to.
 
 The DO is the agent runtime. It extends the Agents-SDK `Agent` (itself a genuine
-`DurableObject` subclass), so the Worker reaches it with a single **native
-Cloudflare RPC** call — `await stub.converse(text, identity)` — with no internal
-HTTP or JSON-RPC layer: the DO is never exposed over the network, only reachable
-from this Worker's own code. [`src/a2a/executor.ts`](src/a2a/executor.ts) is
-the only A2A-protocol-aware piece on the Worker side: it records a `submitted`
-Task in the caller's DO, starts the async delivery workflow, and publishes that
-Task as the accept (see **Async task delivery** below). The DO backs a
-**Session** with `this.sql`:
+`DurableObject` subclass), so the Worker and the Workflow reach it over **native
+Cloudflare RPC** with no internal HTTP or JSON-RPC layer: the DO is never exposed
+over the network, only reachable from this Worker's own code. Its RPC surface is
+a set of narrow, phase-shaped methods — `decomposeTask`, `executeSubtask`,
+`listSubtasks`, `skipBlockedSubtasks`, `failSubtask`, `cancelPendingSubtasks`,
+`composeTask` for the pipeline, and `beginTask` / `getTask` / `saveTask` /
+`markWorking` / `cancelTask` / `cleanupOldTasks` for Task state. There is no
+general "run a turn" entry point: inference happens only inside the pipeline
+phases below. [`src/a2a/executor.ts`](src/a2a/executor.ts) is the only
+A2A-protocol-aware piece on the Worker side: it records a `submitted` Task in the
+caller's DO, starts the async delivery workflow, and publishes that Task as the
+accept (see **Async task delivery** below). The DO backs a **Session** with
+`this.sql`:
 
 - **One continuous Session per caller** ([`src/agent/session.ts`](src/agent/session.ts)):
   a read-only `"soul"` identity block + a writable `"memory"` scratchpad the model
@@ -89,22 +94,168 @@ Task as the accept (see **Async task delivery** below). The DO backs a
   Workers-AI model (via [`workers-ai-provider`](https://www.npmjs.com/package/workers-ai-provider)
   routed through an AI Gateway); also the compaction summarizer. Model ids, gateway
   slug, and Session tuning are constants in [`src/config.ts`](src/config.ts).
-- **Turn loop** ([`src/agent/loop.ts`](src/agent/loop.ts)): `runTurn` appends the
-  user turn to the Session, runs a bounded multi-step `generateText` loop
-  (`stepCountIs(MAX_STEPS)`) over the Session history + soul + memory, persists the
-  assistant reply, and returns the final reply text. Primary→fallback on error; a
-  transient (capacity/timeout) or unexpected failure resolves to a friendly reply
-  rather than throwing. [`ReactiveAgent.converse`](src/reactive-agent/index.ts) is the
-  DO's one public RPC method — it wraps `runTurn` and returns its result.
+- **Main-agent operations** ([`src/agent/decompose.ts`](src/agent/decompose.ts),
+  [`src/agent/compose.ts`](src/agent/compose.ts)): the two places the main agent
+  infers over the Session — Phase 1 splits the task into Subtasks, Phase 3 writes
+  the final reply. Shared model plumbing (transient-error classification,
+  intermediate-content streaming) lives in
+  [`src/agent/inference.ts`](src/agent/inference.ts). Both do their own
+  primary→fallback recovery; neither is a general turn runner.
 - **Soul + caller context** ([`src/agent/prompt.ts`](src/agent/prompt.ts)): the frozen
   `"soul"` feeds the Session soul block; the verified caller is appended per turn as
   a system suffix. The prompt is aware of the gateway's `<turn>` provenance wrapper
   (parsed, never authored — see [`src/agent/history.ts`](src/agent/history.ts)).
-- **Tools** ([`src/agent/tools.ts`](src/agent/tools.ts)): placeholder `whoami` /
-  `echo` tools plus the `recall` episodic-memory search (merged over the Session's
-  own `set_context`). `whoami` and `recall` close over the verified identity /
-  instance namespace so neither can be spoofed from model input. Real domain tools
-  (with per-call authorization) come in a later phase.
+- **Tools** ([`src/agent/tools.ts`](src/agent/tools.ts)): the main agent gets
+  placeholder `whoami` / `echo` tools plus the `recall` episodic-memory search
+  (merged over the Session's own `set_context`). `whoami` and `recall` close over
+  the verified identity / instance namespace so neither can be spoofed from model
+  input. Subagents get a disjoint set built by `buildRecipeTools` from their
+  Recipe's tool families — today `browser` (Browser Rendering Quick Actions).
+  Per-call **authorization** policy for domain tools is still a later phase.
+
+## The task pipeline (five phases)
+
+Every accepted Task runs through five phases in
+[`src/workflows/handle-task.ts`](src/workflows/handle-task.ts). The main agent
+never answers a task directly: it **decomposes** it into one to eight durable
+Subtasks, runs the dependency-ready ones concurrently in isolated subagents, and
+**composes** their outcomes into the reply.
+
+```mermaid
+flowchart TD
+    A[Accepted A2A Task] --> P0[Phase 0: Pre-work]
+    P0 --> P1[Phase 1: Main-agent decomposition]
+    P1 --> R[Persist 1-8 Subtasks]
+    P1 --> W[Persist and send first working reply]
+    R --> P2[Phase 2: Execute dependency DAG]
+    P2 --> S1[Managed RecipeSubagent]
+    P2 --> S2[Managed RecipeSubagent]
+    S1 --> R
+    S2 --> R
+    R --> P3[Phase 3: Compose or direct result]
+    P3 --> P4[Phase 4: Persist and notify]
+```
+
+The durable step sequence is `working` → `decompose` → one wave per iteration
+(`scan:<n>`, then `execute:<id>` · `fail:<id>` per branch, or `cancel:<n>` if the
+Task was canceled) → `compose` → `complete` → `notify`. **Those names are durable
+cache keys** — renaming one silently re-runs its effect on replay, so treat them
+as a contract, not labels.
+
+> **The Subtask rows are the source of truth; Workflow state is not.** A `step.do`
+> return is capped at **1 MiB**, and a Subtask carries verbatim reference
+> snapshots bounded only by `MAX_INBOUND_TEXT_BYTES` (256 KB) — so steps return
+> narrow projections (`SubtaskNode`: `{id, ordinal, status, dependsOn}`), never
+> rows. Every phase recovers by re-reading the database and the Session, which is
+> also why replay is safe.
+
+- **Phase 1 — decompose** ([`src/agent/decompose.ts`](src/agent/decompose.ts)).
+  One `generateText` call with `Output.object()` returns a first user-visible
+  `reply` plus one to eight Subtask drafts. Failure on **both** models fails the
+  Task; a general Subtask is never synthesized, because that would deliver
+  plausible work nobody asked for.
+- **Phase 2 — execute** ([`src/agent/subtasks/scheduler.ts`](src/agent/subtasks/scheduler.ts)).
+  `selectWave` picks every node whose dependencies completed; all of them run
+  concurrently (the eight-Subtask maximum is the only fan-out bound). The
+  scheduler **does not re-validate the DAG**: `createDecomposition` already
+  rejected missing, self-referential, and cyclic edges before a row existed, and
+  all three manifest identically as _no progress possible_ — which the single
+  "active nodes but none ready" check already catches.
+- **Phase 3 — compose** ([`src/agent/compose.ts`](src/agent/compose.ts)).
+  Composition is **bypassed only when decomposition produced exactly one Subtask
+  total** and it succeeded. Any multi-Subtask task with at least one success
+  composes — bypassing a 1-success/2-failure DAG would return the success's raw
+  text and silently hide the failures.
+
+### Subtask contract and lifecycle
+
+A Subtask is a durable row with three **distinct** input categories, kept
+distinguishable all the way into the subagent's prompt:
+
+| Input               | Origin                      | Rule                                                                               |
+| ------------------- | --------------------------- | ---------------------------------------------------------------------------------- |
+| `prompt`            | generated by the main agent | The only channel for summaries, recall, or tool output — at main-agent discretion. |
+| `references`        | verbatim Session history    | Copied exactly; the model never rewrites, summarizes, or relabels them.            |
+| `dependencyResults` | prerequisite Subtask output | Rendered explicitly as **generated output**, never as conversation evidence.       |
+
+Status flows `pending` → `running` → one of `completed` · `failed` · `skipped` ·
+`canceled`. Transitions are guarded (`UPDATE … WHERE status = <expected>` +
+`.returning()`), so a disallowed transition is a no-op rather than a corruption.
+
+**References are resolved once, at decomposition.** At Phase 1 the eligible live
+history turns are numbered `1..N` into an ephemeral catalog
+([`src/agent/subtasks/catalog.ts`](src/agent/subtasks/catalog.ts)); the model
+selects **indices only**, and application code copies each selected message's
+exact role+text onto the row. Execution never re-reads the Session, so mid-task
+compaction cannot affect a Subtask already in flight, and no rewritten "quote" can
+reach a subagent. Compaction summaries are excluded from the catalog (the SDK's
+`compaction_` message-id prefix) — readable as context, structurally uncitable as
+evidence.
+
+### Recipes
+
+A Recipe configures one isolated subagent invocation: enabled state, version,
+primary/fallback model ids, soul text, and tool families. The `default` Recipe is
+a **code constant** (`DEFAULT_RECIPE` in
+[`src/agent/subtasks/recipe.ts`](src/agent/subtasks/recipe.ts), sourcing model ids
+from [`src/config.ts`](src/config.ts)) — not a database row, so it cannot go stale
+against the configured models and needs no migration seed.
+
+Decomposition assigns only a semantic Subtask `type`; it never names a Recipe.
+`resolveRecipeForType` maps type → Recipe (always `default` today) and is the seam
+a future Recipe admin surface extends. `validateRecipe` is the capability
+boundary: the model allowlist is exactly the two config ids (a non-allowlisted id
+is substituted with its slot's config default, independently per slot), unknown
+tool families are dropped, a blank soul falls back to `STATELESS_SUBAGENT_SOUL`,
+and a disabled Recipe throws. `recall` and the Session `set_context` tool are
+**structurally impossible** for a subagent — they are never in the family map.
+Recipe data never supplies arbitrary bindings, tools, or secrets. The resolved
+Recipe id and version are recorded on the row after the fact, at execution start.
+
+### Subagent lifecycle and retry safety
+
+Each Subtask executes in a `RecipeSubagent` ([`src/subagent/`](src/subagent/)) —
+an Agents-SDK **facet** created beneath the caller's `ReactiveAgent`, so it needs
+no wrangler binding (it must only stay exported from `src/index.ts` so
+`ctx.exports` can resolve it by class name). It has no Session, no durable memory,
+no recall, and no access to parent history beyond the supplied references.
+
+Retry safety rests on two mechanisms:
+
+- **The child caches exactly one terminal result**, keyed by a SHA-256 fingerprint
+  of the request ([`src/subagent/fingerprint.ts`](src/subagent/fingerprint.ts)).
+  Terminal outcomes — completed **and** failed — replay with zero inference. A
+  transient platform fault throws and caches **nothing**, so a Workflow retry
+  re-runs inference by design. A _different_ request arriving at a child that
+  already holds a result throws `FINGERPRINT_MISMATCH` (a message prefix, because
+  error classes don't survive DO RPC), signalling a parent lifecycle bug.
+- **Winning the `pending → running` claim is what distinguishes a fresh execution
+  from a retry** — and that decides whether the child may be deleted. Claiming the
+  row means fresh, so any stale child is deleted first. _Losing_ the claim with the
+  row still `running` means a previous attempt crashed mid-execution, so the child
+  is **not** deleted: its cache may hold the terminal result that makes the retry
+  free. The child is deleted only **after** its result is durably copied into the
+  parent — never before.
+
+### Failure and cancellation
+
+- A failed branch **skips its dependent descendants** (propagated to a fixpoint,
+  bounded by the eight-Subtask maximum) while independent branches keep running.
+- A branch that exhausts its step retries fails **the branch, not the Task**
+  (`fail:<id>`), so composition can disclose the gap while its siblings keep the
+  durable work they finished.
+- If both models fail composition _deterministically_, `runCompose` joins the
+  successful branches' text in ordinal order plus a fixed disclosure note and the
+  Task completes. **Degrade rather than discard**: failing a Task whose branch work
+  is already durable would throw away results the user asked for. Transient faults
+  still throw for the step to retry.
+- Cancellation is re-checked before decomposition, before each wave, before
+  composition, and before terminal delivery. It stops new work, cancels pending
+  Subtasks, and discards late results from already-running model calls; no
+  completed or failed terminal callback is sent after cancellation.
+- Internal diagnostics stay on the row and in logs — the composition model is told
+  _that_ a branch failed, not its stack trace, so it discloses the gap in user-safe
+  words.
 
 ## Async task delivery (accept + notify)
 
@@ -122,7 +273,7 @@ This agent implements that contract in three moving parts:
   without a `pushNotificationConfig` (JSON-RPC `-32602` — this agent is
   async-only), then the [`A2AExecutor`](src/a2a/executor.ts) records a `submitted`
   Task via the DO (`beginTask`, idempotent on the gateway's `messageId`), starts a
-  [`NotifyTaskWorkflow`](src/workflows/notify-task.ts) whose instance id is derived
+  [`HandleTaskWorkflow`](src/workflows/handle-task.ts) whose instance id is derived
   from that `messageId`, and publishes the Task as the accept — all in well under
   the gateway's 30s accept timeout. Task state persists in the DO
   ([`src/a2a/task-store.ts`](src/a2a/task-store.ts) backs the a2a-js `TaskStore`),
@@ -130,21 +281,67 @@ This agent implements that contract in three moving parts:
   `ReactiveAgent.cleanupOldTasks` runs as a weekly cron (Sunday 01:00 UTC) via the
   Agents SDK `this.schedule` API, registered idempotently in `onStart`.
 - **Generate + deliver (Workflow).**
-  [`src/workflows/notify-task.ts`](src/workflows/notify-task.ts) is the durable
-  controller. Its `step.do(...)` steps run `converse()` on the caller's DO
-  (native RPC — a Workflow can't touch the DO's SQLite directly, so turn inputs
-  ride as the workflow payload and task state is mutated only through DO RPC),
-  then POST the completed Task to the gateway webhook. Steps are durable and
-  retried; a future human-approval interrupt slots in as a `step.waitForEvent`
-  between generation and delivery. Idempotency comes from the deterministic
-  instance id (a dispatch retry never starts a second run) plus the gateway's
-  single-use callback token, giving exactly-once effect.
+  [`src/workflows/handle-task.ts`](src/workflows/handle-task.ts) is the durable
+  controller running the five phases above. Every step reaches the caller's DO by
+  native RPC — a Workflow can't touch the DO's SQLite directly, so turn inputs
+  ride as the workflow payload and task state is mutated only through DO RPC —
+  and the last step POSTs the terminal Task to the gateway webhook. Steps are
+  durable and retried; a future human-approval interrupt slots in as a
+  `step.waitForEvent` between composition and delivery. Idempotency is layered:
+  the deterministic instance id (a dispatch retry never starts a second run), the
+  gateway's single-use callback token, and — because steps replay — **per-phase
+  recovery from durable state**: `Session.appendMessage` dedupes by message id, so
+  deterministic ids (`task:<id>:user`, `…:reply:decompose`, `…:reply:final`) make
+  each phase's append exactly-once; a re-run of `decompose` recovers its rows and
+  reply with zero inference; `execute:<id>` recovers from the parent row or the
+  child's fingerprint cache.
 - **Callback auth (`src/a2a/notify.ts`).** The callback is authenticated exactly
   like the AgentCard: a short-lived EdDSA JWT signed by `A2A_SIGNING_KEY` whose
   protected-header `kid`+`jku` **equal the card's** (the gateway pinned those at
-  registration), with `aud` = the webhook URL. The completed Task carries the
-  reply in `status.message` (where the gateway's `extractText` reads it). Still
-  zero shared secrets — the gateway verifies against this agent's public JWKS.
+  registration), with `aud` = the webhook URL. The terminal Task carries the reply
+  in `status.message` (where the gateway's `extractText` reads it) — `completed`
+  with the composed reply, or `failed` with **user-safe** text (the diagnostic
+  stays on the Subtask row and in logs, never in the callback body). Progress
+  replies are posted as `working` Tasks under stable semantic keys — `step:<n>`
+  for tool-loop progress, `decompose` for the Phase 1 reply, `final` for the
+  terminal one — three namespaces that cannot collide. Still zero shared secrets:
+  the gateway verifies against this agent's public JWKS.
+
+## Durable state (SQLite + migrations)
+
+Every DO instance owns a private SQLite database
+([`src/db/schema.ts`](src/db/schema.ts)), reached through `AgentDB`
+([`src/db/db.ts`](src/db/db.ts)) — one drizzle handle plus memoized per-table
+namespaces (`db.tasks`, `db.subtasks`). Two tables:
+
+| Table          | Role                                                                    |
+| -------------- | ----------------------------------------------------------------------- |
+| `notify_tasks` | A2A Task state across the accept→callback gap; answers `tasks/get`.     |
+| `subtasks`     | The decomposition: one row per Subtask, the pipeline's source of truth. |
+
+`subtasks` uses an SQLite `AUTOINCREMENT` integer primary key, so a `SubtaskId` is
+caller-local, monotonic, and never reused after cleanup. It stores the parent task
+id and `ordinal`, semantic type, nullable resolved Recipe id/version, the prompt,
+`references_json` (verbatim role+text snapshots), `depends_on_json` (resolved
+`SubtaskId`s), status, `result_parts_json`, an optional diagnostic error, and
+timestamps. Both its indexes — `idx_subtasks_task_ordinal` (**unique**: the
+schema-level backstop for idempotent creation) and `idx_subtasks_status` — are
+declared **inline in the `sqliteTable` callback**; a standalone `index()` export
+makes the pinned drizzle-kit emit a phantom `DROP INDEX`.
+
+Creating a decomposition is atomic and idempotent on the parent task id, wrapped in
+an explicit synchronous `db.transaction`. DO write coalescing makes the durable
+commit atomic but does **not** undo already-executed statements, which would
+otherwise strand a truncated, edge-less DAG behind the idempotency guard.
+
+Migrations follow the Agents SDK pattern: there is no global apply step, because
+each instance has its own database — `AgentDB`'s constructor runs `migrate()`
+(idempotent; Drizzle tracks applied migrations in `__drizzle_migrations`) and
+`onStart()` forces that on every wake-up. Workers have no runtime filesystem, so
+the generated SQL is bundled inline in
+[`src/db/migrations/index.ts`](src/db/migrations/index.ts). Expired Tasks and their
+Subtasks are cleaned up together after 30 days (both keyed on their own
+`created_at`, written in the same Task lifecycle).
 
 ## Canonical JSON (must match the gateway)
 
@@ -160,14 +357,15 @@ The card signature is computed over a deterministic serialization:
 
 ## Environment
 
-| Variable          | Where   | Purpose                                                                                              |
-| ----------------- | ------- | ---------------------------------------------------------------------------------------------------- |
-| `A2A_SIGNING_KEY` | secret  | Ed25519 private JWK (with `kid`) that signs the AgentCard.                                           |
-| `GATEWAY_ORIGINS` | secret  | JSON array of trusted gateway origins, e.g. `["https://gw.example.com"]`. Validates `jku` and `iss`. |
-| `AI`              | binding | Workers AI binding (routed via AI Gateway) backing the LLM tool loop + recall embeddings.            |
-| `ReactiveAgent`   | binding | Durable Object namespace — one instance per caller, holding the durable Session + task state.        |
-| `VECTORIZE`       | binding | Vectorize index (`reactive-agent-recall`, 1024-dim/cosine) storing per-instance episodic recall.     |
-| `NOTIFY_WORKFLOW` | binding | Cloudflare Workflow (`NotifyTaskWorkflow`) that generates a turn and delivers the push callback.     |
+| Variable               | Where   | Purpose                                                                                                                                                                                                 |
+| ---------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `A2A_SIGNING_KEY`      | secret  | Ed25519 private JWK (with `kid`) that signs the AgentCard.                                                                                                                                              |
+| `GATEWAY_ORIGINS`      | secret  | JSON array of trusted gateway origins, e.g. `["https://gw.example.com"]`. Validates `jku` and `iss`.                                                                                                    |
+| `AI`                   | binding | Workers AI binding (routed via AI Gateway) backing decomposition, subagent execution, composition, and recall embeddings.                                                                               |
+| `BROWSER`              | binding | Browser Rendering, backing the `browser` Recipe tool family (Quick Actions) subagents run with. **Requires a paid Workers plan — not on the free tier.**                                                |
+| `ReactiveAgent`        | binding | Durable Object namespace — one instance per caller, holding the durable Session, Subtask rows, and task state. Managed `RecipeSubagent` facets are created beneath it and need no binding of their own. |
+| `VECTORIZE`            | binding | Vectorize index (`reactive-agent-recall`, 1024-dim/cosine) storing per-instance episodic recall.                                                                                                        |
+| `HANDLE_TASK_WORKFLOW` | binding | Cloudflare Workflow (`HandleTaskWorkflow`) that runs the five-phase pipeline and delivers the push callback.                                                                                            |
 
 > The recall index is created out of band before deploy (it must match the
 > embedding model's output):
@@ -175,28 +373,75 @@ The card signature is computed over a deterministic serialization:
 > Vectorize has no local-development mode, so `npm run dev` prints a warning and
 > the test suite injects a fake index rather than binding a real one.
 
+## Known risks (unverified against real infrastructure)
+
+The test suite is deliberately **hermetic** — no network, no real inference — so
+three things are proven only by construction and stay unverified until production
+traffic. They are characteristics, not known bugs; none is a correctness hole.
+
+1. **Structured output riding alongside tools.** Phase 1 sends a JSON
+   `responseFormat` (from `Output.object`) on **every step** of a loop that also
+   carries tools. `workers-ai-provider` maps that to
+   `response_format: { type: "json_schema" }`, and
+   `test/agent/decompose.spec.ts` asserts the schema and the tools reach the model
+   together — but a mock model cannot prove the _real_ models **honor** it. If
+   `@cf/zai-org/glm-5.2` and `@cf/google/gemma-4-26b-a4b-it` both ignore it,
+   decomposition exhausts both models and **every Task fails**. This is the
+   highest-risk unknown in the design; watch the first live tasks in AI Gateway
+   logs.
+2. **`execute:<id>` step timing.** One step can run up to **16 model steps**
+   (`MAX_STEPS` = 8 on the primary, then 8 on the fallback), each potentially
+   making a Browser Rendering call, inside one Workflow attempt. No `StepConfig` is
+   set anywhere, so that attempt gets the platform default of **10 minutes** with
+   `retries: { limit: 5, delay: 10s, backoff: exponential }`, and there is no
+   internal deadline. A timeout is the one failure mode that caches **nothing**, so
+   every retry re-runs the whole loop — roughly an hour before the branch gives up.
+   It is bounded (the branch fails, composition still discloses the gap), so this is
+   a latency/cost characteristic to revisit with real step latencies, not a
+   correctness hole.
+3. **Subagent observability depends on AI Gateway logging.** The schema persists no
+   step log by design — subagent tool activity is observed through Cloudflare AI
+   Gateway. `AI_GATEWAY_ID` is `"default"` (auto-provisioned on first request), so
+   if logging is off for that gateway, that activity is invisible.
+
 ## Files
 
-| File                                                               | Role                                                                                                               |
-| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| [`src/index.ts`](src/index.ts)                                     | Worker entry: card / JWKS; verifies JWT, then runs the A2A JSON-RPC server dispatching into the caller's DO.       |
-| [`src/a2a/card.ts`](src/a2a/card.ts)                               | Build + sign the AgentCard; derive public JWKS; parse signing key.                                                 |
-| [`src/a2a/canonical.ts`](src/a2a/canonical.ts)                     | Canonical JSON contract (mirrors the gateway).                                                                     |
-| [`src/a2a/verify.ts`](src/a2a/verify.ts)                           | Verify the gateway identity JWT.                                                                                   |
-| [`src/reactive-agent/index.ts`](src/reactive-agent/index.ts)       | `ReactiveAgent` DO — owns the caller's Session (`converse()`) + durable async task state (`beginTask`, …).         |
-| [`src/a2a/task.ts`](src/a2a/task.ts)                               | `PlainTask` — SDK `Task` minus `unknown` extension `metadata`, so DO-RPC `Task` returns don't collapse to `never`. |
-| [`src/agent/session.ts`](src/agent/session.ts)                     | The continuous Session (soul + memory + compaction).                                                               |
-| [`src/a2a/executor.ts`](src/a2a/executor.ts)                       | `A2AExecutor` — accepts a turn (submitted Task) and starts the notify workflow.                                    |
-| [`src/a2a/task-store.ts`](src/a2a/task-store.ts)                   | `DurableTaskStore` — DO-backed a2a-js `TaskStore` (durable task state across accept→callback).                     |
-| [`src/a2a/notify.ts`](src/a2a/notify.ts)                           | Build the submitted/completed Tasks; sign + POST the gateway push-notification callback.                           |
-| [`src/workflows/notify-task.ts`](src/workflows/notify-task.ts)     | `NotifyTaskWorkflow` — durable controller: converse → complete → notify the gateway.                               |
-| [`src/agent/loop.ts`](src/agent/loop.ts)                           | `runTurn` — Session turn runner (primary → fallback, transient handling).                                          |
-| [`src/agent/model.ts`](src/agent/model.ts)                         | Workers-AI primary/fallback model pair (via AI Gateway).                                                           |
-| [`src/agent/prompt.ts`](src/agent/prompt.ts)                       | Soul (identity + rules) + per-request caller context.                                                              |
-| [`src/agent/tools.ts`](src/agent/tools.ts)                         | `whoami` / `echo` placeholders + the gated `recall` tool (pure handlers + AI-SDK wiring).                          |
-| [`src/agent/recall.ts`](src/agent/recall.ts)                       | Episodic recall: embed + upsert compacted-away messages to Vectorize; semantic search.                             |
-| [`src/a2a/inbound.ts`](src/a2a/inbound.ts)                         | Inbound A2A message → text (`textOf`) — the one place touching the `@a2a-js/sdk` message shape.                    |
-| [`src/agent/history.ts`](src/agent/history.ts)                     | `<turn>` provenance parsing + Session-history message glue (no A2A types).                                         |
-| [`src/config.ts`](src/config.ts)                                   | Model ids, AI Gateway slug, loop bound, Session/compaction tuning.                                                 |
-| [`src/reactive-agent/manifest.ts`](src/reactive-agent/manifest.ts) | AgentCard identity + advertised skills.                                                                            |
-| [`scripts/generate-keys.mjs`](scripts/generate-keys.mjs)           | Ed25519 JWK keypair generator.                                                                                     |
+| File                                                                         | Role                                                                                                                                                                 |
+| ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`src/index.ts`](src/index.ts)                                               | Worker entry: card / JWKS; verifies JWT, then runs the A2A JSON-RPC server dispatching into the caller's DO.                                                         |
+| [`src/a2a/card.ts`](src/a2a/card.ts)                                         | Build + sign the AgentCard; derive public JWKS; parse signing key.                                                                                                   |
+| [`src/a2a/canonical.ts`](src/a2a/canonical.ts)                               | Canonical JSON contract (mirrors the gateway).                                                                                                                       |
+| [`src/a2a/verify.ts`](src/a2a/verify.ts)                                     | Verify the gateway identity JWT.                                                                                                                                     |
+| [`src/reactive-agent/index.ts`](src/reactive-agent/index.ts)                 | `ReactiveAgent` DO — owns the caller's Session, the Subtask RPCs (`decomposeTask`/`executeSubtask`/`composeTask`, …), and durable async task state (`beginTask`, …). |
+| [`src/a2a/task.ts`](src/a2a/task.ts)                                         | `PlainTask` — SDK `Task` minus `unknown` extension `metadata`, so DO-RPC `Task` returns don't collapse to `never`.                                                   |
+| [`src/agent/session.ts`](src/agent/session.ts)                               | The continuous Session (soul + memory + compaction).                                                                                                                 |
+| [`src/a2a/executor.ts`](src/a2a/executor.ts)                                 | `A2AExecutor` — accepts a turn (submitted Task) and starts the notify workflow.                                                                                      |
+| [`src/a2a/task-store.ts`](src/a2a/task-store.ts)                             | `DurableTaskStore` — DO-backed a2a-js `TaskStore` (durable task state across accept→callback).                                                                       |
+| [`src/a2a/notify.ts`](src/a2a/notify.ts)                                     | Build the submitted/completed Tasks; sign + POST the gateway push-notification callback.                                                                             |
+| [`src/workflows/handle-task.ts`](src/workflows/handle-task.ts)               | `HandleTaskWorkflow` — durable controller for the five phases: `working` → `decompose` → `scan`/`execute` → `compose` → `complete` → `notify`.                       |
+| [`src/agent/decompose.ts`](src/agent/decompose.ts)                           | Phase 1 — `runDecompose`: structured (`Output.object`) split into 1-8 Subtask drafts + the first reply.                                                              |
+| [`src/agent/compose.ts`](src/agent/compose.ts)                               | Phase 3 — `runCompose`: single-node bypass, multi-branch composition, deterministic-join degradation.                                                                |
+| [`src/agent/inference.ts`](src/agent/inference.ts)                           | Shared model plumbing: `isTransientAiError`, `buildIntermediateContentHandler`, `OnContent`.                                                                         |
+| [`src/agent/subtasks/types.ts`](src/agent/subtasks/types.ts)                 | RPC-safe Subtask contracts (`Subtask`, `SubtaskReference`, `RecipeExecutionRequest`, `SubtaskNode`, …).                                                              |
+| [`src/agent/subtasks/catalog.ts`](src/agent/subtasks/catalog.ts)             | `buildReferenceCatalog` — the ephemeral 1..N numbering of eligible history turns (compaction summaries excluded).                                                    |
+| [`src/agent/subtasks/decomposition.ts`](src/agent/subtasks/decomposition.ts) | `decompositionProposalSchema` + `resolveDecomposition` — index-only reference resolution and DAG validation.                                                         |
+| [`src/agent/subtasks/recipe.ts`](src/agent/subtasks/recipe.ts)               | `DEFAULT_RECIPE` (code-owned), `resolveRecipeForType`, `validateRecipe` — the model/tool capability boundary.                                                        |
+| [`src/agent/subtasks/scheduler.ts`](src/agent/subtasks/scheduler.ts)         | `selectWave` — pure DAG wave selection (ready / done / stuck).                                                                                                       |
+| [`src/subagent/index.ts`](src/subagent/index.ts)                             | `RecipeSubagent` — the managed facet; `execute(request)` + the fingerprint-keyed terminal-result cache.                                                              |
+| [`src/subagent/run.ts`](src/subagent/run.ts)                                 | `runRecipeExecution` — the Session-less bounded loop (primary → fallback, transient vs terminal).                                                                    |
+| [`src/subagent/prompt.ts`](src/subagent/prompt.ts)                           | `renderSubagentPrompt` — soul as system; sectioned user message keeping references and dependency output distinct.                                                   |
+| [`src/subagent/fingerprint.ts`](src/subagent/fingerprint.ts)                 | Deterministic SHA-256 request fingerprint keying the child's retry cache.                                                                                            |
+| [`src/db/schema.ts`](src/db/schema.ts)                                       | Drizzle tables: `notify_tasks` + `subtasks` (indexes declared inline — see **Durable state**).                                                                       |
+| [`src/db/db.ts`](src/db/db.ts)                                               | `AgentDB` — one drizzle handle over the DO's SQLite + `db.tasks` / `db.subtasks`; runs `migrate()` on construction.                                                  |
+| [`src/db/models/tasks.ts`](src/db/models/tasks.ts)                           | `notify_tasks` query methods (`begin`/`get`/`save`/`markWorking`/`cancel`/`cleanup`).                                                                                |
+| [`src/db/models/subtasks.ts`](src/db/models/subtasks.ts)                     | Subtask query methods: atomic idempotent `createDecomposition`, guarded transitions, cleanup.                                                                        |
+| [`src/db/migrations/`](src/db/migrations/)                                   | Generated SQL + journal, bundled inline in `index.ts` (no runtime filesystem in Workers).                                                                            |
+| [`src/agent/model.ts`](src/agent/model.ts)                                   | Workers-AI primary/fallback model pair (via AI Gateway), parameterizable per Recipe.                                                                                 |
+| [`src/agent/prompt.ts`](src/agent/prompt.ts)                                 | Soul (identity + rules) + per-request caller context.                                                                                                                |
+| [`src/agent/tools.ts`](src/agent/tools.ts)                                   | `buildTools` (main agent: `whoami`/`echo` + gated `recall`) and `buildRecipeTools` (subagents: `browser` family).                                                    |
+| [`src/agent/recall.ts`](src/agent/recall.ts)                                 | Episodic recall: embed + upsert compacted-away messages to Vectorize; semantic search.                                                                               |
+| [`src/a2a/inbound.ts`](src/a2a/inbound.ts)                                   | Inbound A2A message → text (`textOf` / `inboundText`, size-bounded) — the one place touching the `@a2a-js/sdk` message shape.                                        |
+| [`src/agent/history.ts`](src/agent/history.ts)                               | `<turn>` provenance parsing + deterministic Session-message ids (the exactly-once append seam).                                                                      |
+| [`src/config.ts`](src/config.ts)                                             | Model ids, AI Gateway slug, `MAX_STEPS` / `MAX_SUBTASKS` bounds, Session/compaction tuning.                                                                          |
+| [`src/reactive-agent/manifest.ts`](src/reactive-agent/manifest.ts)           | AgentCard identity + advertised skills.                                                                                                                              |
+| [`scripts/generate-keys.mjs`](scripts/generate-keys.mjs)                     | Ed25519 JWK keypair generator.                                                                                                                                       |

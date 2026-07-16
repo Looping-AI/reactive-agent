@@ -6,9 +6,9 @@ import type {
 import type { PushNotificationConfig } from "@a2a-js/sdk";
 import { env } from "cloudflare:workers";
 import type { GatewayIdentity } from "./verify";
-import type { NotifyTaskParams } from "@/workflows/notify-task";
+import type { HandleTaskParams } from "@/workflows/handle-task";
 import { getAgent } from "@/reactive-agent";
-import { textOf } from "./inbound";
+import { inboundText } from "./inbound";
 
 /** Per-request config the outer Worker extracts from `message/send` and injects. */
 export interface ExecutorConfig {
@@ -19,19 +19,29 @@ export interface ExecutorConfig {
 }
 
 /**
- * Derive the deterministic {@link NotifyTaskWorkflow} instance id for a turn. Keyed
+ * Derive the deterministic {@link HandleTaskWorkflow} instance id for a turn. Keyed
  * on the gateway's `messageId` (stable across dispatch retries), so re-creating it
  * is a no-op — the turn runs exactly once. Sanitized to the id charset.
  */
 export function workflowIdForMessage(messageId: string): string {
-  return `notify-${messageId.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+  return `handle-${messageId.replace(/[^A-Za-z0-9_-]/g, "-")}`;
 }
+
+/**
+ * The one create failure that means "the retry already won": Workflows rejects a
+ * duplicate instance id with the `instance.already_exists` code, worded as
+ * `(instance.already_exists) ... already exists`. Kept narrow on purpose — the
+ * runtime also raises `instance.not_found` / "Instance does not exist", which a
+ * loose `/exist/i` would swallow, reporting a broken binding as an accepted turn
+ * and stranding the task in `submitted` with nothing to run it.
+ */
+const ALREADY_EXISTS = /already[\s_]exists/i;
 
 /**
  * A2A executor for the **async accept + notify** contract. On `message/send` it no
  * longer blocks on generation: it records a `submitted` Task in the caller's DO
  * (idempotent on `messageId`), hands the turn to a durable
- * {@link file://../workflows/notify-task.ts NotifyTaskWorkflow}, and publishes the
+ * {@link file://../workflows/handle-task.ts HandleTaskWorkflow}, and publishes the
  * accepted Task immediately as the response. The workflow generates the reply and
  * POSTs it to the gateway's push-notification webhook out of band.
  *
@@ -54,7 +64,7 @@ export class A2AExecutor implements AgentExecutor {
       throw new Error("pushNotificationConfig url and token are required");
     }
 
-    const text = textOf(requestContext.userMessage);
+    const text = inboundText(requestContext.userMessage);
     const messageId = requestContext.userMessage.messageId;
     const contextId = requestContext.contextId;
 
@@ -88,15 +98,16 @@ export class A2AExecutor implements AgentExecutor {
   /** Start the turn workflow; swallow the "instance already exists" retry race. */
   private async startWorkflow(
     messageId: string,
-    params: NotifyTaskParams
+    params: HandleTaskParams
   ): Promise<void> {
     try {
-      await env.NOTIFY_WORKFLOW.create({
+      await env.HANDLE_TASK_WORKFLOW.create({
         id: workflowIdForMessage(messageId),
         params
       });
     } catch (err) {
-      if (err instanceof Error && /exist/i.test(err.message)) return;
+      const message = err instanceof Error ? err.message : String(err);
+      if (ALREADY_EXISTS.test(message)) return;
       throw err;
     }
   }

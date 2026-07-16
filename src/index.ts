@@ -19,7 +19,8 @@ import { A2AExecutor } from "./a2a/executor";
 import { DurableTaskStore } from "./a2a/task-store";
 
 export { ReactiveAgent } from "./reactive-agent";
-export { NotifyTaskWorkflow } from "./workflows/notify-task";
+export { RecipeSubagent } from "./subagent";
+export { HandleTaskWorkflow } from "./workflows/handle-task";
 
 /**
  * Reference remote and reactive A2A agent for looping-gateway.

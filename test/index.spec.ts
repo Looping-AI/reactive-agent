@@ -27,7 +27,7 @@ const TEST_ENV: Env = {
   BROWSER: undefined as unknown as BrowserRun,
   ReactiveAgent: undefined as unknown as DurableObjectNamespace<ReactiveAgent>,
   VECTORIZE: undefined as unknown as VectorizeIndex,
-  NOTIFY_WORKFLOW: undefined as unknown as Env["NOTIFY_WORKFLOW"]
+  HANDLE_TASK_WORKFLOW: undefined as unknown as Env["HANDLE_TASK_WORKFLOW"]
 };
 
 // The worker's fetch handler only takes (request, env) — it never uses ctx.
@@ -193,7 +193,7 @@ describe("POST /a2a", () => {
     expect(res.status).toBe(400);
   });
 
-  it("accepts a message/send with a pushNotificationConfig: records a submitted Task and starts the notify workflow", async () => {
+  it("accepts a message/send with a pushNotificationConfig: records a submitted Task and starts the handle workflow", async () => {
     const identity = {
       key: "custom:1:ada",
       name: "Ada",
@@ -201,7 +201,7 @@ describe("POST /a2a", () => {
       workspaceId: 1
     };
     // Executor uses global env for routing; miniflare DO handles beginTask and
-    // NOTIFY_WORKFLOW.create. We assert on the observable HTTP contract only.
+    // HANDLE_TASK_WORKFLOW.create. We assert on the observable HTTP contract only.
     const res = await postRpc(sendBody("Hello from test!"), identity);
 
     expect(res.status).toBe(200);
