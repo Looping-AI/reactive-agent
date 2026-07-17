@@ -1,5 +1,5 @@
 import type { LanguageModel, ModelMessage, ToolSet } from "ai";
-import { generateText, Output, stepCountIs } from "ai";
+import { generateText, hasToolCall, stepCountIs } from "ai";
 import type { SessionMessage } from "agents/experimental/memory/session";
 import { MAX_STEPS, MAX_SUBTASKS } from "@/config";
 import {
@@ -18,10 +18,8 @@ import {
   isCatalogEligible,
   type ReferenceCatalogEntry
 } from "./subtasks/catalog";
-import {
-  decompositionProposalSchema,
-  resolveDecomposition
-} from "./subtasks/decomposition";
+import { resolveDecomposition } from "./subtasks/decomposition";
+import { DELEGATE_TOOL_NAME, delegateTool } from "./subtasks/delegate";
 import type { ModelPair } from "./model";
 import type { DecompositionProposal, SubtaskDraft } from "./subtasks/types";
 
@@ -29,17 +27,22 @@ import type { DecompositionProposal, SubtaskDraft } from "./subtasks/types";
  * Phase 1: turn one inbound task into a validated 1..8-node Subtask DAG plus the
  * first user-visible reply.
  *
- * Deliberately **not** layered on a shared turn loop with {@link
- * file://./compose.ts compose.ts}: this has a different output contract
- * (structured, schema-validated), a different failure contract (a typed failure
- * fails the parent Task — it never resolves to a friendly string), and different
- * Session semantics (deterministic, replay-safe message ids). It reuses what
- * genuinely is shared: the model pair and manual fallback shape, the tool set,
- * the history conversion, and the intermediate content handler from
- * {@link file://./inference.ts inference.ts}.
+ * The model delegates by **calling {@link delegateTool}** — a real tool call it
+ * picks and fills, which the Workflow then performs durably and
+ * {@link file://./compose.ts compose.ts} reassembles with its result. The tool has
+ * no `execute`, so the call *is* the output: the loop halts on it and its
+ * schema-validated input is the proposal.
  *
- * The model reasons over the whole conversation but delegates by **catalog index
- * only** — see {@link renderDecompositionMessages}.
+ * Deliberately **not** layered on a shared turn loop with compose.ts: this has a
+ * different output contract (a validated DAG, not prose), a different failure
+ * contract (a typed failure fails the parent Task — it never resolves to a
+ * friendly string), and different Session semantics (deterministic, replay-safe
+ * message ids). It reuses what genuinely is shared: the model pair and manual
+ * fallback shape, the tool set, the history conversion, and the intermediate
+ * content handler from {@link file://./inference.ts inference.ts}.
+ *
+ * The model reasons over the whole conversation but references it by **catalog
+ * index only** — see {@link renderDecompositionMessages}.
  */
 
 /** Prompt suffix teaching the decomposition contract. Appended to the soul + caller context. */
@@ -47,11 +50,16 @@ export const DECOMPOSITION_INSTRUCTIONS = `
 
 # Task decomposition
 
-You are decomposing the latest user request into durable subtasks that isolated
-subagents will execute concurrently. Respond with JSON matching the required
-schema — no prose outside it.
+Decompose the latest user request into durable subtasks that isolated subagents
+will execute concurrently, and hand them off by calling the \`${DELEGATE_TOOL_NAME}\` tool.
+Call it exactly once, once you have decided how to split the work — it is the only
+way to act on the request.
 
-Produce:
+Its results come back to you, and you then write the user's final reply from them.
+So ask each subtask for the **material** you need, not for a finished answer: its
+output is raw material you will compose, never something the user sees directly.
+
+\`${DELEGATE_TOOL_NAME}\` takes:
 
 - "reply": the first thing the user sees, in your own voice. Acknowledge what you
   are doing about their request. Do not promise a delivery time, and do not
@@ -145,18 +153,23 @@ type Attempt =
   { ok: true; proposal: DecompositionProposal } | { ok: false; error: unknown };
 
 /**
- * One structured-output attempt against a single model.
+ * One attempt against a single model: let it work, and require it to land on a
+ * `delegate` call.
  *
  * Takes the model **factory**, not a model: resolving it can throw (a missing
  * binding, a bad id), and that has to count as this attempt failing so the other
  * model still gets its turn.
  *
- * `result.output` is likewise read **inside** the try: the AI SDK surfaces the two
- * structured-output failures differently — unparseable or schema-mismatched final
- * text rejects `generateText` itself (`NoObjectGeneratedError`), while a run that
- * never produced a final object (truncated, or the step cap cut the tool loop
- * mid-flight) throws `NoOutputGeneratedError` on property access. Catching both
- * here collapses every attempt failure into one path.
+ * The model may use its own tools freely first — decomposing well can genuinely
+ * need a lookup or a recall — but it cannot wander: the loop halts the moment
+ * `delegate` is called (the tool has no `execute`, so there is no result to
+ * continue from), and the last permitted step forces the pick so a research loop
+ * can never burn `MAX_STEPS` without producing a decomposition.
+ *
+ * Every deterministic failure collapses to `{ ok: false }`: the SDK rejects a
+ * call whose input violates the schema (`InvalidToolInputError`) or names an
+ * unknown tool (`NoSuchToolError`), and a run that stopped without delegating at
+ * all is caught below.
  */
 async function attempt(
   args: RunDecomposeArgs,
@@ -169,9 +182,12 @@ async function attempt(
       model: model(),
       system,
       messages,
-      tools: args.tools,
-      output: Output.object({ schema: decompositionProposalSchema }),
-      stopWhen: stepCountIs(MAX_STEPS),
+      tools: { ...args.tools, [DELEGATE_TOOL_NAME]: delegateTool },
+      stopWhen: [stepCountIs(MAX_STEPS), hasToolCall(DELEGATE_TOOL_NAME)],
+      prepareStep: ({ stepNumber }) =>
+        stepNumber === MAX_STEPS - 1
+          ? { toolChoice: { type: "tool", toolName: DELEGATE_TOOL_NAME } }
+          : {},
       // We do our own primary → fallback recovery, so disable the SDK's
       // per-model backoff (it would only add latency and duplicate the fallback).
       maxRetries: 0,
@@ -179,23 +195,35 @@ async function attempt(
         ? buildIntermediateContentHandler(args.onContent)
         : undefined
     });
-    return { ok: true, proposal: result.output };
+    const call = result.toolCalls.find(
+      (c) => c.toolName === DELEGATE_TOOL_NAME
+    );
+    if (!call) {
+      return {
+        ok: false,
+        error: new Error(
+          `model stopped without calling ${DELEGATE_TOOL_NAME} (finishReason=${result.finishReason})`
+        )
+      };
+    }
+    // Already schema-validated by the SDK against the tool's `inputSchema`.
+    return { ok: true, proposal: call.input as DecompositionProposal };
   } catch (error) {
     return { ok: false, error };
   }
 }
 
 /**
- * Run Phase 1 against the continuous Session: append the user turn, ask the model
- * for a structured decomposition over the indexed history, validate it against the
- * catalog, and persist the reply to the Session.
+ * Run Phase 1 against the continuous Session: append the user turn, let the model
+ * delegate over the indexed history, validate its call against the catalog, and
+ * persist the reply to the Session.
  *
  * Both the user turn and the reply use deterministic ids, so a Workflow-step
  * re-run neither duplicates the turn nor changes an already-delivered reply.
  *
  * Throws only on a transient platform fault (for the Workflow step to retry);
- * every deterministic failure — invalid JSON, schema violation, a bad DAG, both
- * models exhausted — resolves to `{ status: "failed" }`.
+ * every deterministic failure — a schema violation, a bad DAG, no `delegate` call,
+ * both models exhausted — resolves to `{ status: "failed" }`.
  */
 export async function runDecompose(
   args: RunDecomposeArgs

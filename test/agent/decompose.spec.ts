@@ -4,16 +4,17 @@ import { tool } from "ai";
 import type { LanguageModel, ToolSet } from "ai";
 import { runDecompose, renderDecompositionMessages } from "@/agent/decompose";
 import { createModelPair, type ModelPair } from "@/agent/model";
-import { MAX_SUBTASKS } from "@/config";
+import { MAX_STEPS, MAX_SUBTASKS } from "@/config";
 import {
   decomposeReplyMessageId,
   deterministicSessionMessage,
   sessionText,
   taskUserMessageId
 } from "@/agent/history";
+import { DELEGATE_TOOL_NAME } from "@/agent/subtasks/delegate";
 import type { DecompositionProposal } from "@/agent/subtasks/types";
 import { FakeSession } from "../helpers/fake-session";
-import { mockModel } from "./mock-model";
+import { mockModel, type MockStep } from "./mock-model";
 
 const TASK_ID = "task-1";
 const CALLER_SUFFIX = "\n\nCalling agent instance: Ada.";
@@ -27,9 +28,11 @@ const ECHO_TOOL: ToolSet = {
   })
 };
 
-/** A valid proposal as the model would emit it. */
-function proposal(over: Partial<DecompositionProposal> = {}): string {
-  return JSON.stringify({
+/** A valid proposal as the model would fill the `delegate` call. */
+function proposal(
+  over: Partial<DecompositionProposal> = {}
+): DecompositionProposal {
+  return {
     reply: "On it — I'll look into that.",
     subtasks: [
       {
@@ -41,7 +44,14 @@ function proposal(over: Partial<DecompositionProposal> = {}): string {
       }
     ],
     ...over
-  });
+  };
+}
+
+/** The step where the model hands the work off — the decomposition's output. */
+function delegates(over: Partial<DecompositionProposal> = {}): MockStep {
+  return {
+    toolCall: { toolName: DELEGATE_TOOL_NAME, input: proposal(over) }
+  };
 }
 
 /** Drive a decomposition with a scripted primary model. */
@@ -145,7 +155,7 @@ describe("renderDecompositionMessages", () => {
 
 describe("runDecompose — happy path", () => {
   it("returns the reply and the resolved drafts", async () => {
-    const { outcome } = await run(mockModel({ text: proposal() }));
+    const { outcome } = await run(mockModel(delegates()));
     expect(outcome.status).toBe("completed");
     if (outcome.status !== "completed") return;
     expect(outcome.reply).toBe("On it — I'll look into that.");
@@ -154,7 +164,7 @@ describe("runDecompose — happy path", () => {
   });
 
   it("snapshots the selected turn verbatim onto the draft", async () => {
-    const { outcome } = await run(mockModel({ text: proposal() }));
+    const { outcome } = await run(mockModel(delegates()));
     if (outcome.status !== "completed") throw new Error("expected completed");
     // Index 1 is the inbound user turn this decomposition just appended.
     expect(outcome.drafts[0].references).toEqual([
@@ -163,7 +173,7 @@ describe("runDecompose — happy path", () => {
   });
 
   it("appends the user turn and the reply under deterministic ids", async () => {
-    const { session } = await run(mockModel({ text: proposal() }));
+    const { session } = await run(mockModel(delegates()));
     expect(session.messages.map((m) => m.id)).toEqual([
       taskUserMessageId(TASK_ID),
       decomposeReplyMessageId(TASK_ID)
@@ -176,7 +186,7 @@ describe("runDecompose — happy path", () => {
 
   it("gives the model the soul, caller context, and decomposition contract", async () => {
     let seen = "";
-    const capturing = mockModel({ text: proposal() });
+    const capturing = mockModel(delegates());
     const orig = capturing.doGenerate.bind(capturing);
     capturing.doGenerate = async (options: Parameters<typeof orig>[0]) => {
       seen = JSON.stringify(options.prompt);
@@ -190,19 +200,19 @@ describe("runDecompose — happy path", () => {
   });
 
   /**
-   * The structured-output wiring: `Output.object()` must reach the provider as a
-   * JSON `responseFormat` **while tools are attached**, since that combination
-   * rides on every step of the decomposition loop.
+   * The delegation wiring: `delegate` must reach the provider carrying the
+   * decomposition contract as its input schema, **alongside** the reasoning
+   * tools — that pairing is what lets the model look something up and then hand
+   * the work off within one loop.
    *
-   * Boundary: this proves the AI SDK passes the schema through, and that
-   * `workers-ai-provider` will therefore see a `json` response format to map onto
-   * `response_format: { type: "json_schema" }`. It cannot prove the real
-   * Workers-AI models *honor* it — `MockLanguageModelV3` ignores `responseFormat`
-   * and returns scripted text regardless, and `env.AI` has no local mode. That
-   * remains unverified until a live run (see PLAN.md, Phase E known risks).
+   * Boundary: this proves the AI SDK passes the tool and its schema through, so
+   * `workers-ai-provider` will see a function tool to map onto Workers-AI's
+   * `tools`. It cannot prove the real models *honor* the schema —
+   * `MockLanguageModelV3` returns scripted calls regardless, and `env.AI` has no
+   * local mode. That remains unverified until a live run.
    */
-  it("sends the decomposition schema as a json responseFormat alongside tools", async () => {
-    const capturing = mockModel({ text: proposal() });
+  it("sends the decomposition contract as the delegate tool's schema, alongside tools", async () => {
+    const capturing = mockModel(delegates());
     const orig = capturing.doGenerate.bind(capturing);
     let seen: Parameters<typeof orig>[0] | undefined;
     capturing.doGenerate = async (options: Parameters<typeof orig>[0]) => {
@@ -211,11 +221,12 @@ describe("runDecompose — happy path", () => {
     };
     await run(capturing, { tools: ECHO_TOOL });
 
-    if (seen?.responseFormat?.type !== "json") {
-      throw new Error("expected a json responseFormat");
+    const delegate = seen?.tools?.find((t) => t.name === DELEGATE_TOOL_NAME);
+    if (delegate?.type !== "function") {
+      throw new Error("expected a delegate function tool");
     }
-    // The decomposition contract itself, not just "some JSON".
-    const schema = seen.responseFormat.schema;
+    // The decomposition contract itself, not just "some tool".
+    const schema = delegate.inputSchema;
     expect(Object.keys(schema?.properties ?? {}).sort()).toEqual([
       "reply",
       "subtasks"
@@ -225,9 +236,34 @@ describe("runDecompose — happy path", () => {
       minItems: 1,
       maxItems: MAX_SUBTASKS
     });
-    // ...and the reasoning tools ride on the same call. This pairing is the
-    // untested-in-production risk, so assert it rather than the schema alone.
-    expect(seen.tools?.map((t) => t.name)).toContain("echo");
+    // ...and the reasoning tools ride on the same call.
+    expect(seen?.tools?.map((t) => t.name)).toContain("echo");
+  });
+
+  it("frees the model to reason, but forces the pick on the last step", async () => {
+    const choices: unknown[] = [];
+    // A model that only ever reasons: without the forced landing it would burn
+    // the whole step budget and decompose nothing.
+    const steps: MockStep[] = Array.from({ length: MAX_STEPS }, () => ({
+      toolCall: { toolName: "echo", input: { text: "ping" } }
+    }));
+    const capturing = mockModel(...steps);
+    const orig = capturing.doGenerate.bind(capturing);
+    capturing.doGenerate = async (options: Parameters<typeof orig>[0]) => {
+      choices.push(options.toolChoice);
+      return orig(options);
+    };
+    await run(capturing, { tools: ECHO_TOOL });
+
+    // `run` gives both slots the same model, so the primary's loop is the first
+    // MAX_STEPS calls; the fallback then repeats it.
+    const primary = choices.slice(0, MAX_STEPS);
+    // Forcing the pick from the first step would cost the model its lookup.
+    expect(primary[0]).toEqual({ type: "auto" });
+    expect(primary[MAX_STEPS - 1]).toEqual({
+      type: "tool",
+      toolName: DELEGATE_TOOL_NAME
+    });
   });
 
   it("streams intermediate content while reasoning", async () => {
@@ -244,7 +280,7 @@ describe("runDecompose — happy path", () => {
             text: "checking something",
             toolCall: { toolName: "echo", input: { text: "ping" } }
           },
-          { text: proposal() }
+          delegates()
         )
       }),
       onContent: (text, index) => {
@@ -256,18 +292,35 @@ describe("runDecompose — happy path", () => {
 });
 
 describe("runDecompose — invalid model output", () => {
-  it("falls back to the second model when the first emits unparseable output", async () => {
+  it("falls back to the second model when the first answers instead of delegating", async () => {
     const outcome = await runPair(
       modelPair(
-        () => mockModel({ text: "not json at all" }),
-        () => mockModel({ text: proposal() })
+        () => mockModel({ text: "Sure, here's the flight." }),
+        () => mockModel(delegates())
+      )
+    );
+    expect(outcome.status).toBe("completed");
+  });
+
+  it("falls back when the first model's call violates the schema", async () => {
+    const outcome = await runPair(
+      modelPair(
+        () =>
+          mockModel({
+            // A blank reply and no subtasks: rejected at the schema edge.
+            toolCall: {
+              toolName: DELEGATE_TOOL_NAME,
+              input: { reply: "", subtasks: [] }
+            }
+          }),
+        () => mockModel(delegates())
       )
     );
     expect(outcome.status).toBe("completed");
   });
 
   it("falls back when the first model's graph is invalid", async () => {
-    const cyclic = JSON.stringify({
+    const cyclic = delegates({
       reply: "On it.",
       subtasks: [
         {
@@ -288,8 +341,8 @@ describe("runDecompose — invalid model output", () => {
     });
     const outcome = await runPair(
       modelPair(
-        () => mockModel({ text: cyclic }),
-        () => mockModel({ text: proposal() })
+        () => mockModel(cyclic),
+        () => mockModel(delegates())
       )
     );
     expect(outcome.status).toBe("completed");
@@ -334,36 +387,21 @@ describe("runDecompose — invalid model output", () => {
   });
 
   it("rejects a reference index the catalog does not have", async () => {
+    const unknownRef = delegates({
+      subtasks: [
+        {
+          localKey: "a",
+          type: "t",
+          prompt: "p",
+          referenceIndexes: [99],
+          dependsOn: []
+        }
+      ]
+    });
     const outcome = await runPair(
       modelPair(
-        () =>
-          mockModel({
-            text: proposal({
-              subtasks: [
-                {
-                  localKey: "a",
-                  type: "t",
-                  prompt: "p",
-                  referenceIndexes: [99],
-                  dependsOn: []
-                }
-              ]
-            })
-          }),
-        () =>
-          mockModel({
-            text: proposal({
-              subtasks: [
-                {
-                  localKey: "a",
-                  type: "t",
-                  prompt: "p",
-                  referenceIndexes: [99],
-                  dependsOn: []
-                }
-              ]
-            })
-          })
+        () => mockModel(unknownRef),
+        () => mockModel(unknownRef)
       )
     );
     expect(outcome.status).toBe("failed");
@@ -377,7 +415,7 @@ describe("runDecompose — resilience", () => {
         () => {
           throw new Error("primary boom");
         },
-        () => mockModel({ text: proposal() })
+        () => mockModel(delegates())
       )
     );
     expect(outcome.status).toBe("completed");
@@ -422,7 +460,7 @@ describe("runDecompose — storage faults are not model faults", () => {
     let attempts = 0;
     const counting = () => {
       attempts++;
-      return mockModel({ text: proposal() });
+      return mockModel(delegates());
     };
 
     // A storage fault must reach the workflow step (which retries), not be
@@ -445,7 +483,7 @@ describe("runDecompose — storage faults are not model faults", () => {
     let attempts = 0;
     const counting = () => {
       attempts++;
-      return mockModel({ text: proposal() });
+      return mockModel(delegates());
     };
 
     await expect(
@@ -459,8 +497,8 @@ describe("runDecompose — storage faults are not model faults", () => {
 describe("runDecompose — replay safety", () => {
   it("does not duplicate the user turn on a re-run", async () => {
     const session = new FakeSession();
-    await run(mockModel({ text: proposal() }), { session });
-    await run(mockModel({ text: proposal() }), { session });
+    await run(mockModel(delegates()), { session });
+    await run(mockModel(delegates()), { session });
     expect(
       session.messages.filter((m) => m.id === taskUserMessageId(TASK_ID))
     ).toHaveLength(1);
@@ -468,10 +506,10 @@ describe("runDecompose — replay safety", () => {
 
   it("keeps the first attempt's reply when a re-run infers a different one", async () => {
     const session = new FakeSession();
-    await run(mockModel({ text: proposal() }), { session });
+    await run(mockModel(delegates()), { session });
 
     const second = await run(
-      mockModel({ text: proposal({ reply: "A completely different reply." }) }),
+      mockModel(delegates({ reply: "A completely different reply." })),
       { session }
     );
 

@@ -141,11 +141,20 @@ export type DecomposeTaskResult =
  * subset of the durable {@link Subtask} row, loaded in stable ordinal order.
  * Completed, failed, and skipped branches are all included so the composed reply
  * can use available successes and disclose relevant failures.
+ *
+ * Carries `prompt` and `dependsOn` — not for composing, but for reconstructing
+ * the `delegate` call that produced these branches (see
+ * `agent/subtasks/delegate.ts`). Unlike {@link SubtaskNode}, this projection is
+ * built inside the DO and returns only a reply, so the 1 MiB Workflow-step cap
+ * that keeps the scheduler's view narrow does not apply. `references` still stays
+ * out: it is unbounded history text, and the call's shape does not need it.
  */
 export interface CompositionBranch {
   subtaskId: SubtaskId;
   ordinal: number;
   type: string;
+  prompt: string;
+  dependsOn: SubtaskId[];
   status: SubtaskStatus;
   resultParts: SubtaskResultPart[] | null;
   error: string | null;

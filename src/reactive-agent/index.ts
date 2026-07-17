@@ -626,6 +626,8 @@ export class ReactiveAgent extends Agent<Env> {
         subtaskId: s.id,
         ordinal: s.ordinal,
         type: s.type,
+        prompt: s.prompt,
+        dependsOn: s.dependsOn,
         status: s.status,
         resultParts: s.resultParts,
         error: s.error

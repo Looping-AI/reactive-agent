@@ -1,16 +1,24 @@
 import { describe, it, expect } from "vitest";
-import type { LanguageModel } from "ai";
+import type { LanguageModel, ModelMessage } from "ai";
 import {
   joinSuccessfulBranches,
-  renderCompositionMessage,
+  renderCompositionMessages,
   runCompose
 } from "@/agent/compose";
 import { createModelPair, type ModelPair } from "@/agent/model";
 import {
+  decomposeReplyMessageId,
   deterministicSessionMessage,
   finalReplyMessageId,
-  sessionText
+  sessionText,
+  taskUserMessageId
 } from "@/agent/history";
+import {
+  DELEGATE_TOOL_NAME,
+  delegateToolCallId,
+  type DelegateCallInput,
+  type DelegateSubtaskOutcome
+} from "@/agent/subtasks/delegate";
 import type { CompositionBranch } from "@/agent/subtasks/types";
 import { FakeSession } from "../helpers/fake-session";
 import { mockModel } from "./mock-model";
@@ -23,6 +31,8 @@ function branch(over: Partial<CompositionBranch> = {}): CompositionBranch {
     subtaskId: 1,
     ordinal: 0,
     type: "research",
+    prompt: "find the thing",
+    dependsOn: [],
     status: "completed",
     resultParts: [{ kind: "text", text: "the finding" }],
     error: null,
@@ -72,24 +82,84 @@ function run(
   }).then((result) => ({ result, session }));
 }
 
-describe("renderCompositionMessage", () => {
-  it("labels the results as generated output, not conversation evidence", () => {
-    const rendered = renderCompositionMessage([branch()]);
-    expect(rendered).toContain("generated output");
-    expect(rendered).toContain("not conversation evidence");
+describe("renderCompositionMessages", () => {
+  const history = [
+    deterministicSessionMessage(
+      taskUserMessageId(TASK_ID),
+      "user",
+      "the request"
+    ),
+    deterministicSessionMessage(
+      decomposeReplyMessageId(TASK_ID),
+      "assistant",
+      "on it"
+    )
+  ];
+
+  /** The content parts of a rendered message (all but plain-text history). */
+  function parts(message: ModelMessage) {
+    return Array.isArray(message.content) ? message.content : [];
+  }
+
+  function callInput(messages: ModelMessage[]): DelegateCallInput {
+    const call = parts(messages[1]).find((p) => p.type === "tool-call");
+    if (!call) throw new Error("no delegate call rendered");
+    return call.input as DelegateCallInput;
+  }
+
+  function callOutput(messages: ModelMessage[]): DelegateSubtaskOutcome[] {
+    const result = parts(messages[2]).find((p) => p.type === "tool-result");
+    if (!result || result.output.type !== "json") {
+      throw new Error("no delegate result rendered");
+    }
+    return result.output.value as DelegateSubtaskOutcome[];
+  }
+
+  it("reunites the delegate call with its result", () => {
+    const messages = renderCompositionMessages(history, TASK_ID, [branch()]);
+    expect(messages.map((m) => m.role)).toEqual(["user", "assistant", "tool"]);
+
+    const call = parts(messages[1]).find((p) => p.type === "tool-call");
+    const result = parts(messages[2]).find((p) => p.type === "tool-result");
+    expect(call?.toolName).toBe(DELEGATE_TOOL_NAME);
+    expect(result?.toolName).toBe(DELEGATE_TOOL_NAME);
+    // A result the provider cannot pair to its call is a malformed history.
+    expect(call?.toolCallId).toBe(delegateToolCallId(TASK_ID));
+    expect(result?.toolCallId).toBe(call?.toolCallId);
+  });
+
+  it("keeps the acknowledgment the user already saw on the calling turn", () => {
+    const messages = renderCompositionMessages(history, TASK_ID, [branch()]);
+    const text = parts(messages[1]).find((p) => p.type === "text");
+    expect(text?.text).toBe("on it");
+    expect(callInput(messages).reply).toBe("on it");
+  });
+
+  it("carries each outcome under the id of the work that produced it", () => {
+    const messages = renderCompositionMessages(history, TASK_ID, [
+      branch({ subtaskId: 7, prompt: "find alpha" }),
+      branch({ subtaskId: 9, prompt: "find beta", dependsOn: [7] })
+    ]);
+    expect(callInput(messages).subtasks).toEqual([
+      { id: 7, type: "research", prompt: "find alpha", dependsOn: [] },
+      { id: 9, type: "research", prompt: "find beta", dependsOn: [7] }
+    ]);
+    expect(callOutput(messages).map((o) => o.subtaskId)).toEqual([7, 9]);
   });
 
   it("includes each completed branch's text", () => {
-    const rendered = renderCompositionMessage([
+    const messages = renderCompositionMessages(history, TASK_ID, [
       branch({ subtaskId: 1, resultParts: [{ kind: "text", text: "alpha" }] }),
       branch({ subtaskId: 2, resultParts: [{ kind: "text", text: "beta" }] })
     ]);
-    expect(rendered).toContain("alpha");
-    expect(rendered).toContain("beta");
+    expect(callOutput(messages).map((o) => o.output)).toEqual([
+      "alpha",
+      "beta"
+    ]);
   });
 
-  it("names failed and skipped branches so they can be disclosed", () => {
-    const rendered = renderCompositionMessage([
+  it("reports failed and skipped branches so they can be disclosed", () => {
+    const messages = renderCompositionMessages(history, TASK_ID, [
       branch({ subtaskId: 1 }),
       branch({
         subtaskId: 2,
@@ -99,19 +169,37 @@ describe("renderCompositionMessage", () => {
       }),
       branch({ subtaskId: 3, status: "skipped", resultParts: null })
     ]);
-    expect(rendered).toContain("[subtask 2] (research) failed");
-    expect(rendered).toContain("[subtask 3] (research) skipped");
+    expect(callOutput(messages)).toEqual([
+      {
+        subtaskId: 1,
+        type: "research",
+        status: "completed",
+        output: "the finding"
+      },
+      { subtaskId: 2, type: "research", status: "failed", output: null },
+      { subtaskId: 3, type: "research", status: "skipped", output: null }
+    ]);
   });
 
   it("keeps internal diagnostics out of the model's view", () => {
-    const rendered = renderCompositionMessage([
+    const messages = renderCompositionMessages(history, TASK_ID, [
       branch({
         status: "failed",
         resultParts: null,
         error: "stack trace: connection refused at 10.0.0.1"
       })
     ]);
-    expect(rendered).not.toContain("connection refused");
+    expect(JSON.stringify(messages)).not.toContain("connection refused");
+  });
+
+  it("still pairs the result when the acknowledgment is gone from history", () => {
+    // Compacted away by a concurrent task: the pair must stay well-formed.
+    const messages = renderCompositionMessages([history[0]], TASK_ID, [
+      branch()
+    ]);
+    expect(messages.map((m) => m.role)).toEqual(["user", "assistant", "tool"]);
+    expect(parts(messages[1]).some((p) => p.type === "text")).toBe(false);
+    expect(callOutput(messages)).toHaveLength(1);
   });
 });
 
