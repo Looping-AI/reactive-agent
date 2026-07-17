@@ -1,13 +1,21 @@
-import type { LanguageModel, ModelMessage } from "ai";
+import type { AssistantContent, LanguageModel, ModelMessage } from "ai";
 import { generateText } from "ai";
+import type { SessionMessage } from "agents/experimental/memory/session";
 import { isTransientAiError } from "./inference";
 import {
+  decomposeReplyMessageId,
   deterministicSessionMessage,
   finalReplyMessageId,
-  sessionText,
-  toModelMessages
+  sessionText
 } from "./history";
 import { appendOnce, type SessionLike } from "./session";
+import {
+  DELEGATE_TOOL_NAME,
+  composeDelegateTool,
+  delegateCallInput,
+  delegateCallOutput,
+  delegateToolCallId
+} from "./subtasks/delegate";
 import type { ModelPair } from "./model";
 import type { ComposeTaskResult, CompositionBranch } from "./subtasks/types";
 
@@ -17,6 +25,15 @@ import type { ComposeTaskResult, CompositionBranch } from "./subtasks/types";
  * Composition is main-agent work — it speaks in the agent's voice, over the
  * agent's Session — but it is not a turn: the user's message was already appended
  * and answered in Phase 1, so nothing is appended here except the final reply.
+ *
+ * The model sees the outcomes as what they are: the **result of the `delegate`
+ * call it made in Phase 1**, reunited with that call (see
+ * {@link renderCompositionMessages}). That is the whole design. "Tool result →
+ * assistant writes the user's reply" is a pattern every instruction-tuned model
+ * has seen a million times, so it carries both facts this phase depends on —
+ * that the outcomes are generated output rather than something the user said,
+ * and that it is now the model's turn to answer — without a prompt having to
+ * assert either in English.
  *
  * Inference is skipped whenever it would add nothing: a single-Subtask task has
  * one result and no failures to reconcile, and a task where nothing succeeded has
@@ -29,10 +46,11 @@ export const COMPOSITION_INSTRUCTIONS = `
 
 # Composing the final answer
 
-The work you delegated for the user's latest request has finished. Its results
-appear in the final message, labeled by subtask.
+Your \`${DELEGATE_TOOL_NAME}\` call has returned: its result holds the outcome of every
+subtask you delegated for the user's latest request. The work is done — do not
+call \`${DELEGATE_TOOL_NAME}\` again.
 
-Write the reply the user receives. Use the successful results as your material,
+Write the reply the user receives. Use the completed results as your material,
 in your own voice — do not paste them verbatim, introduce them as "subtask
 output", or mention subtasks, subagents, or delegation. The user asked you.
 
@@ -52,32 +70,85 @@ function branchText(branch: CompositionBranch): string {
 }
 
 /**
- * Render the branch outcomes as one ephemeral message.
+ * Rebuild the `delegate` call and pair it with its result.
  *
- * Explicitly labeled as **generated subtask output**, never as conversation
- * evidence — the same discipline as the subagent prompt's dependency section.
- * Failed and skipped branches are included by name so the model can disclose them
- * rather than quietly answering as if the work had been done.
+ * Both halves are real. Phase 1's model genuinely emitted this call; the
+ * subagents genuinely produced these outcomes. All that separates them is a
+ * Workflow boundary and, often, hours — so the pair is reconstructed here rather
+ * than carried, from the durable rows that are the record of what happened.
  *
- * Ephemeral by design: this is never appended to the Session. It is scaffolding
- * for one inference call, not something the user said.
+ * Failed and skipped branches are included so the model can disclose them rather
+ * than quietly answering as if the work had been done; their diagnostics are not
+ * (see {@link delegateCallOutput}).
  */
-export function renderCompositionMessage(
+function delegationPair(
+  taskId: string,
+  replyText: string | null,
   branches: CompositionBranch[]
-): string {
-  const lines = branches.map((branch) => {
-    const label = `[subtask ${branch.subtaskId}] (${branch.type})`;
-    if (branch.status === "completed") {
-      return `${label} completed:\n${branchText(branch)}`;
-    }
-    // Diagnostics stay out of the rendered line: the model discloses *that*
-    // something failed, in user-safe words; the row keeps the detail.
-    return `${label} ${branch.status} — no output available.`;
+): ModelMessage[] {
+  const toolCallId = delegateToolCallId(taskId);
+  const content: AssistantContent = [];
+  // The acknowledgment the user already saw, if it is still in history.
+  if (replyText) content.push({ type: "text", text: replyText });
+  content.push({
+    type: "tool-call",
+    toolCallId,
+    toolName: DELEGATE_TOOL_NAME,
+    input: delegateCallInput(replyText ?? "", branches)
   });
-  return (
-    "# Subtask results (generated output from the work you delegated — not conversation evidence)\n" +
-    lines.join("\n\n")
-  );
+  return [
+    { role: "assistant", content },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId,
+          toolName: DELEGATE_TOOL_NAME,
+          output: { type: "json", value: delegateCallOutput(branches) }
+        }
+      ]
+    }
+  ];
+}
+
+/**
+ * Render the model's view for composition: the conversation, with this task's
+ * delegation restored as the call-and-result it actually was.
+ *
+ * The Phase 1 reply is stored as plain assistant text (history is text-only, and
+ * stays that way — `sessionText`, the `[ref N]` catalog, compaction, and recall
+ * all read text parts). So the tool call is re-attached to that message here,
+ * and the result appended after it, for this one inference call. The same
+ * ephemeral-re-rendering discipline as {@link file://./decompose.ts
+ * renderDecompositionMessages}, which likewise marks up history the Session
+ * never sees.
+ *
+ * The pair is emitted together, anchored on the Phase 1 reply's deterministic id,
+ * so a `tool` message can never be orphaned from its call. Should that reply be
+ * gone — compacted away by a concurrent task — the pair still lands, minus the
+ * acknowledgment text: a result the model cannot place beats a malformed history.
+ */
+export function renderCompositionMessages(
+  history: SessionMessage[],
+  taskId: string,
+  branches: CompositionBranch[]
+): ModelMessage[] {
+  const replyId = decomposeReplyMessageId(taskId);
+  const messages: ModelMessage[] = [];
+  let anchored = false;
+  for (const message of history) {
+    if (message.role !== "user" && message.role !== "assistant") continue;
+    const text = sessionText(message);
+    if (message.id !== replyId) {
+      messages.push({ role: message.role, content: text });
+      continue;
+    }
+    messages.push(...delegationPair(taskId, text, branches));
+    anchored = true;
+  }
+  if (!anchored) messages.push(...delegationPair(taskId, null, branches));
+  return messages;
 }
 
 /**
@@ -109,9 +180,17 @@ export interface RunComposeArgs {
 }
 
 /**
- * One composition attempt: single-shot, no tools — there is nothing left to look
- * up. Takes the model **factory**, since resolving it can throw and that must
- * count as this attempt failing, not abort the whole composition.
+ * One composition attempt: single-shot — there is nothing left to look up.
+ * Takes the model **factory**, since resolving it can throw and that must count
+ * as this attempt failing, not abort the whole composition.
+ *
+ * `delegate` is declared but forbidden: the history contains a call to it, which
+ * a provider can only make sense of against the tool's definition — declared here
+ * as {@link composeDelegateTool}, whose schema is the *resolved* shape the
+ * reunited call actually carries, not Phase 1's emitted one. `toolChoice: "none"`
+ * keeps the model from delegating the same work twice; should it call anyway,
+ * `result.text` comes back empty and the check below fails the attempt — the
+ * fallback model, and then the deterministic join, are already the net for that.
  */
 async function attempt(
   model: () => LanguageModel,
@@ -122,6 +201,8 @@ async function attempt(
     model: model(),
     system,
     messages,
+    tools: { [DELEGATE_TOOL_NAME]: composeDelegateTool },
+    toolChoice: "none",
     maxRetries: 0
   });
   const text = result.text.trim();
@@ -179,11 +260,8 @@ export async function runCompose(
   }
 
   const history = await session.getHistory();
-  const messages = [
-    ...toModelMessages(history),
-    // Ephemeral — scaffolding for this call only, never appended to the Session.
-    { role: "user" as const, content: renderCompositionMessage(branches) }
-  ];
+  // Ephemeral — scaffolding for this call only, never appended to the Session.
+  const messages = renderCompositionMessages(history, taskId, branches);
   const system =
     (await session.refreshSystemPrompt()) +
     systemSuffix +

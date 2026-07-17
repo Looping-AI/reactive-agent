@@ -10,6 +10,7 @@ import {
   sessionText
 } from "@/agent/history";
 import { DEFAULT_RECIPE } from "@/agent/subtasks/recipe";
+import { DELEGATE_TOOL_NAME } from "@/agent/subtasks/delegate";
 import type { AgentDB } from "@/db/db";
 import type {
   RecipeExecutionRequest,
@@ -18,7 +19,7 @@ import type {
 } from "@/agent/subtasks/types";
 import type { GatewayIdentity } from "@/a2a/verify";
 import { freshStub } from "../helpers/do";
-import { mockModel } from "../agent/mock-model";
+import { mockModel, type MockStep } from "../agent/mock-model";
 
 const IDENTITY: GatewayIdentity = {
   key: "custom:1:tests",
@@ -31,20 +32,25 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** A valid decomposition as the model emits it. */
-function proposalJson(subtasks?: unknown[]): string {
-  return JSON.stringify({
-    reply: "On it.",
-    subtasks: subtasks ?? [
-      {
-        localKey: "research",
-        type: "research",
-        prompt: "Research the thing",
-        referenceIndexes: [1],
-        dependsOn: []
+/** The `delegate` call a model makes to emit a valid decomposition. */
+function delegates(subtasks?: unknown[]): MockStep {
+  return {
+    toolCall: {
+      toolName: DELEGATE_TOOL_NAME,
+      input: {
+        reply: "On it.",
+        subtasks: subtasks ?? [
+          {
+            localKey: "research",
+            type: "research",
+            prompt: "Research the thing",
+            referenceIndexes: [1],
+            dependsOn: []
+          }
+        ]
       }
-    ]
-  });
+    }
+  };
 }
 
 function draft(over: Partial<SubtaskDraft> = {}): SubtaskDraft {
@@ -120,7 +126,7 @@ function seed(instance: ReactiveAgent, drafts: SubtaskDraft[]) {
 describe("decomposeTask", () => {
   it("persists the DAG and returns the first reply", async () => {
     await runInDurableObject(freshStub("decompose"), async (instance) => {
-      instance.modelsOverride = pairOf(mockModel({ text: proposalJson() }));
+      instance.modelsOverride = pairOf(mockModel(delegates()));
 
       const result = await instance.decomposeTask({
         taskId: TASK_ID,
@@ -145,7 +151,7 @@ describe("decomposeTask", () => {
     await runInDurableObject(
       freshStub("decompose-session"),
       async (instance) => {
-        instance.modelsOverride = pairOf(mockModel({ text: proposalJson() }));
+        instance.modelsOverride = pairOf(mockModel(delegates()));
         await instance.decomposeTask({
           taskId: TASK_ID,
           text: "hello",
@@ -164,7 +170,7 @@ describe("decomposeTask", () => {
     await runInDurableObject(
       freshStub("decompose-replay"),
       async (instance) => {
-        instance.modelsOverride = pairOf(mockModel({ text: proposalJson() }));
+        instance.modelsOverride = pairOf(mockModel(delegates()));
         await instance.decomposeTask({
           taskId: TASK_ID,
           text: "hello",
@@ -191,7 +197,9 @@ describe("decomposeTask", () => {
 
   it("returns a typed failure when the model output is unusable", async () => {
     await runInDurableObject(freshStub("decompose-fail"), async (instance) => {
-      instance.modelsOverride = pairOf(mockModel({ text: "not json" }));
+      instance.modelsOverride = pairOf(
+        mockModel({ text: "Sure, here you go." })
+      );
       const result = await instance.decomposeTask({
         taskId: TASK_ID,
         text: "hello",
@@ -206,8 +214,8 @@ describe("decomposeTask", () => {
   it("persists a multi-node DAG with resolved dependency edges", async () => {
     await runInDurableObject(freshStub("decompose-dag"), async (instance) => {
       instance.modelsOverride = pairOf(
-        mockModel({
-          text: proposalJson([
+        mockModel(
+          delegates([
             {
               localKey: "research",
               type: "research",
@@ -223,7 +231,7 @@ describe("decomposeTask", () => {
               dependsOn: ["research"]
             }
           ])
-        })
+        )
       );
       const result = await instance.decomposeTask({
         taskId: TASK_ID,

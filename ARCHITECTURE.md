@@ -150,10 +150,15 @@ as a contract, not labels.
 > also why replay is safe.
 
 - **Phase 1 — decompose** ([`src/agent/decompose.ts`](src/agent/decompose.ts)).
-  One `generateText` call with `Output.object()` returns a first user-visible
-  `reply` plus one to eight Subtask drafts. Failure on **both** models fails the
-  Task; a general Subtask is never synthesized, because that would deliver
-  plausible work nobody asked for.
+  One `generateText` call in which the model calls
+  [`delegate`](src/agent/subtasks/delegate.ts), whose input schema _is_ the
+  decomposition contract: a first user-visible `reply` plus one to eight Subtask
+  drafts. The tool has no `execute` — the Workflow performs the call, durably, and
+  Phase 3 reassembles it with its result — so the call is the phase's output and
+  the loop halts on it. The model may use its own tools first; the last permitted
+  step forces the pick so a loop cannot end undecided. Failure on **both** models
+  fails the Task; a general Subtask is never synthesized, because that would
+  deliver plausible work nobody asked for.
 - **Phase 2 — execute** ([`src/agent/subtasks/scheduler.ts`](src/agent/subtasks/scheduler.ts)).
   `selectWave` picks every node whose dependencies completed; all of them run
   concurrently (the eight-Subtask maximum is the only fan-out bound). The
@@ -162,6 +167,15 @@ as a contract, not labels.
   all three manifest identically as _no progress possible_ — which the single
   "active nodes but none ready" check already catches.
 - **Phase 3 — compose** ([`src/agent/compose.ts`](src/agent/compose.ts)).
+  The model sees the outcomes as the **result of the `delegate` call it made in
+  Phase 1**: `renderCompositionMessages` re-attaches the call to the stored reply
+  and appends its result, rebuilding both halves from the durable rows. Nothing is
+  fabricated — only a Workflow boundary separated them. "Tool result → assistant
+  writes the user's reply" is a pattern every instruction-tuned model knows, so it
+  carries both facts this phase needs (the outcomes are generated output, not
+  conversation evidence; it is now the model's turn) without a prompt asserting
+  either. `delegate` is declared here but pinned with `toolChoice: "none"`: the
+  history's call needs its definition, and the work is already done.
   Composition is **bypassed only when decomposition produced exactly one Subtask
   total** and it succeeded. Any multi-Subtask task with at least one success
   composes — bypassing a 1-success/2-failure DAG would return the success's raw
@@ -379,16 +393,17 @@ The test suite is deliberately **hermetic** — no network, no real inference �
 three things are proven only by construction and stay unverified until production
 traffic. They are characteristics, not known bugs; none is a correctness hole.
 
-1. **Structured output riding alongside tools.** Phase 1 sends a JSON
-   `responseFormat` (from `Output.object`) on **every step** of a loop that also
-   carries tools. `workers-ai-provider` maps that to
-   `response_format: { type: "json_schema" }`, and
-   `test/agent/decompose.spec.ts` asserts the schema and the tools reach the model
-   together — but a mock model cannot prove the _real_ models **honor** it. If
-   `@cf/zai-org/glm-5.2` and `@cf/google/gemma-4-26b-a4b-it` both ignore it,
-   decomposition exhausts both models and **every Task fails**. This is the
-   highest-risk unknown in the design; watch the first live tasks in AI Gateway
-   logs.
+1. **The delegation tool call, on both ends.** Phase 1 needs the real models to
+   call `delegate` and fill its schema; Phase 3 hands them a history containing
+   that call paired with a `tool` result, under `toolChoice: "none"`.
+   `test/agent/decompose.spec.ts` and `test/agent/compose.spec.ts` assert both
+   shapes reach the provider, but a mock model cannot prove
+   `@cf/zai-org/glm-5.2` and `@cf/google/gemma-4-26b-a4b-it` **honor** them.
+   Failure is graceful on both ends and that is deliberate: a Phase 1 model that
+   never delegates exhausts both models and fails the Task; a Phase 3 model that
+   mishandles the pair returns unusable text, falls through to the fallback, and
+   then to `joinSuccessfulBranches`, which delivers the completed work regardless.
+   Watch the first live tasks in AI Gateway logs.
 2. **`execute:<id>` step timing.** One step can run up to **16 model steps**
    (`MAX_STEPS` = 8 on the primary, then 8 on the fallback), each potentially
    making a Browser Rendering call, inside one Workflow attempt. No `StepConfig` is
