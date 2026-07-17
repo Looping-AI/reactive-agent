@@ -195,17 +195,18 @@ async function attempt(
         ? buildIntermediateContentHandler(args.onContent)
         : undefined
     });
-    const call = result.toolCalls.find(
+    const delegates = result.toolCalls.filter(
       (c) => c.toolName === DELEGATE_TOOL_NAME
     );
-    if (!call) {
+    if (delegates.length !== 1) {
       return {
         ok: false,
         error: new Error(
-          `model stopped without calling ${DELEGATE_TOOL_NAME} (finishReason=${result.finishReason})`
+          `model must call ${DELEGATE_TOOL_NAME} exactly once (calls=${delegates.length}, finishReason=${result.finishReason})`
         )
       };
     }
+    const call = delegates[0];
     // Already schema-validated by the SDK against the tool's `inputSchema`.
     return { ok: true, proposal: call.input as DecompositionProposal };
   } catch (error) {
