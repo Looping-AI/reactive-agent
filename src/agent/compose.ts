@@ -11,9 +11,9 @@ import {
 import { appendOnce, type SessionLike } from "./session";
 import {
   DELEGATE_TOOL_NAME,
+  composeDelegateTool,
   delegateCallInput,
   delegateCallOutput,
-  delegateTool,
   delegateToolCallId
 } from "./subtasks/delegate";
 import type { ModelPair } from "./model";
@@ -185,11 +185,12 @@ export interface RunComposeArgs {
  * as this attempt failing, not abort the whole composition.
  *
  * `delegate` is declared but forbidden: the history contains a call to it, which
- * a provider can only make sense of against the tool's definition, while
- * `toolChoice: "none"` keeps the model from delegating the same work twice.
- * Should it call anyway, `result.text` comes back empty and the check below
- * fails the attempt — the fallback model, and then the deterministic join, are
- * already the net for that.
+ * a provider can only make sense of against the tool's definition — declared here
+ * as {@link composeDelegateTool}, whose schema is the *resolved* shape the
+ * reunited call actually carries, not Phase 1's emitted one. `toolChoice: "none"`
+ * keeps the model from delegating the same work twice; should it call anyway,
+ * `result.text` comes back empty and the check below fails the attempt — the
+ * fallback model, and then the deterministic join, are already the net for that.
  */
 async function attempt(
   model: () => LanguageModel,
@@ -200,7 +201,7 @@ async function attempt(
     model: model(),
     system,
     messages,
-    tools: { [DELEGATE_TOOL_NAME]: delegateTool },
+    tools: { [DELEGATE_TOOL_NAME]: composeDelegateTool },
     toolChoice: "none",
     maxRetries: 0
   });

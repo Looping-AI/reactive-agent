@@ -1,4 +1,5 @@
 import { tool } from "ai";
+import { z } from "zod";
 import { decompositionProposalSchema } from "./decomposition";
 import type { CompositionBranch, SubtaskId, SubtaskStatus } from "./types";
 
@@ -20,20 +21,65 @@ import type { CompositionBranch, SubtaskId, SubtaskStatus } from "./types";
 
 export const DELEGATE_TOOL_NAME = "delegate";
 
+/** The one description both declarations share, so the two can never drift. */
+const DELEGATE_DESCRIPTION =
+  "Delegate the user's request to isolated subagents and acknowledge it. Call this exactly once, when you have decided how to split the work. Its results return to you, and you then write the user's final reply from them.";
+
 /**
- * The tool as both phases declare it. Deliberately **without `execute`**: the
+ * The tool as **Phase 1** declares it. Deliberately **without `execute`**: the
  * Workflow performs this call, durably, outside the inference — so there is
  * nothing for the SDK to run, and the tool loop halts on the call rather than
  * trying to continue past it.
  *
- * Its `inputSchema` is the decomposition contract itself, so the SDK validates
- * the model's proposal before it ever reaches {@link resolveDecomposition} —
- * the same guarantee `Output.object` gave, from the same schema.
+ * Its `inputSchema` is the decomposition contract itself — the *emitted* shape,
+ * with draft-local `localKey`s and catalog `referenceIndexes`, since at authoring
+ * time the durable ids do not exist yet. The SDK validates the model's proposal
+ * against it before it ever reaches {@link resolveDecomposition} — the same
+ * guarantee `Output.object` gave, from the same schema.
+ *
+ * Phase 3 declares the same tool *name* under a different face —
+ * {@link composeDelegateTool} — because the call it reassembles is the
+ * post-resolution *durable* shape, not the emitted one.
  */
 export const delegateTool = tool({
-  description:
-    "Delegate the user's request to isolated subagents and acknowledge it. Call this exactly once, when you have decided how to split the work. Its results return to you, and you then write the user's final reply from them.",
+  description: DELEGATE_DESCRIPTION,
   inputSchema: decompositionProposalSchema
+});
+
+/**
+ * The **resolved** `delegate` call — the durable shape, after the data layer
+ * assigned SQLite ids and dropped the authoring-only `localKey`/`referenceIndexes`.
+ * Distinct from {@link decompositionProposalSchema} (the emitted shape) by design:
+ * the Workflow boundary between the call and its result is exactly where the
+ * emitted form becomes this one.
+ *
+ * The single source of truth for the reconstructed call's shape — its inferred
+ * types drive {@link delegateCallInput}, and {@link composeDelegateTool} declares
+ * it to the provider — so the tool the compose model sees always matches the call
+ * reunited into its history.
+ */
+export const delegatedCallSchema = z.object({
+  reply: z.string(),
+  subtasks: z.array(
+    z.object({
+      id: z.number().int(),
+      type: z.string(),
+      prompt: z.string(),
+      dependsOn: z.array(z.number().int())
+    })
+  )
+});
+
+/**
+ * The tool as **Phase 3** declares it: same name and description, the resolved
+ * schema. Declared (never called — compose pins `toolChoice: "none"`) only so the
+ * provider can interpret the reunited call-and-result against a definition whose
+ * shape matches the call it sees. No `execute`, for the same reason as
+ * {@link delegateTool}.
+ */
+export const composeDelegateTool = tool({
+  description: DELEGATE_DESCRIPTION,
+  inputSchema: delegatedCallSchema
 });
 
 /**
@@ -46,31 +92,20 @@ export function delegateToolCallId(taskId: string): string {
 }
 
 /**
- * One delegated unit of work, as the reconstructed call carries it.
+ * The reconstructed `delegate` call's input: the acknowledgment plus the DAG, in
+ * the **resolved** form. Inferred from {@link delegatedCallSchema} so the built
+ * object is compile-time-checked against the schema the compose model is shown —
+ * the two cannot drift.
  *
- * This is the **resolved** form, not the emitted one: the model proposed
- * `localKey` strings and `referenceIndexes`, and resolution turned those into
- * SQLite-assigned ids and snapshotted reference text. Neither the local keys nor
- * the indexes survive on the durable row, so Phase 3 rebuilds the call from what
- * actually happened rather than from what was asked for.
- *
- * That is the better record anyway: `id` here is the same id the outcome carries
- * in {@link DelegateSubtaskOutcome}, so the model can line up each result with
- * the work that produced it — something the local keys could not have done.
+ * `id` is the same id the matching outcome carries in
+ * {@link DelegateSubtaskOutcome}, so the model can line each result up with the
+ * work that produced it — something the emitted call's `localKey`s (gone from the
+ * durable row) could not have done.
  */
-export interface DelegatedSubtask {
-  id: SubtaskId;
-  type: string;
-  prompt: string;
-  /** Resolved prerequisite ids (the emitted call's local keys, after resolution). */
-  dependsOn: SubtaskId[];
-}
+export type DelegateCallInput = z.infer<typeof delegatedCallSchema>;
 
-/** The reconstructed `delegate` call's input: the acknowledgment plus the DAG. */
-export interface DelegateCallInput {
-  reply: string;
-  subtasks: DelegatedSubtask[];
-}
+/** One delegated unit of work, as the reconstructed call carries it. */
+export type DelegatedSubtask = DelegateCallInput["subtasks"][number];
 
 /**
  * One branch's outcome, as the tool result carries it. `output` is null for any

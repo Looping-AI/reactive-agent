@@ -15,10 +15,12 @@ import {
 } from "@/agent/history";
 import {
   DELEGATE_TOOL_NAME,
+  delegatedCallSchema,
   delegateToolCallId,
   type DelegateCallInput,
   type DelegateSubtaskOutcome
 } from "@/agent/subtasks/delegate";
+import { decompositionProposalSchema } from "@/agent/subtasks/decomposition";
 import type { CompositionBranch } from "@/agent/subtasks/types";
 import { FakeSession } from "../helpers/fake-session";
 import { mockModel } from "./mock-model";
@@ -126,6 +128,17 @@ describe("renderCompositionMessages", () => {
     // A result the provider cannot pair to its call is a malformed history.
     expect(call?.toolCallId).toBe(delegateToolCallId(TASK_ID));
     expect(result?.toolCallId).toBe(call?.toolCallId);
+  });
+
+  it("reconstructs the call in the shape the compose tool declares", () => {
+    // The compose model is shown `composeDelegateTool` (delegatedCallSchema); the
+    // reunited call must match it, and must NOT be the emitted Phase 1 shape —
+    // declaring the wrong face is exactly the mismatch this guards against.
+    const input = callInput(
+      renderCompositionMessages(history, TASK_ID, [branch()])
+    );
+    expect(delegatedCallSchema.safeParse(input).success).toBe(true);
+    expect(decompositionProposalSchema.safeParse(input).success).toBe(false);
   });
 
   it("keeps the acknowledgment the user already saw on the calling turn", () => {
@@ -323,6 +336,34 @@ describe("runCompose — multi-branch composition", () => {
     expect(seen).toContain("Composing the final answer");
     expect(seen).toContain("alpha");
     expect(seen).toContain("beta");
+  });
+
+  it("declares delegate in its resolved shape and forbids re-calling it", async () => {
+    const capturing = mockModel({ text: "the answer" });
+    const orig = capturing.doGenerate.bind(capturing);
+    let seen: Parameters<typeof orig>[0] | undefined;
+    capturing.doGenerate = async (options: Parameters<typeof orig>[0]) => {
+      seen ??= options;
+      return orig(options);
+    };
+    await run(two, createModelPair({ model: capturing }));
+
+    const delegate = seen?.tools?.find((t) => t.name === DELEGATE_TOOL_NAME);
+    if (delegate?.type !== "function") {
+      throw new Error("expected a delegate function tool");
+    }
+    // JSON Schema's recursive union doesn't narrow; drill through a loose view.
+    const schema = delegate.inputSchema as {
+      properties?: {
+        subtasks?: { items?: { properties?: Record<string, unknown> } };
+      };
+    };
+    const subtask = schema.properties?.subtasks?.items?.properties;
+    // The resolved face (matches the history call), not Phase 1's emitted one.
+    expect(subtask).toHaveProperty("id");
+    expect(subtask).not.toHaveProperty("localKey");
+    // Declared so the call is interpretable, forbidden so the work isn't redone.
+    expect(seen?.toolChoice).toEqual({ type: "none" });
   });
 
   it("never persists the ephemeral results message to the session", async () => {
