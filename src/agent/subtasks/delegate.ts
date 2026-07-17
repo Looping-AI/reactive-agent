@@ -60,14 +60,17 @@ export const delegateTool = tool({
  */
 export const delegatedCallSchema = z.object({
   reply: z.string(),
-  subtasks: z.array(
-    z.object({
-      id: z.number().int(),
-      type: z.string(),
-      prompt: z.string(),
-      dependsOn: z.array(z.number().int())
-    })
-  )
+  subtasks: z
+    .array(
+      z.object({
+        id: z.number().int(),
+        type: z.string(),
+        prompt: z.string(),
+        dependsOn: z.array(z.number().int())
+      })
+    )
+    .min(1)
+    .max(8)
 });
 
 /**
