@@ -10,3 +10,7 @@ A2A_SIGNING_KEY=
 // ["gateway.example"]. Not a traditional secret, but kept out of wrangler.jsonc
 // for deploy-time convenience (differs per environment, no code change to ship).
 GATEWAY_ORIGINS=
+
+// ARC_API_KEY: API key for the ARC-AGI-3 game API (three.arcprize.org), issued
+// from the ARC-AGI-3 web console. Backs the `arc-game` recipe's tool family.
+ARC_API_KEY=

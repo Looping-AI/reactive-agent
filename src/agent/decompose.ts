@@ -85,7 +85,15 @@ Each subtask has:
   output. The graph must be acyclic.
 
 Subtasks with no dependency between them run at the same time, so only add an edge
-where output genuinely feeds input.`;
+where output genuinely feeds input.
+
+## Playing an ARC-AGI-3 game
+
+If the user asks you to play an ARC-AGI-3 game (e.g. "play game ls20"), emit
+**exactly one** subtask with "type": "arc-game", no dependencies and no other
+subtasks. Put the game the user named verbatim in its "prompt" (e.g. "Play the
+ARC-AGI-3 game ls20."). This runs long — acknowledge in your "reply" that you have
+started playing and will report back, without promising a time.`;
 
 /**
  * Render the model's view of the conversation, marking each referenceable turn

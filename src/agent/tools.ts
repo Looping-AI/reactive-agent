@@ -5,6 +5,9 @@ import type { QuickActionBinding } from "agents/browser";
 import type { Embed } from "./model";
 import { recallSearch, type RecallIndex, type RecallResult } from "./recall";
 import { RECALL_TOP_K } from "@/config";
+import type { WorkspaceHandle } from "@/subagent/workspace";
+import type { ProgressEvent } from "./subtasks/types";
+import { buildArcGameTools } from "@/recipes/arc-game/tools";
 
 /**
  * The agent's tools. Pure handlers are exported separately from the AI-SDK
@@ -67,24 +70,127 @@ export function buildBrowserTools(browser: QuickActionBinding): ToolSet {
 }
 
 /**
+ * Emit a user-facing progress note from inside a tool (e.g. a game level-up). The
+ * resumable runner collects these and ends the current chunk so the parent DO can
+ * post them promptly. Best-effort — the runner never lets a progress note affect
+ * generation.
+ */
+export type EmitProgress = (event: ProgressEvent) => void;
+
+/**
+ * Everything a Recipe tool family needs to build its tools, closed over so none
+ * of it is ever model input: the Worker `env` (bindings/secrets), the execution's
+ * {@link WorkspaceHandle} (durable file store), and {@link EmitProgress}. Passed
+ * to every family so a domain family (e.g. `arc-game`) reaches its API key and
+ * persists session state to the workspace exactly like the browser family closes
+ * over its binding.
+ */
+export interface ToolFamilyContext {
+  env: Env;
+  workspace: WorkspaceHandle;
+  emitProgress: EmitProgress;
+}
+
+/**
+ * A tool family's contribution: its tools, plus an optional `abort` hook the
+ * facet runs on cancellation to reconstruct and release external state (e.g.
+ * close a game scorecard from the session file in the workspace). Reconstructible
+ * from the workspace, so it is safe to run on a fresh isolate after eviction.
+ */
+export interface RecipeToolSet {
+  tools: ToolSet;
+  abort?: (ctx: ToolFamilyContext) => Promise<void>;
+}
+
+/**
+ * The model-facing workspace tools: read/write/list over the execution's durable
+ * file store. Long recipes keep only a small rolling context window, so these are
+ * how the model persists anything it must remember across turns.
+ */
+export function buildWorkspaceTools(workspace: WorkspaceHandle): ToolSet {
+  return {
+    ws_read: tool({
+      description:
+        "Read a file from your workspace. Returns the file's text, or a note if it does not exist.",
+      inputSchema: z.object({
+        path: z.string().describe("File path, e.g. 'notes.md'")
+      }),
+      execute: async ({ path }) => {
+        const content = await workspace.read(path);
+        return content === null ? `(no file at ${path})` : content;
+      }
+    }),
+    ws_write: tool({
+      description:
+        "Create or overwrite a workspace file. Use this to persist notes, hypotheses, and plans so you remember them after older turns scroll out of context.",
+      inputSchema: z.object({
+        path: z.string().describe("File path, e.g. 'notes.md'"),
+        content: z
+          .string()
+          .describe("Full file content (overwrites any existing file)")
+      }),
+      execute: async ({ path, content }) => {
+        try {
+          await workspace.write(path, content);
+          return `wrote ${path}`;
+        } catch (err) {
+          return `error writing ${path}: ${String(err)}`;
+        }
+      }
+    }),
+    ws_list: tool({
+      description: "List the files currently in your workspace.",
+      inputSchema: z.object({
+        dir: z.string().optional().describe("Directory to list (default: root)")
+      }),
+      execute: async ({ dir }) => {
+        const entries = await workspace.list(dir);
+        if (entries.length === 0) return "(workspace is empty)";
+        return entries
+          .map(
+            (e) =>
+              `${e.path}${e.type === "directory" ? "/" : ""} (${e.size} bytes)`
+          )
+          .join("\n");
+      }
+    })
+  };
+}
+
+/**
  * Build the toolset for a validated Recipe's tool families (subagent
- * executions). Families are gated on binding presence like {@link buildTools};
- * unknown families are skipped (defense-in-depth — `validateRecipe` already
- * dropped them). `recall` and the Session's `set_context` are structurally
- * impossible here: they are not in the family map, and a subagent has no
- * Session or recall dependencies to wire them to.
+ * executions), plus an aggregated `abort` hook. Families are gated on binding
+ * presence like {@link buildTools}; unknown families are skipped (defense-in-depth
+ * — `validateRecipe` already dropped them). `recall` and the Session's
+ * `set_context` are structurally impossible here: they are not in the family map,
+ * and a subagent has no Session or recall dependencies to wire them to.
  */
 export function buildRecipeTools(
   toolFamilies: string[],
-  browser?: QuickActionBinding
-): ToolSet {
+  ctx: ToolFamilyContext
+): RecipeToolSet {
   const tools: ToolSet = {};
+  const aborts: Array<(ctx: ToolFamilyContext) => Promise<void>> = [];
+
   for (const family of toolFamilies) {
-    if (family === "browser" && browser) {
-      Object.assign(tools, buildBrowserTools(browser));
+    if (family === "browser" && ctx.env.BROWSER) {
+      Object.assign(tools, buildBrowserTools(ctx.env.BROWSER));
+    } else if (family === "workspace") {
+      Object.assign(tools, buildWorkspaceTools(ctx.workspace));
+    } else if (family === "arc-game") {
+      const built = buildArcGameTools(ctx);
+      Object.assign(tools, built.tools);
+      if (built.abort) aborts.push(built.abort);
     }
   }
-  return tools;
+
+  const abort =
+    aborts.length === 0
+      ? undefined
+      : async (c: ToolFamilyContext) => {
+          for (const run of aborts) await run(c);
+        };
+  return { tools, abort };
 }
 
 /**

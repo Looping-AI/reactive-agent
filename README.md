@@ -97,15 +97,17 @@ npm run keygen agent-1
 `agent-1` is an example key identifier (`kid`), not a required name. Replace it
 with any descriptive identifier you choose for this agent's signing key.
 
-Set `A2A_SIGNING_KEY` in `secrets` to the private JWK printed by `keygen`, and
-set `GATEWAY_ORIGINS` to the deployed gateway origin:
+Set `A2A_SIGNING_KEY` in `secrets` to the private JWK printed by `keygen`, set
+`GATEWAY_ORIGINS` to the deployed gateway origin, and set `ARC_API_KEY` to an
+ARC-AGI-3 API key (from the ARC-AGI-3 web console) for the game-playing recipe:
 
 ```sh
 A2A_SIGNING_KEY=<private JWK printed by keygen>
 GATEWAY_ORIGINS=["gateway.example"]
+ARC_API_KEY=<ARC-AGI-3 API key>
 ```
 
-Deploy the new Worker with both secrets:
+Deploy the new Worker with the secrets:
 
 ```sh
 npx wrangler deploy --secrets-file secrets

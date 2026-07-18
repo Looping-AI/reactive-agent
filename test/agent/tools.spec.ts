@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { buildRecipeTools, buildTools, recall } from "@/agent/tools";
-import type { RecallDeps } from "@/agent/tools";
+import type { RecallDeps, ToolFamilyContext } from "@/agent/tools";
 import type { RecallIndex } from "@/agent/recall";
+import type { WorkspaceHandle } from "@/subagent/workspace";
 import type { QuickActionBinding } from "agents/browser";
 
 /** Recall deps backed by a fake index returning one canned match. */
@@ -96,37 +97,79 @@ describe("buildTools", () => {
   });
 });
 
+/** A no-op workspace handle — registration tests never call the tools. */
+const fakeWorkspace: WorkspaceHandle = {
+  read: async () => null,
+  write: async () => {},
+  exists: async () => false,
+  remove: async () => false,
+  list: async () => [],
+  readJson: async () => null,
+  writeJson: async () => {}
+};
+
+/** Minimal tool-family context; only the fields a given family reads matter. */
+function ctx(over: { browser?: QuickActionBinding } = {}): ToolFamilyContext {
+  return {
+    env: { BROWSER: over.browser, ARC_API_KEY: "test-key" } as unknown as Env,
+    workspace: fakeWorkspace,
+    emitProgress: () => {}
+  };
+}
+
+const BROWSER_TOOLS = [
+  "browser_extract",
+  "browser_links",
+  "browser_markdown",
+  "browser_scrape"
+];
+
 describe("buildRecipeTools", () => {
   it("builds the browser tools for the browser family", () => {
-    const tools = buildRecipeTools(["browser"], browserStub);
-    expect(Object.keys(tools).sort()).toEqual([
-      "browser_extract",
-      "browser_links",
-      "browser_markdown",
-      "browser_scrape"
-    ]);
+    const { tools } = buildRecipeTools(
+      ["browser"],
+      ctx({ browser: browserStub })
+    );
+    expect(Object.keys(tools).sort()).toEqual(BROWSER_TOOLS);
   });
 
   it("skips the browser family when no binding is available", () => {
-    expect(Object.keys(buildRecipeTools(["browser"]))).toEqual([]);
+    const { tools } = buildRecipeTools(["browser"], ctx());
+    expect(Object.keys(tools)).toEqual([]);
   });
 
   it("ignores unknown families — recall/set_context can never appear", () => {
-    const tools = buildRecipeTools(
+    const { tools } = buildRecipeTools(
       ["recall", "set_context", "warp", "browser"],
-      browserStub
+      ctx({ browser: browserStub })
     );
-    expect(Object.keys(tools).sort()).toEqual([
-      "browser_extract",
-      "browser_links",
-      "browser_markdown",
-      "browser_scrape"
-    ]);
+    expect(Object.keys(tools).sort()).toEqual(BROWSER_TOOLS);
     expect(tools.recall).toBeUndefined();
     expect(tools.set_context).toBeUndefined();
   });
 
-  it("builds an empty toolset for no families", () => {
-    expect(Object.keys(buildRecipeTools([], browserStub))).toEqual([]);
+  it("builds the workspace tools for the workspace family", () => {
+    const { tools } = buildRecipeTools(["workspace"], ctx());
+    expect(Object.keys(tools).sort()).toEqual([
+      "ws_list",
+      "ws_read",
+      "ws_write"
+    ]);
+  });
+
+  it("builds the arc-game tools with an abort hook", () => {
+    const built = buildRecipeTools(["arc-game"], ctx());
+    expect(Object.keys(built.tools).sort()).toEqual([
+      "arc_act",
+      "arc_inspect",
+      "arc_start_game"
+    ]);
+    expect(typeof built.abort).toBe("function");
+  });
+
+  it("builds an empty toolset with no abort for no families", () => {
+    const built = buildRecipeTools([], ctx({ browser: browserStub }));
+    expect(Object.keys(built.tools)).toEqual([]);
+    expect(built.abort).toBeUndefined();
   });
 });

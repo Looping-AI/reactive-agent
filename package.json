@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@a2a-js/sdk": "^0.3.14",
+    "@cloudflare/shell": "0.4.1",
     "agents": "^0.17.4",
     "ai": "^6.0.228",
     "drizzle-orm": "^0.45.2",

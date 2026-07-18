@@ -57,6 +57,6 @@
     }
   ],
   "secrets": {
-    "required": ["A2A_SIGNING_KEY", "GATEWAY_ORIGINS"]
+    "required": ["A2A_SIGNING_KEY", "GATEWAY_ORIGINS", "ARC_API_KEY"]
   }
 }

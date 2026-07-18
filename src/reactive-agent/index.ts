@@ -25,9 +25,12 @@ import type {
   CompositionBranch,
   DecomposeTaskResult,
   DependencyResult,
+  RecipeChunkResult,
   RecipeExecutionRequest,
   RecipeExecutionResult,
+  ResolvedRecipe,
   Subtask,
+  SubtaskChunkOutcome,
   SubtaskId,
   SubtaskNode,
   SubtaskStatus
@@ -389,48 +392,127 @@ export class ReactiveAgent extends Agent<Env> {
   }
 
   /**
-   * Phase 2: execute one Subtask in an isolated, managed subagent and durably
-   * record its terminal outcome in the parent.
+   * Phase 2: run **one durable chunk** of a Subtask in an isolated, managed
+   * subagent, posting any progress the chunk emitted and durably recording a
+   * terminal outcome.
    *
-   * The parent owns the child's whole lifecycle. The ordering rules that make this
-   * safe to re-run:
+   * The Workflow calls this repeatedly (chunk 0, 1, …) until it returns
+   * `done: true` — a single-chunk recipe finishes on chunk 0, a long one spans
+   * many. The row status distinguishes the cases with no chunk-number bookkeeping:
+   * chunk 0 claims `pending → running` (fresh — delete any stale child); every
+   * later chunk (and every retry) finds the row already `running` and leaves the
+   * child alone so its checkpointed run state resumes.
+   *
+   * The lifecycle rules that make it safe to re-run are unchanged from the
+   * single-shot original:
    *
    * - A terminal row short-circuits: the result is already durable.
-   * - A **fresh** execution deletes any stale child first, so the new request can
-   *   never collide with a previous one's cached fingerprint.
-   * - An **ambiguous retry** (the row is already `running` — a previous attempt
-   *   crashed) must *not* delete the child: it may hold the cached terminal result
-   *   that makes the retry free.
-   * - The child is deleted **only after** its result is durably copied here.
+   * - A **fresh** execution deletes any stale child first.
+   * - An **ambiguous retry** (row already `running`) must *not* delete the child.
+   * - The child is deleted **only after** its terminal result is copied here.
    *
-   * Throws on a transient fault (the step retries) and on scheduler-invariant
-   * violations (an unknown Subtask, or a dependency that has not completed) — both
-   * are bugs, not outcomes.
+   * Throws on a transient fault (the step retries and the child resumes from its
+   * checkpoint) and on scheduler-invariant violations — both are bugs, not
+   * outcomes.
    */
-  async executeSubtask(id: SubtaskId): Promise<Subtask> {
+  async executeSubtaskChunk(
+    id: SubtaskId,
+    chunk: number,
+    push?: TurnPushContext
+  ): Promise<SubtaskChunkOutcome> {
+    const prepared = await this.prepareChunk(id);
+    if (prepared.kind === "terminal") {
+      return { done: true, status: prepared.subtask.status, progress: [] };
+    }
+    const { request, recipe, name } = prepared;
+
+    const outcome = await this.executeChunkInChild(name, request, chunk);
+
+    // Post progress the chunk emitted (best-effort; postWorking never throws).
+    // Deterministic keys let the gateway dedupe a re-posted event on replay.
+    if (push) {
+      for (const event of outcome.progress) {
+        await this.postWorking(push, event.text, event.key);
+      }
+    }
+
+    if (!outcome.done) {
+      return { done: false, status: "running", progress: outcome.progress };
+    }
+
+    // Terminal chunk. The Task may have been canceled while it ran: discard the
+    // late result, release external state, and leave the row truthfully terminal.
+    if (await this.isTaskCanceled(request.taskId)) {
+      this.db.subtasks.cancelRunning(id);
+      await this.abortChildQuietly(name, recipe.toolFamilies);
+      await this.deleteChildQuietly(name);
+      return {
+        done: true,
+        status: this.requireSubtask(id).status,
+        progress: outcome.progress
+      };
+    }
+
+    const persisted = this.persistResult(id, outcome.result);
+    if (!persisted) {
+      const current = this.requireSubtask(id);
+      if (current.status === "pending" || current.status === "running") {
+        throw new Error(
+          `subtask ${id} could not record its result (status=${current.status})`
+        );
+      }
+      await this.deleteChildQuietly(name);
+      return { done: true, status: current.status, progress: outcome.progress };
+    }
+
+    // Only now is the result durable in the parent — the child is free to go.
+    await this.deleteSubAgent(RecipeSubagent, name);
+    return {
+      done: true,
+      status: this.requireSubtask(id).status,
+      progress: outcome.progress
+    };
+  }
+
+  /**
+   * The shared front half of a chunk: resolve terminal/cancel short-circuits,
+   * validate the Recipe, claim the row (fresh-vs-retry), and assemble the
+   * execution request. Deterministic every chunk, so the request — and thus its
+   * fingerprint — is identical across a run's chunks and their retries.
+   */
+  private async prepareChunk(id: SubtaskId): Promise<
+    | { kind: "terminal"; subtask: Subtask }
+    | {
+        kind: "ready";
+        request: RecipeExecutionRequest;
+        recipe: ResolvedRecipe;
+        name: string;
+      }
+  > {
     const subtask = this.db.subtasks.get(id);
     if (!subtask) throw new Error(`unknown subtask: ${id}`);
-
     const name = subagentName(subtask.taskId, id);
 
     if (subtask.status !== "pending" && subtask.status !== "running") {
       // Already terminal. Sweep the child in case a previous run persisted the
       // result and crashed before deleting it.
       await this.deleteChildQuietly(name);
-      return subtask;
+      return { kind: "terminal", subtask };
     }
 
     if (await this.isTaskCanceled(subtask.taskId)) {
-      // Start no new work. A row left `running` by a previous attempt that
-      // crashed is resolved here rather than left to lie about its state until
-      // cleanup — `cancelPending` only reaches pending rows, so nothing else
-      // would ever transition it.
+      // Start no new work. A row left `running` by a crashed attempt is resolved
+      // here — `cancelPending` only reaches pending rows.
       if (subtask.status === "running") {
         this.db.subtasks.cancelRunning(id);
+        await this.abortChildQuietly(
+          name,
+          this.toolFamiliesForType(subtask.type)
+        );
         await this.deleteChildQuietly(name);
-        return this.requireSubtask(id);
+        return { kind: "terminal", subtask: this.requireSubtask(id) };
       }
-      return subtask;
+      return { kind: "terminal", subtask };
     }
 
     const dependencyResults = this.loadDependencyResults(subtask);
@@ -448,12 +530,12 @@ export class ReactiveAgent extends Agent<Env> {
         recipeVersion: recipe.version
       });
       this.db.subtasks.fail(id, message);
-      return this.requireSubtask(id);
+      return { kind: "terminal", subtask: this.requireSubtask(id) };
     }
 
-    // Record the resolved Recipe at execution start, and claim the row. Winning
-    // this transition is exactly what distinguishes a fresh execution from a
-    // retry — the difference that decides whether the child may be deleted.
+    // Claim the row. Winning the `pending → running` transition distinguishes a
+    // fresh execution (chunk 0) from a retry/continuation — the difference that
+    // decides whether the child may be deleted.
     const claimed = this.db.subtasks.start(id, {
       recipeId: validated.key,
       recipeVersion: validated.version
@@ -464,10 +546,9 @@ export class ReactiveAgent extends Agent<Env> {
     } else {
       const current = this.requireSubtask(id);
       if (current.status !== "running") {
-        await this.deleteChildQuietly(name);
-        return current;
+        return { kind: "terminal", subtask: current };
       }
-      // Ambiguous retry: leave the child alone; its cache may replay the result.
+      // Ambiguous retry / later chunk: leave the child so its run state resumes.
     }
 
     const request: RecipeExecutionRequest = {
@@ -478,51 +559,22 @@ export class ReactiveAgent extends Agent<Env> {
       references: subtask.references,
       dependencyResults
     };
-
-    const result = await this.executeInChild(name, request);
-
-    // The Task may have been canceled while the child ran. The result is late:
-    // discard it, and leave the row in a truthful terminal state.
-    if (await this.isTaskCanceled(subtask.taskId)) {
-      this.db.subtasks.cancelRunning(id);
-      await this.deleteChildQuietly(name);
-      return this.requireSubtask(id);
-    }
-
-    const persisted = this.persistResult(id, result);
-    if (!persisted) {
-      // Lost a race with a concurrent invocation, or the row moved on.
-      const current = this.requireSubtask(id);
-      if (current.status === "pending" || current.status === "running") {
-        throw new Error(
-          `subtask ${id} could not record its result (status=${current.status})`
-        );
-      }
-      await this.deleteChildQuietly(name);
-      return current;
-    }
-
-    // Only now is the result durable in the parent — the child is free to go. A
-    // failure here propagates: the retry hits the terminal-row path above, which
-    // sweeps the child best-effort.
-    await this.deleteSubAgent(RecipeSubagent, name);
-    return this.requireSubtask(id);
+    return { kind: "ready", request, recipe: validated, name };
   }
 
   /**
-   * Invoke the managed child, recreating it once on a fingerprint mismatch.
-   *
-   * A mismatch means a stale child survived from a *different* request under this
-   * name — recoverable exactly once by deleting it and starting clean. A second
-   * mismatch is a genuine lifecycle bug and must surface.
+   * Invoke the managed child for one chunk, recreating it once on a fingerprint
+   * mismatch (a stale child from a *different* request — recoverable exactly once;
+   * a second mismatch is a genuine lifecycle bug and must surface).
    */
-  private async executeInChild(
+  private async executeChunkInChild(
     name: string,
-    request: RecipeExecutionRequest
-  ): Promise<RecipeExecutionResult> {
+    request: RecipeExecutionRequest,
+    chunk: number
+  ): Promise<RecipeChunkResult> {
     const child = await this.subAgent(RecipeSubagent, name);
     try {
-      return await child.execute(request);
+      return await child.executeChunk(request, chunk);
     } catch (err) {
       if (!String(err).includes(FINGERPRINT_MISMATCH)) throw err;
       console.warn("[reactive-agent] stale subagent state, recreating", {
@@ -530,7 +582,37 @@ export class ReactiveAgent extends Agent<Env> {
       });
       await this.deleteSubAgent(RecipeSubagent, name);
       const fresh = await this.subAgent(RecipeSubagent, name);
-      return await fresh.execute(request);
+      return await fresh.executeChunk(request, chunk);
+    }
+  }
+
+  /** The validated tool families for a Subtask type, or none if the recipe is unusable. */
+  private toolFamiliesForType(type: string): string[] {
+    try {
+      return validateRecipe(resolveRecipeForType(type)).toolFamilies;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Best-effort release of a child's external state on cancellation (e.g. close a
+   * game scorecard from its workspace session). Swallows failures — an unreleased
+   * resource is a documented residual, not a reason to fail cancellation.
+   */
+  private async abortChildQuietly(
+    name: string,
+    toolFamilies: string[]
+  ): Promise<void> {
+    if (toolFamilies.length === 0) return;
+    try {
+      const child = await this.subAgent(RecipeSubagent, name);
+      await child.abortExecution(toolFamilies);
+    } catch (err) {
+      console.warn("[reactive-agent] subagent abort failed", {
+        name,
+        err: String(err)
+      });
     }
   }
 

@@ -12,7 +12,7 @@ import {
 import { getAgent, type TurnPushContext } from "@/reactive-agent";
 import { selectWave } from "@/agent/subtasks/scheduler";
 import type { SubtaskId } from "@/agent/subtasks/types";
-import { MAX_SUBTASKS } from "@/config";
+import { MAX_SUBTASKS, MAX_CHUNKS_PER_BRANCH } from "@/config";
 
 /**
  * The async task controller. The gateway no longer waits for a synchronous reply:
@@ -139,7 +139,7 @@ export async function runHandleTask(
   }
 
   // Phase 2: Execute Subtasks.
-  const executed = await executeDag(p, step, stub);
+  const executed = await executeDag(p, step, stub, push);
   if (executed === "canceled") return;
   if (executed === "stuck") {
     await deliver(p, step, stub, null);
@@ -183,7 +183,8 @@ type DagOutcome = "done" | "canceled" | "stuck";
 async function executeDag(
   p: HandleTaskParams,
   step: WorkflowStep,
-  stub: AgentStub
+  stub: AgentStub,
+  push: TurnPushContext
 ): Promise<DagOutcome> {
   for (let wave = 0; wave <= MAX_SUBTASKS; wave++) {
     // One durable step per wave: re-check cancellation, propagate skips past any
@@ -219,7 +220,9 @@ async function executeDag(
     // Every dependency-ready node runs concurrently — the 8-Subtask maximum is
     // the only fan-out bound. `runBranch` never rejects, so a single branch
     // cannot fast-fail `Promise.all` and strand its siblings' durable results.
-    await Promise.all(decision.ids.map((id) => runBranch(p, step, stub, id)));
+    await Promise.all(
+      decision.ids.map((id) => runBranch(p, step, stub, id, push))
+    );
   }
 
   console.error("[handle-task] subtask DAG exceeded its wave budget", {
@@ -229,25 +232,52 @@ async function executeDag(
 }
 
 /**
- * Run one Subtask as a durable step, and make sure the row ends terminal either
- * way.
+ * Run one Subtask to termination as a sequence of durable **chunk** steps, and
+ * make sure the row ends terminal either way.
  *
- * `executeSubtask` resolves a deterministic branch failure into a `failed` row
- * and returns it; it throws only on a transient fault (retry me) or a lifecycle
- * bug. So a throw that survives every retry means nobody is left to resolve this
- * row — fail *the branch* and let Phase 3 disclose the gap, rather than
- * discarding the durable work its siblings already finished.
+ * `executeSubtaskChunk(id, chunk)` advances one chunk: a single-chunk recipe is
+ * `done` on chunk 0 (step `execute:<id>`, byte-identical to the pre-resumable
+ * pipeline); a long recipe yields `done: false` and the loop runs the next chunk
+ * (`execute:<id>:chunk:<n>`) until it terminates. Each chunk is its own retryable
+ * step, and the child resumes from its checkpoint — so no step approaches the
+ * platform timeout.
+ *
+ * It resolves a deterministic branch failure into a `failed` row itself and
+ * throws only on a transient fault (retry me) or a lifecycle bug. So a throw that
+ * survives every retry — or a run that never terminates within the chunk budget —
+ * means nobody is left to resolve this row: fail *the branch* and let Phase 3
+ * disclose the gap, rather than discarding the durable work its siblings finished.
  */
 async function runBranch(
   p: HandleTaskParams,
   step: WorkflowStep,
   stub: AgentStub,
-  id: SubtaskId
+  id: SubtaskId,
+  push: TurnPushContext
 ): Promise<void> {
   try {
-    await step.do(`execute:${id}`, async () => {
-      const subtask = await stub.executeSubtask(id);
-      return subtask.status;
+    for (let chunk = 0; chunk < MAX_CHUNKS_PER_BRANCH; chunk++) {
+      // Chunk 0 keeps the historic `execute:<id>` step name so single-chunk
+      // branches replay byte-identically; later chunks append `:chunk:<n>`.
+      const stepName =
+        chunk === 0 ? `execute:${id}` : `execute:${id}:chunk:${chunk}`;
+      const done = await step.do(stepName, async () => {
+        // The DO posts any progress itself; the step returns only the verdict.
+        const outcome = await stub.executeSubtaskChunk(id, chunk, push);
+        return outcome.done;
+      });
+      if (done) return;
+    }
+    // The run never terminated within its chunk budget — treat as stuck.
+    console.error("[handle-task] subtask exceeded its chunk budget", {
+      taskId: p.taskId,
+      subtaskId: id
+    });
+    await step.do(`fail:${id}`, async () => {
+      await stub.failSubtask(
+        id,
+        `execution exceeded ${MAX_CHUNKS_PER_BRANCH} chunks`
+      );
     });
   } catch (err) {
     console.error("[handle-task] subtask execution exhausted retries", {

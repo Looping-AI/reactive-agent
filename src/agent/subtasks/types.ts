@@ -41,11 +41,29 @@ export interface SubtaskDraft {
 }
 
 /**
+ * Execution budget for one Recipe, enforced by the resumable runner (not the
+ * Workflow). The runner drives the model/tool loop in durable **chunks**: it runs
+ * up to `turnsPerChunk` turns (or `chunkSoftMs` wall-clock, whichever first) per
+ * Workflow step, checkpoints, and yields for a fresh step — so a long run never
+ * exceeds the platform's per-step timeout. `maxTurns` is the whole-execution
+ * ceiling across every chunk. The default recipe sets `maxTurns === turnsPerChunk`
+ * so it always finishes in one chunk.
+ */
+export interface RecipeLimits {
+  /** Whole-execution ceiling on model turns (one turn = one tool-loop step). */
+  maxTurns: number;
+  /** Turns to run within a single durable chunk before yielding a fresh step. */
+  turnsPerChunk: number;
+  /** Soft wall-clock budget (ms) per chunk; ends a chunk early to stay under the step timeout. */
+  chunkSoftMs: number;
+}
+
+/**
  * A fully-resolved Recipe configuration handed to a subagent invocation. Today
- * this is always the code-owned `DEFAULT_RECIPE` (see `agent/subtasks/recipe.ts`);
- * caller-local DB rows mapping into this shape are deferred until a Recipe
- * admin surface exists. Model ids and tool families remain code-validated
- * downstream (`validateRecipe`).
+ * these are code-owned constants (see `agent/subtasks/recipe.ts` and
+ * `recipes/<domain>/recipe.ts`); caller-local DB rows mapping into this shape are
+ * deferred until a Recipe admin surface exists. Model ids, tool families, and
+ * limits remain code-validated downstream (`validateRecipe`).
  */
 export interface ResolvedRecipe {
   key: string;
@@ -55,6 +73,43 @@ export interface ResolvedRecipe {
   soul: string;
   toolFamilies: string[];
   enabled: boolean;
+  /** Turn/chunk/time budget the resumable runner enforces. */
+  limits: RecipeLimits;
+  /** Most-recent turns kept verbatim in the rolling model context; older turns are pruned. */
+  historyWindow: number;
+  /** Append a runtime metrics footer (turns, model calls, wall-clock) to the final result. */
+  reportMetrics: boolean;
+}
+
+/**
+ * A user-facing progress note a tool emits mid-execution (e.g. a game level-up).
+ * The resumable runner collects these and ends the current chunk so the parent
+ * DO can post them promptly; `key` is a stable dedupe id the gateway keys on.
+ */
+export interface ProgressEvent {
+  key: string;
+  text: string;
+}
+
+/**
+ * One durable chunk's outcome as the facet reports it to the parent DO. `done`
+ * false means the run yielded a chunk boundary and the Workflow must run another
+ * chunk; `done` true carries the terminal {@link RecipeExecutionResult}. Progress
+ * events accumulated during the chunk ride along either way.
+ */
+export type RecipeChunkResult =
+  | { done: false; progress: ProgressEvent[] }
+  | { done: true; result: RecipeExecutionResult; progress: ProgressEvent[] };
+
+/**
+ * The parent DO's projection of a chunk outcome for the Workflow (RPC-safe, no
+ * result parts — those are persisted on the row). `status` is `running` until the
+ * run is `done`, then the terminal Subtask status.
+ */
+export interface SubtaskChunkOutcome {
+  done: boolean;
+  status: SubtaskStatus;
+  progress: ProgressEvent[];
 }
 
 /**
