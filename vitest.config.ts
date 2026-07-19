@@ -33,8 +33,8 @@ const fetchMock = createVcrAgent({
   snapshotsDir: SNAPSHOTS_DIR,
   record: RECORD,
   passthroughHosts: [new URL(GATEWAY_ORIGIN).host],
-  excludeHeaders: ["x-api-key"],
-  ignoreHeaders: ["cookie"]
+  excludeHeaders: ["x-api-key", "cookie", "set-cookie"],
+  ignoreHeaders: []
 });
 
 fetchMock.disableNetConnect();
