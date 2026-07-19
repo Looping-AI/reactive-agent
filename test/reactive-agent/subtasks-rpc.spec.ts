@@ -9,12 +9,14 @@ import {
   finalReplyMessageId,
   sessionText
 } from "@/agent/history";
-import { DEFAULT_RECIPE } from "@/agent/subtasks/recipe";
+import { DEFAULT_RECIPE } from "@/agent/subtasks/registry";
 import { DELEGATE_TOOL_NAME } from "@/agent/subtasks/delegate";
 import type { AgentDB } from "@/db/db";
 import type {
+  RecipeChunkResult,
   RecipeExecutionRequest,
   RecipeExecutionResult,
+  Subtask,
   SubtaskDraft
 } from "@/agent/subtasks/types";
 import type { GatewayIdentity } from "@/a2a/verify";
@@ -89,21 +91,43 @@ function pairOf(model: LanguageModel): ModelPair {
 
 /**
  * Stub the managed-child lifecycle on a real DO instance. `subAgent` resolves to a
- * fake child whose `execute` is scripted, so the parent's ordering rules (claim,
- * reset, persist, delete) can be asserted without a real facet or a real model.
+ * fake child whose scripted result the parent's single-chunk path returns, so the
+ * ordering rules (claim, reset, persist, delete) can be asserted without a real
+ * facet or a real model. The fake `executeChunk` wraps the scripted terminal
+ * result as a done chunk — every stubbed subtask here finishes in one chunk.
  */
 function stubChild(
   instance: ReactiveAgent,
   execute: (request: RecipeExecutionRequest) => Promise<RecipeExecutionResult>
 ) {
   const executeSpy = vi.fn(execute);
+  const executeChunk = vi.fn(
+    async (request: RecipeExecutionRequest): Promise<RecipeChunkResult> => ({
+      done: true,
+      result: await executeSpy(request),
+      progress: []
+    })
+  );
+  const abortExecution = vi.fn().mockResolvedValue(undefined);
   const subAgent = vi
     .spyOn(instance, "subAgent")
-    .mockResolvedValue({ execute: executeSpy } as never);
+    .mockResolvedValue({ executeChunk, abortExecution } as never);
   const deleteSubAgent = vi
     .spyOn(instance, "deleteSubAgent")
     .mockResolvedValue(undefined);
-  return { executeSpy, subAgent, deleteSubAgent };
+  return { executeSpy, executeChunk, abortExecution, subAgent, deleteSubAgent };
+}
+
+/**
+ * Run one Subtask to termination through the chunk RPC and return its terminal
+ * row. Single-chunk here (the stub or the real facet-failure path finishes on
+ * chunk 0), so this mirrors what the old `executeSubtask` returned directly.
+ */
+async function exec(instance: ReactiveAgent, id: number): Promise<Subtask> {
+  await instance.executeSubtaskChunk(id, 0);
+  const row = (await instance.listSubtasks(TASK_ID)).find((s) => s.id === id);
+  if (!row) throw new Error(`subtask ${id} not found after execution`);
+  return row;
 }
 
 const OK: RecipeExecutionResult = {
@@ -245,13 +269,13 @@ describe("decomposeTask", () => {
   });
 });
 
-describe("executeSubtask — happy path and lifecycle ordering", () => {
+describe("executeSubtaskChunk — happy path and lifecycle ordering", () => {
   it("runs the child and records the result", async () => {
     await runInDurableObject(freshStub("exec"), async (instance) => {
       const { rows } = seed(instance, [draft()]);
       const { executeSpy } = stubChild(instance, async () => OK);
 
-      const done = await instance.executeSubtask(rows[0].id);
+      const done = await exec(instance, rows[0].id);
 
       expect(done.status).toBe("completed");
       expect(done.resultParts).toEqual([{ kind: "text", text: "the finding" }]);
@@ -264,7 +288,7 @@ describe("executeSubtask — happy path and lifecycle ordering", () => {
       const { rows } = seed(instance, [draft()]);
       stubChild(instance, async () => OK);
 
-      const done = await instance.executeSubtask(rows[0].id);
+      const done = await exec(instance, rows[0].id);
       expect(done.recipeId).toBe(DEFAULT_RECIPE.key);
       expect(done.recipeVersion).toBe(DEFAULT_RECIPE.version);
     });
@@ -276,7 +300,7 @@ describe("executeSubtask — happy path and lifecycle ordering", () => {
       const { rows } = seed(instance, [draft({ references })]);
       const { executeSpy } = stubChild(instance, async () => OK);
 
-      await instance.executeSubtask(rows[0].id);
+      await instance.executeSubtaskChunk(rows[0].id, 0);
 
       const request = executeSpy.mock.calls[0][0];
       expect(request.prompt).toBe("do the thing");
@@ -295,7 +319,7 @@ describe("executeSubtask — happy path and lifecycle ordering", () => {
       );
       const complete = vi.spyOn(db.subtasks, "complete");
 
-      await instance.executeSubtask(rows[0].id);
+      await instance.executeSubtaskChunk(rows[0].id, 0);
 
       // Fresh execution resets stale state first, then persists, then deletes.
       expect(deleteSubAgent.mock.invocationCallOrder[0]).toBeLessThan(
@@ -325,7 +349,7 @@ describe("executeSubtask — happy path and lifecycle ordering", () => {
       }
       const { executeSpy } = stubChild(instance, async () => OK);
 
-      await instance.executeSubtask(rows[2].id);
+      await instance.executeSubtaskChunk(rows[2].id, 0);
 
       const request = executeSpy.mock.calls[0][0];
       expect(request.dependencyResults.map((d) => d.subtaskId)).toEqual([
@@ -347,7 +371,7 @@ describe("executeSubtask — happy path and lifecycle ordering", () => {
         modelId: null
       }));
 
-      const done = await instance.executeSubtask(rows[0].id);
+      const done = await exec(instance, rows[0].id);
       expect(done.status).toBe("failed");
       expect(done.error).toBe("recipe exhausted");
     });
@@ -362,14 +386,14 @@ describe("executeSubtask — happy path and lifecycle ordering", () => {
         modelId: "primary-model"
       }));
 
-      const done = await instance.executeSubtask(rows[0].id);
+      const done = await exec(instance, rows[0].id);
       expect(done.status).toBe("failed");
       expect(done.error).toContain("malformed result");
     });
   });
 });
 
-describe("executeSubtask — retry and recovery", () => {
+describe("executeSubtaskChunk — retry and recovery", () => {
   it("short-circuits a terminal subtask without invoking the child", async () => {
     await runInDurableObject(freshStub("exec-terminal"), async (instance) => {
       const { rows, db } = seed(instance, [draft()]);
@@ -382,7 +406,7 @@ describe("executeSubtask — retry and recovery", () => {
         instance,
         async () => OK
       );
-      const done = await instance.executeSubtask(rows[0].id);
+      const done = await exec(instance, rows[0].id);
 
       expect(done.status).toBe("completed");
       expect(executeSpy).not.toHaveBeenCalled();
@@ -401,7 +425,7 @@ describe("executeSubtask — retry and recovery", () => {
         instance,
         async () => OK
       );
-      await instance.executeSubtask(rows[0].id);
+      await instance.executeSubtaskChunk(rows[0].id, 0);
 
       // The child may hold the cached terminal result — deleting it pre-execution
       // would throw that away and force a re-inference.
@@ -420,7 +444,7 @@ describe("executeSubtask — retry and recovery", () => {
         return OK;
       });
 
-      const done = await instance.executeSubtask(rows[0].id);
+      const done = await exec(instance, rows[0].id);
 
       expect(done.status).toBe("completed");
       expect(call).toBe(2);
@@ -436,7 +460,7 @@ describe("executeSubtask — retry and recovery", () => {
         throw new Error(`${FINGERPRINT_MISMATCH}: still stale`);
       });
 
-      await expect(instance.executeSubtask(rows[0].id)).rejects.toThrow(
+      await expect(instance.executeSubtaskChunk(rows[0].id, 0)).rejects.toThrow(
         FINGERPRINT_MISMATCH
       );
     });
@@ -449,7 +473,9 @@ describe("executeSubtask — retry and recovery", () => {
         throw new Error("3040: capacity temporarily exceeded");
       });
 
-      await expect(instance.executeSubtask(rows[0].id)).rejects.toThrow(/3040/);
+      await expect(instance.executeSubtaskChunk(rows[0].id, 0)).rejects.toThrow(
+        /3040/
+      );
       // Left running for the step retry to resume.
       expect((await instance.listSubtasks(TASK_ID))[0].status).toBe("running");
     });
@@ -457,7 +483,7 @@ describe("executeSubtask — retry and recovery", () => {
 
   it("throws on an unknown subtask", async () => {
     await runInDurableObject(freshStub("exec-unknown"), async (instance) => {
-      await expect(instance.executeSubtask(9999)).rejects.toThrow(
+      await expect(instance.executeSubtaskChunk(9999, 0)).rejects.toThrow(
         /unknown subtask/
       );
     });
@@ -471,14 +497,14 @@ describe("executeSubtask — retry and recovery", () => {
       ]);
       stubChild(instance, async () => OK);
 
-      await expect(instance.executeSubtask(rows[1].id)).rejects.toThrow(
+      await expect(instance.executeSubtaskChunk(rows[1].id, 0)).rejects.toThrow(
         /ran before dependency/
       );
     });
   });
 });
 
-describe("executeSubtask — cancellation", () => {
+describe("executeSubtaskChunk — cancellation", () => {
   it("does not start work for a canceled task", async () => {
     await runInDurableObject(freshStub("exec-cancel-pre"), async (instance) => {
       const { rows } = seed(instance, [draft()]);
@@ -490,7 +516,7 @@ describe("executeSubtask — cancellation", () => {
       await instance.cancelTask(TASK_ID);
       const { executeSpy } = stubChild(instance, async () => OK);
 
-      const row = await instance.executeSubtask(rows[0].id);
+      const row = await exec(instance, rows[0].id);
       expect(executeSpy).not.toHaveBeenCalled();
       expect(row.status).toBe("pending");
     });
@@ -514,7 +540,7 @@ describe("executeSubtask — cancellation", () => {
         await instance.cancelTask(TASK_ID);
         const { executeSpy } = stubChild(instance, async () => OK);
 
-        const row = await instance.executeSubtask(rows[0].id);
+        const row = await exec(instance, rows[0].id);
 
         // cancelPending only reaches pending rows, so this path must resolve it —
         // otherwise the row stays `running` until the 30-day cleanup.
@@ -540,7 +566,7 @@ describe("executeSubtask — cancellation", () => {
           return OK;
         });
 
-        const row = await instance.executeSubtask(rows[0].id);
+        const row = await exec(instance, rows[0].id);
 
         expect(row.status).toBe("canceled");
         expect(row.resultParts).toBeNull();
@@ -799,7 +825,7 @@ describe("failSubtask", () => {
   });
 });
 
-describe("executeSubtask — real facet integration", () => {
+describe("executeSubtaskChunk — real facet integration", () => {
   it("records a terminal failure and leaves no child behind", async () => {
     await runInDurableObject(freshStub("exec-real"), async (instance) => {
       const { rows } = seed(instance, [draft()]);
@@ -807,7 +833,7 @@ describe("executeSubtask — real facet integration", () => {
       // No stubbing: a real RecipeSubagent facet runs. env.AI has no local mode,
       // so the child exhausts both models and returns a terminal failure — which
       // is exactly the parent path we want proven end-to-end.
-      const done = await instance.executeSubtask(rows[0].id);
+      const done = await exec(instance, rows[0].id);
 
       expect(done.status).toBe("failed");
       expect(done.error).toContain("recipe exhausted");

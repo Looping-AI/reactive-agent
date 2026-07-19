@@ -1,5 +1,5 @@
 /**
- * Unit tests for the code-owned default Recipe (src/agent/subtasks/recipe.ts).
+ * Unit tests for the code-owned default Recipe (src/agent/subtasks/registry.ts).
  *
  * The default lives in code, not the DB, so it always reflects config.ts — these
  * tests guard against drift and confirm resolution is code-only for now.
@@ -11,9 +11,14 @@ import {
   STATELESS_SUBAGENT_SOUL,
   resolveRecipeForType,
   validateRecipe
-} from "@/agent/subtasks/recipe";
+} from "@/agent/subtasks/registry";
 import type { ResolvedRecipe } from "@/agent/subtasks/types";
-import { CHAT_MODEL_ID, CHAT_FALLBACK_MODEL_ID } from "@/config";
+import {
+  CHAT_MODEL_ID,
+  CHAT_FALLBACK_MODEL_ID,
+  DEFAULT_MAX_TURNS,
+  MAX_STEPS
+} from "@/config";
 
 describe("DEFAULT_RECIPE", () => {
   it("mirrors the config model ids (no stale DB seed)", () => {
@@ -28,12 +33,32 @@ describe("DEFAULT_RECIPE", () => {
     expect(DEFAULT_RECIPE.toolFamilies).toEqual(["browser"]);
     expect(DEFAULT_RECIPE.soul).toBe(STATELESS_SUBAGENT_SOUL);
   });
+
+  it("completes in a single chunk (maxTurns === turnsPerChunk) and reports no metrics", () => {
+    expect(DEFAULT_RECIPE.limits.maxTurns).toBe(
+      DEFAULT_RECIPE.limits.turnsPerChunk
+    );
+    expect(DEFAULT_RECIPE.limits.maxTurns).toBe(MAX_STEPS);
+    expect(DEFAULT_RECIPE.historyWindow).toBeGreaterThanOrEqual(
+      DEFAULT_RECIPE.limits.maxTurns
+    );
+    expect(DEFAULT_RECIPE.reportMetrics).toBe(false);
+  });
 });
 
 describe("resolveRecipeForType", () => {
-  it("returns the code default for any semantic type (code-only for now)", () => {
+  it("returns the code default for an unmapped semantic type", () => {
     expect(resolveRecipeForType("general")).toBe(DEFAULT_RECIPE);
     expect(resolveRecipeForType("research")).toBe(DEFAULT_RECIPE);
+  });
+
+  it("routes the arc-game type to the long-running ARC recipe", () => {
+    const recipe = resolveRecipeForType("arc-game");
+    expect(recipe.key).toBe("arc-game");
+    // A long recipe: many turns spanning multiple chunks, and it reports metrics.
+    expect(recipe.limits.maxTurns).toBeGreaterThan(recipe.limits.turnsPerChunk);
+    expect(recipe.reportMetrics).toBe(true);
+    expect(recipe.toolFamilies).toEqual(["workspace", "arc-game"]);
   });
 });
 
@@ -97,5 +122,31 @@ describe("validateRecipe", () => {
     expect(() => validateRecipe(custom({ enabled: false }))).toThrow(
       RecipeValidationError
     );
+  });
+
+  it("clamps turnsPerChunk to maxTurns and substitutes non-positive limits", () => {
+    const validated = validateRecipe(
+      custom({
+        limits: { maxTurns: 100, turnsPerChunk: 250, chunkSoftMs: -5 }
+      })
+    );
+    expect(validated.limits.maxTurns).toBe(100);
+    expect(validated.limits.turnsPerChunk).toBe(100); // clamped down to maxTurns
+    expect(validated.limits.chunkSoftMs).toBeGreaterThan(0); // substituted default
+  });
+
+  it("substitutes a code default for a non-integer maxTurns", () => {
+    const validated = validateRecipe(
+      custom({ limits: { maxTurns: 0, turnsPerChunk: 4, chunkSoftMs: 1000 } })
+    );
+    expect(validated.limits.maxTurns).toBe(DEFAULT_MAX_TURNS);
+    // turnsPerChunk (4) is still <= the substituted default, so it survives.
+    expect(validated.limits.turnsPerChunk).toBe(4);
+  });
+
+  it("substitutes a code default for a non-positive historyWindow", () => {
+    expect(
+      validateRecipe(custom({ historyWindow: 0 })).historyWindow
+    ).toBeGreaterThan(0);
   });
 });

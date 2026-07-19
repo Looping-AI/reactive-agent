@@ -67,7 +67,7 @@ function stepFake(cache?: Map<string, unknown>): StepFake {
 // agent fake
 // ---------------------------------------------------------------------------
 
-/** What `executeSubtask` should do for a given node. */
+/** What `executeSubtaskChunk` should do for a given node. */
 type Outcome = "completed" | "failed" | "throw";
 
 interface AgentOptions {
@@ -75,6 +75,8 @@ interface AgentOptions {
   dag?: [number, number[]][];
   /** Per-node execution outcome. Default: `completed`. */
   outcomes?: Record<number, Outcome>;
+  /** Per-node chunk count before the run terminates. Default: 1 (single chunk). */
+  chunks?: Record<number, number>;
   /** Make decomposition report a typed failure. */
   decomposeFails?: boolean;
   /** Make composition report a typed failure. */
@@ -93,7 +95,7 @@ interface AgentFake {
     dependsOn: number[];
   }[];
   state?: Task["status"]["state"];
-  /** Highest number of `executeSubtask` calls in flight at once. */
+  /** Highest number of `executeSubtaskChunk` calls in flight at once. */
   maxConcurrent: number;
   executed: number[];
   failed: { id: number; error: string }[];
@@ -168,10 +170,10 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
       }
     }),
 
-    executeSubtask: vi.fn(async (id: number) => {
+    executeSubtaskChunk: vi.fn(async (id: number, chunk: number) => {
       inFlight++;
       agent.maxConcurrent = Math.max(agent.maxConcurrent, inFlight);
-      agent.executed.push(id);
+      if (chunk === 0) agent.executed.push(id);
       opts.onExecute?.(id, agent);
       // Yield so siblings in the same wave get to start before any finishes —
       // this is what makes `maxConcurrent` meaningful.
@@ -180,9 +182,18 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
 
       const outcome = opts.outcomes?.[id] ?? "completed";
       if (outcome === "throw") throw new Error(`transient fault on ${id}`);
+      // A node yields `done: false` until it has run its configured chunk count.
+      const totalChunks = opts.chunks?.[id] ?? 1;
+      if (chunk < totalChunks - 1) {
+        return {
+          done: false,
+          status: "running" as SubtaskStatus,
+          progress: []
+        };
+      }
       const node = agent.nodes.find((n) => n.id === id)!;
       node.status = outcome;
-      return { ...node, status: outcome };
+      return { done: true, status: outcome, progress: [] };
     }),
 
     failSubtask: vi.fn(async (id: number, error: string) => {
@@ -312,6 +323,24 @@ describe("HandleTaskWorkflow — the five phases", () => {
     await runHandleTask(params(), stepFake().step);
 
     expect(bodyOf(captured)).toEqual(agent.saved);
+  });
+
+  it("runs a multi-chunk node as a sequence of durable chunk steps until done", async () => {
+    // A long recipe yields `done: false` and gets another chunk: chunk 0 keeps the
+    // historic `execute:<id>` name (single-chunk branches replay byte-identically),
+    // later chunks append `:chunk:<n>`, and the loop stops on the terminal chunk.
+    const agent = mockAgent({ chunks: { 1: 3 } });
+    mockFetch();
+    const { step, names } = stepFake();
+
+    await runHandleTask(params(), step);
+
+    expect(names.filter((n) => n.startsWith("execute:"))).toEqual([
+      "execute:1",
+      "execute:1:chunk:1",
+      "execute:1:chunk:2"
+    ]);
+    expect(agent.saved?.status.state).toBe("completed");
   });
 
   it("threads the push context into decomposition so it can stream the first reply", async () => {

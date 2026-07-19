@@ -1,5 +1,13 @@
-import { CHAT_MODEL_ID, CHAT_FALLBACK_MODEL_ID } from "@/config";
-import type { ResolvedRecipe } from "./types";
+import {
+  CHAT_MODEL_ID,
+  CHAT_FALLBACK_MODEL_ID,
+  DEFAULT_MAX_TURNS,
+  DEFAULT_TURNS_PER_CHUNK,
+  DEFAULT_CHUNK_SOFT_MS,
+  DEFAULT_HISTORY_WINDOW
+} from "@/config";
+import { ARC_GAME_RECIPE } from "@/recipes/arc-game/recipe";
+import type { RecipeLimits, ResolvedRecipe } from "./types";
 
 /**
  * The stateless subagent soul — the frozen identity for a managed Subtask
@@ -29,17 +37,32 @@ export const DEFAULT_RECIPE: ResolvedRecipe = {
   fallbackModelId: CHAT_FALLBACK_MODEL_ID,
   soul: STATELESS_SUBAGENT_SOUL,
   toolFamilies: ["browser"],
-  enabled: true
+  enabled: true,
+  // maxTurns === turnsPerChunk ⇒ the default recipe always completes in a single
+  // durable chunk, identical to the pre-resumable-runner behavior. historyWindow
+  // exceeds maxTurns so a default run never prunes its own context.
+  limits: {
+    maxTurns: DEFAULT_MAX_TURNS,
+    turnsPerChunk: DEFAULT_TURNS_PER_CHUNK,
+    chunkSoftMs: DEFAULT_CHUNK_SOFT_MS
+  },
+  historyWindow: DEFAULT_HISTORY_WINDOW,
+  reportMetrics: false
 };
 
 /**
- * Resolve a semantic Subtask type to its Recipe configuration. Code-only
- * (always the {@link DEFAULT_RECIPE}); this is the seam a future Recipe admin
- * phase extends to consult caller-local `subtask_type_recipes`/`recipes` tables
- * before falling back here.
+ * Resolve a semantic Subtask type to its Recipe configuration. Code-only — a
+ * small switch over the domain recipes plus the {@link DEFAULT_RECIPE} fallback.
+ * This is the seam a future Recipe admin phase extends to consult caller-local
+ * `subtask_type_recipes`/`recipes` tables before falling back here.
  */
-export function resolveRecipeForType(_type: string): ResolvedRecipe {
-  return DEFAULT_RECIPE;
+export function resolveRecipeForType(type: string): ResolvedRecipe {
+  switch (type) {
+    case ARC_GAME_RECIPE.key:
+      return ARC_GAME_RECIPE;
+    default:
+      return DEFAULT_RECIPE;
+  }
 }
 
 /**
@@ -58,7 +81,29 @@ export const SUBAGENT_MODEL_ALLOWLIST: ReadonlySet<string> = new Set([
  * or durable memory to reach — and their absence here makes them structurally
  * impossible to enable through Recipe data.
  */
-export const KNOWN_TOOL_FAMILIES: ReadonlySet<string> = new Set(["browser"]);
+export const KNOWN_TOOL_FAMILIES: ReadonlySet<string> = new Set([
+  "browser",
+  "workspace",
+  "arc-game"
+]);
+
+/**
+ * Clamp a Recipe-supplied limit to a positive integer, substituting a code
+ * default for a missing, non-integer, or non-positive value. Defense-in-depth for
+ * a future DB-sourced Recipe: limits drive the runner's loop bounds, so a bad
+ * value must degrade to a safe default rather than spin or stall.
+ */
+function normalizeLimits(limits: RecipeLimits): RecipeLimits {
+  const positiveInt = (n: number, fallback: number): number =>
+    Number.isInteger(n) && n > 0 ? n : fallback;
+  const maxTurns = positiveInt(limits?.maxTurns, DEFAULT_MAX_TURNS);
+  const turnsPerChunk = Math.min(
+    positiveInt(limits?.turnsPerChunk, DEFAULT_TURNS_PER_CHUNK),
+    maxTurns
+  );
+  const chunkSoftMs = positiveInt(limits?.chunkSoftMs, DEFAULT_CHUNK_SOFT_MS);
+  return { maxTurns, turnsPerChunk, chunkSoftMs };
+}
 
 /**
  * Thrown by {@link validateRecipe} for a disabled Recipe — a deterministic
@@ -88,6 +133,10 @@ export function validateRecipe(recipe: ResolvedRecipe): ResolvedRecipe {
   const toolFamilies = [...new Set(recipe.toolFamilies)].filter((family) =>
     KNOWN_TOOL_FAMILIES.has(family)
   );
+  const historyWindow =
+    Number.isInteger(recipe.historyWindow) && recipe.historyWindow > 0
+      ? recipe.historyWindow
+      : DEFAULT_HISTORY_WINDOW;
   return {
     ...recipe,
     primaryModelId: SUBAGENT_MODEL_ALLOWLIST.has(recipe.primaryModelId)
@@ -97,6 +146,8 @@ export function validateRecipe(recipe: ResolvedRecipe): ResolvedRecipe {
       ? recipe.fallbackModelId
       : CHAT_FALLBACK_MODEL_ID,
     soul,
-    toolFamilies
+    toolFamilies,
+    limits: normalizeLimits(recipe.limits),
+    historyWindow
   };
 }

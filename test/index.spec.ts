@@ -23,6 +23,7 @@ const PUSH_TOKEN = "push-token-abc";
 const TEST_ENV: Env = {
   A2A_SIGNING_KEY: JSON.stringify(TEST_AGENT_PRIVATE_JWK),
   GATEWAY_ORIGINS: JSON.stringify([GATEWAY_ORIGIN]),
+  ARC_API_KEY: "test-arc-key",
   AI: undefined as unknown as Ai,
   BROWSER: undefined as unknown as BrowserRun,
   ReactiveAgent: undefined as unknown as DurableObjectNamespace<ReactiveAgent>,

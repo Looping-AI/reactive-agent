@@ -11,7 +11,11 @@ import { runInDurableObject } from "cloudflare:test";
 import type { LanguageModel } from "ai";
 import { FINGERPRINT_MISMATCH, RecipeSubagent, subagentName } from "@/subagent";
 import type { ModelPair } from "@/agent/model";
-import { DEFAULT_RECIPE } from "@/agent/subtasks/recipe";
+import type {
+  RecipeExecutionRequest,
+  RecipeExecutionResult
+} from "@/agent/subtasks/types";
+import { DEFAULT_RECIPE } from "@/agent/subtasks/registry";
 import { CHAT_MODEL_ID, CHAT_FALLBACK_MODEL_ID } from "@/config";
 import { mockModel } from "../agent/mock-model";
 import { makeRequest } from "./fixtures";
@@ -53,13 +57,27 @@ function countingPair(
   };
 }
 
+/**
+ * Drive a single-chunk execution to its terminal result. The default recipe
+ * (`maxTurns === turnsPerChunk`) always completes on chunk 0, so a done outcome
+ * carries the terminal result the old `execute` used to return directly.
+ */
+async function terminal(
+  child: RecipeSubagent,
+  request: RecipeExecutionRequest
+): Promise<RecipeExecutionResult> {
+  const out = await child.executeChunk(request, 0);
+  if (!out.done) throw new Error("expected a single-chunk terminal outcome");
+  return out.result;
+}
+
 describe("subagentName", () => {
   it("is deterministic per (taskId, subtaskId)", () => {
     expect(subagentName("task-9", 3)).toBe("subtask:task-9:3");
   });
 });
 
-describe("RecipeSubagent.execute", () => {
+describe("RecipeSubagent.executeChunk", () => {
   it("completes, caches the terminal result, and replays it without inference", async () => {
     await runInDurableObject(freshChild("complete"), async (child) => {
       const pair = countingPair(
@@ -70,7 +88,7 @@ describe("RecipeSubagent.execute", () => {
       );
       child.modelsOverride = pair;
 
-      const result = await child.execute(makeRequest());
+      const result = await terminal(child, makeRequest());
       expect(result).toEqual({
         status: "completed",
         resultParts: [{ kind: "text", text: "the answer" }],
@@ -78,7 +96,7 @@ describe("RecipeSubagent.execute", () => {
       });
       expect(pair.attempts()).toBe(1);
 
-      const again = await child.execute(makeRequest());
+      const again = await terminal(child, makeRequest());
       expect(again).toEqual(result);
       expect(pair.attempts()).toBe(1);
     });
@@ -96,14 +114,14 @@ describe("RecipeSubagent.execute", () => {
       );
       child.modelsOverride = pair;
 
-      const result = await child.execute(makeRequest());
+      const result = await terminal(child, makeRequest());
       expect(result.status).toBe("failed");
       if (result.status === "failed") {
         expect(result.error).toContain("recipe exhausted");
       }
       expect(pair.attempts()).toBe(2);
 
-      const again = await child.execute(makeRequest());
+      const again = await terminal(child, makeRequest());
       expect(again).toEqual(result);
       expect(pair.attempts()).toBe(2);
     });
@@ -118,11 +136,11 @@ describe("RecipeSubagent.execute", () => {
         }
       );
 
-      const original = await child.execute(makeRequest());
+      const original = await terminal(child, makeRequest());
       await expect(
-        child.execute(makeRequest({ prompt: "A different task." }))
+        terminal(child, makeRequest({ prompt: "A different task." }))
       ).rejects.toThrow(FINGERPRINT_MISMATCH);
-      expect(await child.execute(makeRequest())).toEqual(original);
+      expect(await terminal(child, makeRequest())).toEqual(original);
     });
   });
 
@@ -136,7 +154,7 @@ describe("RecipeSubagent.execute", () => {
           throw new Error("also down");
         }
       );
-      await expect(child.execute(makeRequest())).rejects.toThrow("3040");
+      await expect(terminal(child, makeRequest())).rejects.toThrow("3040");
 
       // The fault left no cached result: the same request now succeeds.
       const pair = countingPair(
@@ -146,7 +164,7 @@ describe("RecipeSubagent.execute", () => {
         }
       );
       child.modelsOverride = pair;
-      const result = await child.execute(makeRequest());
+      const result = await terminal(child, makeRequest());
       expect(result.status).toBe("completed");
       expect(pair.attempts()).toBe(1);
     });
@@ -163,7 +181,7 @@ describe("RecipeSubagent.execute", () => {
       const request = makeRequest({
         recipe: { ...DEFAULT_RECIPE, enabled: false }
       });
-      const result = await child.execute(request);
+      const result = await terminal(child, request);
       expect(result).toEqual({
         status: "failed",
         error: expect.stringContaining("disabled") as string,
@@ -172,7 +190,7 @@ describe("RecipeSubagent.execute", () => {
       expect(pair.attempts()).toBe(0);
 
       // Deterministic, so cached like any terminal outcome.
-      expect(await child.execute(request)).toEqual(result);
+      expect(await terminal(child, request)).toEqual(result);
     });
   });
 
@@ -181,7 +199,8 @@ describe("RecipeSubagent.execute", () => {
       // No override: the validated ids flow into createModelPair. The real
       // Workers-AI binding has no local mode, so both attempts fail and the
       // diagnostics reveal which ids were actually used.
-      const result = await child.execute(
+      const result = await terminal(
+        child,
         makeRequest({
           recipe: {
             ...DEFAULT_RECIPE,
@@ -209,9 +228,12 @@ describe("RecipeSubagent facet lifecycle", () => {
       // No model injection through the facet stub: the real Workers-AI path
       // fails gracefully (env.AI has no local mode), exercising the
       // deterministic recipe-exhausted terminal path end-to-end.
-      const result = await child.execute(makeRequest());
-      expect(result.status).toBe("failed");
-      expect(await child.execute(makeRequest())).toEqual(result);
+      const chunk = await child.executeChunk(makeRequest(), 0);
+      expect(chunk.done).toBe(true);
+      const result = chunk.done ? chunk.result : undefined;
+      expect(result?.status).toBe("failed");
+      const replay = await child.executeChunk(makeRequest(), 0);
+      expect(replay.done && replay.result).toEqual(result);
 
       // Settle the RPC promise into a plain one before asserting. A stub call
       // returns workerd's RpcPromise, whose property access is pipelined into
@@ -219,7 +241,7 @@ describe("RecipeSubagent facet lifecycle", () => {
       // pipelined promises that reject with no handler, which Vitest reports as
       // an unhandled rejection and fails the run on.
       const mismatch = await child
-        .execute(makeRequest({ prompt: "A different task." }))
+        .executeChunk(makeRequest({ prompt: "A different task." }), 0)
         .then(
           () => undefined,
           (err: unknown) => err
@@ -240,10 +262,11 @@ describe("RecipeSubagent facet lifecycle", () => {
       // Deletion wiped the child's storage: the request that mismatched above
       // now executes fresh on the re-created child instead of rejecting.
       const recreated = await instance.subAgent(RecipeSubagent, name);
-      const fresh = await recreated.execute(
-        makeRequest({ prompt: "A different task." })
+      const fresh = await recreated.executeChunk(
+        makeRequest({ prompt: "A different task." }),
+        0
       );
-      expect(fresh.status).toBe("failed");
+      expect(fresh.done && fresh.result.status).toBe("failed");
       await instance.deleteSubAgent(RecipeSubagent, name);
     });
   });

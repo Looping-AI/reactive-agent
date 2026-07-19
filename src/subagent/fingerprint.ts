@@ -18,7 +18,14 @@ export function canonicalRequest(request: RecipeExecutionRequest): string {
     fallbackModelId: request.recipe.fallbackModelId,
     soul: request.recipe.soul,
     toolFamilies: request.recipe.toolFamilies,
-    enabled: request.recipe.enabled
+    enabled: request.recipe.enabled,
+    limits: {
+      maxTurns: request.recipe.limits.maxTurns,
+      turnsPerChunk: request.recipe.limits.turnsPerChunk,
+      chunkSoftMs: request.recipe.limits.chunkSoftMs
+    },
+    historyWindow: request.recipe.historyWindow,
+    reportMetrics: request.recipe.reportMetrics
   };
   const canonical: RecipeExecutionRequest = {
     taskId: request.taskId,

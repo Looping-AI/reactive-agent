@@ -50,6 +50,19 @@ describe("fingerprintRequest", () => {
     ],
     ["recipe version", { recipe: { ...makeRequest().recipe, version: 2 } }],
     [
+      "a recipe limit",
+      {
+        recipe: {
+          ...makeRequest().recipe,
+          limits: { ...makeRequest().recipe.limits, maxTurns: 999 }
+        }
+      }
+    ],
+    [
+      "the history window",
+      { recipe: { ...makeRequest().recipe, historyWindow: 3 } }
+    ],
+    [
       "a model id",
       { recipe: { ...makeRequest().recipe, primaryModelId: "@cf/other/model" } }
     ],

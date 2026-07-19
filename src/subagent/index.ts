@@ -1,15 +1,23 @@
 import { Agent } from "agents";
 import { z } from "zod";
+import type { Workspace } from "@cloudflare/shell";
 import { createModelPair, type ModelPair } from "@/agent/model";
 import { buildRecipeTools } from "@/agent/tools";
-import { RecipeValidationError, validateRecipe } from "@/agent/subtasks/recipe";
+import {
+  RecipeValidationError,
+  validateRecipe
+} from "@/agent/subtasks/registry";
 import type {
+  ProgressEvent,
+  RecipeChunkResult,
   RecipeExecutionRequest,
   RecipeExecutionResult,
   SubtaskId
 } from "@/agent/subtasks/types";
+import { renderSubagentPrompt } from "./prompt";
+import { createDurableWorkspace, makeWorkspaceHandle } from "./workspace";
 import { fingerprintRequest } from "./fingerprint";
-import { runRecipeExecution } from "./run";
+import { runResumableChunk, type ChunkRunState } from "./run";
 
 /**
  * Message prefix of the error thrown when a child that already holds a cached
@@ -54,14 +62,19 @@ const cachedResultSchema = z.discriminatedUnion("status", [
  * never resolves a Recipe itself — it defensively re-validates the resolved
  * Recipe the parent sends and accepts no configuration beyond it.
  *
- * Retry safety: the child persists exactly one terminal result in its own
- * SQLite, keyed by the deterministic request fingerprint. A retry with the
- * same fingerprint returns the cached result without re-running inference; a
- * different request for the same child name is rejected
+ * Retry safety: the child persists at most one terminal result in its own
+ * SQLite, keyed by the deterministic request fingerprint, plus the rolling
+ * `run_state` of an in-progress multi-chunk run. A retry with the same
+ * fingerprint replays the terminal result or resumes the run without repeating
+ * completed work; a different request for the same child name is rejected
  * ({@link FINGERPRINT_MISMATCH}). Transient platform faults throw and cache
- * nothing, so the enclosing Workflow step can retry inference. The parent
- * deletes the child (`deleteSubAgent`) only after its durable copy of the
- * result succeeds, which wipes this storage.
+ * nothing, so the enclosing Workflow step can retry. The parent deletes the child
+ * (`deleteSubAgent`) only after its durable copy of the result succeeds, which
+ * wipes this storage — the workspace and run state included.
+ *
+ * Not "stateless" like the single-shot original: it owns per-execution durable
+ * state (the workspace and the run checkpoint), scoped to one execution and swept
+ * with the child.
  */
 export class RecipeSubagent extends Agent<Env> {
   /**
@@ -73,16 +86,18 @@ export class RecipeSubagent extends Agent<Env> {
    */
   modelsOverride?: ModelPair;
 
+  private _workspace?: Workspace;
+
   async onStart(): Promise<void> {
-    this.ensureCacheTable();
+    this.ensureTables();
   }
 
   /**
-   * Idempotent schema bootstrap. Also called lazily from `execute()` so
-   * `runInDurableObject`-style tests reach a ready table without RPC dispatch
+   * Idempotent schema bootstrap. Also called lazily from the RPCs so
+   * `runInDurableObject`-style tests reach ready tables without RPC dispatch
    * (mirroring how `AgentDB` migrates on construction).
    */
-  private ensureCacheTable(): void {
+  private ensureTables(): void {
     this.sql`
       CREATE TABLE IF NOT EXISTS execution_cache (
         slot INTEGER PRIMARY KEY CHECK (slot = 1),
@@ -91,56 +106,146 @@ export class RecipeSubagent extends Agent<Env> {
         created_at INTEGER NOT NULL
       )
     `;
+    this.sql`
+      CREATE TABLE IF NOT EXISTS run_state (
+        slot INTEGER PRIMARY KEY CHECK (slot = 1),
+        fingerprint TEXT NOT NULL,
+        state_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `;
+  }
+
+  /** The recipe's durable workspace, backed by this facet's own SQLite storage. */
+  private workspace(): Workspace {
+    return (this._workspace ??= createDurableWorkspace(
+      this.ctx.storage.sql,
+      () => this.name
+    ));
   }
 
   /**
-   * Execute one Subtask under the parent's already-resolved Recipe and return
-   * the terminal outcome. Deterministic outcomes — completed, or failed via a
-   * disabled Recipe / empty prompt / exhausted models — are cached and
-   * replayed; only transient platform faults throw.
+   * Execute one durable chunk of a Subtask under the parent's resolved Recipe.
+   *
+   * A terminal outcome (completed / failed) is cached and replayed on retry. A
+   * mid-run chunk persists its rolling state to `run_state` and returns a
+   * `done: false` yield for the Workflow to run another chunk. `chunk` is a
+   * separate argument — never part of `request` — so every chunk fingerprints
+   * identically and the cache/resume keys line up. Only transient platform faults
+   * throw (nothing cached), so a Workflow retry resumes from the last checkpoint.
    */
-  async execute(
-    request: RecipeExecutionRequest
-  ): Promise<RecipeExecutionResult> {
-    this.ensureCacheTable();
+  async executeChunk(
+    request: RecipeExecutionRequest,
+    _chunk: number
+  ): Promise<RecipeChunkResult> {
+    this.ensureTables();
     const fingerprint = await fingerprintRequest(request);
 
+    // A terminal result already exists → replay it (idempotent retry).
     const cached = this.sql<{ fingerprint: string; result_json: string }>`
       SELECT fingerprint, result_json FROM execution_cache WHERE slot = 1
     `[0];
     if (cached) {
-      if (cached.fingerprint !== fingerprint) {
-        throw new Error(
-          `${FINGERPRINT_MISMATCH}: this child already holds a terminal ` +
-            "result for a different request; the parent must delete a stale " +
-            "child before starting a genuinely new execution"
-        );
-      }
-      return cachedResultSchema.parse(JSON.parse(cached.result_json));
+      if (cached.fingerprint !== fingerprint) throw mismatch("terminal");
+      return {
+        done: true,
+        result: cachedResultSchema.parse(JSON.parse(cached.result_json)),
+        progress: []
+      };
     }
 
-    let result: RecipeExecutionResult;
+    // Validate the recipe up front; a disabled recipe / empty prompt is a
+    // deterministic, cacheable terminal failure with no model call.
+    let recipe;
     try {
-      const recipe = validateRecipe(request.recipe);
-      const models =
-        this.modelsOverride ??
-        createModelPair({
-          primaryModelId: recipe.primaryModelId,
-          fallbackModelId: recipe.fallbackModelId
-        });
-      const tools = buildRecipeTools(recipe.toolFamilies, this.env.BROWSER);
-      // A transient platform fault propagates from here with nothing cached,
-      // so a Workflow retry re-runs inference by design.
-      result = await runRecipeExecution(
-        { ...request, recipe },
-        { models, tools }
-      );
+      recipe = validateRecipe(request.recipe);
     } catch (error) {
       if (!(error instanceof RecipeValidationError)) throw error;
-      // A disabled Recipe is a deterministic caller bug — terminal, cacheable.
-      result = { status: "failed", error: error.message, modelId: null };
+      return this.cacheTerminal(fingerprint, {
+        status: "failed",
+        error: error.message,
+        modelId: null
+      });
+    }
+    if (request.prompt.trim() === "") {
+      return this.cacheTerminal(fingerprint, {
+        status: "failed",
+        error: "empty subtask prompt",
+        modelId: null
+      });
     }
 
+    // Resume an in-progress run, guarding against a stale child holding a
+    // *different* run (the same reuse hazard the terminal cache guards).
+    const saved = this.sql<{ fingerprint: string; state_json: string }>`
+      SELECT fingerprint, state_json FROM run_state WHERE slot = 1
+    `[0];
+    if (saved && saved.fingerprint !== fingerprint)
+      throw mismatch("in-progress");
+    const prev: ChunkRunState | null = saved
+      ? (JSON.parse(saved.state_json) as ChunkRunState)
+      : null;
+
+    const models =
+      this.modelsOverride ??
+      createModelPair({
+        primaryModelId: recipe.primaryModelId,
+        fallbackModelId: recipe.fallbackModelId
+      });
+    const workspace = makeWorkspaceHandle(this.workspace());
+    const progress: ProgressEvent[] = [];
+    const { tools } = buildRecipeTools(recipe.toolFamilies, {
+      env: this.env,
+      workspace,
+      emitProgress: (event) => progress.push(event)
+    });
+    const { system, prompt } = renderSubagentPrompt({ ...request, recipe });
+
+    const { outcome, state } = await runResumableChunk(prev, {
+      system,
+      seedPrompt: prompt,
+      models,
+      tools,
+      limits: recipe.limits,
+      historyWindow: recipe.historyWindow,
+      reportMetrics: recipe.reportMetrics,
+      now: () => Date.now(),
+      progress,
+      checkpoint: (s) => this.saveRunState(fingerprint, s)
+    });
+    // The per-step checkpoint already ran; persist the final state too so a chunk
+    // that yielded without a completed step still advances durably.
+    this.saveRunState(fingerprint, state);
+
+    if (outcome.done) {
+      return this.cacheTerminal(fingerprint, outcome.result, outcome.progress);
+    }
+    return { done: false, progress: outcome.progress };
+  }
+
+  /**
+   * Best-effort cleanup on cancellation: rebuild the recipe's tool families and
+   * run their `abort` hooks (e.g. close an ARC scorecard from the workspace
+   * session file). Reconstructible from the workspace, so it is safe on a fresh
+   * isolate. The parent supplies the validated tool families it resolved.
+   */
+  async abortExecution(toolFamilies: string[]): Promise<void> {
+    this.ensureTables();
+    const ctx = {
+      env: this.env,
+      workspace: makeWorkspaceHandle(this.workspace()),
+      emitProgress: () => {}
+    };
+    const { abort } = buildRecipeTools(toolFamilies, ctx);
+    if (abort) await abort(ctx);
+  }
+
+  /** Persist a terminal result to the cache and return it as a done chunk. */
+  private cacheTerminal(
+    fingerprint: string,
+    result: RecipeExecutionResult,
+    progress: ProgressEvent[] = []
+  ): RecipeChunkResult {
     this.sql`
       INSERT INTO execution_cache (slot, fingerprint, result_json, created_at)
       VALUES (1, ${fingerprint}, ${JSON.stringify(result)}, ${Date.now()})
@@ -149,6 +254,27 @@ export class RecipeSubagent extends Agent<Env> {
         result_json = excluded.result_json,
         created_at = excluded.created_at
     `;
-    return result;
+    return { done: true, result, progress };
   }
+
+  /** Persist the rolling run state (called after every model turn). */
+  private saveRunState(fingerprint: string, state: ChunkRunState): void {
+    this.sql`
+      INSERT INTO run_state (slot, fingerprint, state_json, updated_at)
+      VALUES (1, ${fingerprint}, ${JSON.stringify(state)}, ${Date.now()})
+      ON CONFLICT (slot) DO UPDATE SET
+        fingerprint = excluded.fingerprint,
+        state_json = excluded.state_json,
+        updated_at = excluded.updated_at
+    `;
+  }
+}
+
+/** The cross-RPC stale-child error (see {@link FINGERPRINT_MISMATCH}). */
+function mismatch(phase: "terminal" | "in-progress"): Error {
+  return new Error(
+    `${FINGERPRINT_MISMATCH}: this child already holds a ${phase} state for a ` +
+      "different request; the parent must delete a stale child before starting a " +
+      "genuinely new execution"
+  );
 }
