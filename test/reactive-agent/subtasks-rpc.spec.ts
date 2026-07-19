@@ -9,7 +9,7 @@ import {
   finalReplyMessageId,
   sessionText
 } from "@/agent/history";
-import { DEFAULT_RECIPE } from "@/agent/subtasks/recipe";
+import { DEFAULT_RECIPE } from "@/agent/subtasks/registry";
 import { DELEGATE_TOOL_NAME } from "@/agent/subtasks/delegate";
 import type { AgentDB } from "@/db/db";
 import type {

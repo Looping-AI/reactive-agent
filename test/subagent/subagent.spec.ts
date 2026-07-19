@@ -15,7 +15,7 @@ import type {
   RecipeExecutionRequest,
   RecipeExecutionResult
 } from "@/agent/subtasks/types";
-import { DEFAULT_RECIPE } from "@/agent/subtasks/recipe";
+import { DEFAULT_RECIPE } from "@/agent/subtasks/registry";
 import { CHAT_MODEL_ID, CHAT_FALLBACK_MODEL_ID } from "@/config";
 import { mockModel } from "../agent/mock-model";
 import { makeRequest } from "./fixtures";

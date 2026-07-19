@@ -1,5 +1,5 @@
 /**
- * Unit tests for the code-owned default Recipe (src/agent/subtasks/recipe.ts).
+ * Unit tests for the code-owned default Recipe (src/agent/subtasks/registry.ts).
  *
  * The default lives in code, not the DB, so it always reflects config.ts — these
  * tests guard against drift and confirm resolution is code-only for now.
@@ -11,7 +11,7 @@ import {
   STATELESS_SUBAGENT_SOUL,
   resolveRecipeForType,
   validateRecipe
-} from "@/agent/subtasks/recipe";
+} from "@/agent/subtasks/registry";
 import type { ResolvedRecipe } from "@/agent/subtasks/types";
 import {
   CHAT_MODEL_ID,

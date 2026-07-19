@@ -60,7 +60,7 @@ export interface RecipeLimits {
 
 /**
  * A fully-resolved Recipe configuration handed to a subagent invocation. Today
- * these are code-owned constants (see `agent/subtasks/recipe.ts` and
+ * these are code-owned constants (see `agent/subtasks/registry.ts` and
  * `recipes/<domain>/recipe.ts`); caller-local DB rows mapping into this shape are
  * deferred until a Recipe admin surface exists. Model ids, tool families, and
  * limits remain code-validated downstream (`validateRecipe`).

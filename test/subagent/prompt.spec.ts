@@ -5,7 +5,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { renderSubagentPrompt } from "@/subagent/prompt";
-import { STATELESS_SUBAGENT_SOUL } from "@/agent/subtasks/recipe";
+import { STATELESS_SUBAGENT_SOUL } from "@/agent/subtasks/registry";
 import { makeRequest } from "./fixtures";
 
 describe("renderSubagentPrompt", () => {

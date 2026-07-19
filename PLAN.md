@@ -80,10 +80,10 @@ Decomposition-side limits (`MAX_SUBTASKS`) stay global — recipe config governs
 ## Phase 1 — Recipe config: `limits`, `historyWindow`
 
 - `src/agent/subtasks/types.ts` — `ResolvedRecipe` gains `limits: {maxTurns, turnsPerChunk, chunkSoftMs}` and `historyWindow`; add `SubtaskChunkOutcome {done, status, progress: ProgressEvent[]}`.
-- `src/agent/subtasks/recipe.ts` — `DEFAULT_RECIPE` gets today-equivalent limits (`maxTurns: MAX_STEPS`, `turnsPerChunk: MAX_STEPS`); `validateRecipe` clamps/normalizes (positive ints, `turnsPerChunk ≤ maxTurns`).
+- `src/agent/subtasks/registry.ts` — `DEFAULT_RECIPE` gets today-equivalent limits (`maxTurns: MAX_STEPS`, `turnsPerChunk: MAX_STEPS`); `validateRecipe` clamps/normalizes (positive ints, `turnsPerChunk ≤ maxTurns`).
 - `src/subagent/fingerprint.ts` — `canonicalRequest` rebuilds the recipe field-by-field: add the new fields (they'd silently vanish otherwise). Deploy note: fingerprint change → ≤1 self-healed `FINGERPRINT_MISMATCH` per in-flight retry.
 
-Tests: extend `test/agent/subtasks/recipe.spec.ts`, `test/subagent/fingerprint.spec.ts`.
+Tests: extend `test/agent/subtasks/registry.spec.ts`, `test/subagent/fingerprint.spec.ts`.
 **Done when:** `npm run check` + suite green; zero behavior change.
 
 ## Phase 2 — Workspace
@@ -118,7 +118,7 @@ Tests: port/extend `test/reactive-agent/subtasks-rpc.spec.ts` (lifecycle orderin
 - `tools.ts` — the `arc-game` tool family (`arc_start_game`, `arc_act`, `arc_inspect`) + `abort` hook; session state + write-ahead intent in workspace files; level-up → `emitProgress`.
 - `soul.ts` — `ARC_GAME_SOUL`: rules, action semantics, hypothesis/scratchpad discipline _in workspace files_ (history is pruned), turn economy (prefer acting over re-inspecting), end-of-game reporting contract.
 - `recipe.ts` — `ARC_GAME_RECIPE`: default model pair, `toolFamilies: ["workspace", "arc-game"]`, `limits: {maxTurns: 20_000, turnsPerChunk: 25, chunkSoftMs: 240_000}`, `historyWindow: ~12`.
-- `src/agent/subtasks/recipe.ts` — `resolveRecipeForType("arc-game")` → `ARC_GAME_RECIPE`; add `"arc-game"` to `KNOWN_TOOL_FAMILIES`.
+- `src/agent/subtasks/registry.ts` — `resolveRecipeForType("arc-game")` → `ARC_GAME_RECIPE`; add `"arc-game"` to `KNOWN_TOOL_FAMILIES`.
 - `src/agent/decompose.ts` — teach `DECOMPOSITION_INSTRUCTIONS`: an ARC play request → exactly one subtask, `type: "arc-game"`, no fan-out/deps, game identifier verbatim in the prompt, runs long.
 - Secret: `"ARC_API_KEY"` in `wrangler.jsonc` `secrets.required`; `.dev.vars.example` + README line; `npm run types`.
 
