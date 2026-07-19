@@ -143,6 +143,15 @@ export async function runResumableChunk(
     startedAtMs: deps.now()
   };
 
+  // A retry can resume from a checkpoint taken on the final allowed turn
+  // (turns >= maxTurns) before the chunk returned — e.g. summarizeBudget's own
+  // call threw a transient fault and the Workflow step retried. The budget is
+  // already spent, so summarize now instead of running another unbudgeted,
+  // side-effecting turn (which `stopWhen`'s `Math.max(1, …)` would otherwise force).
+  if (state.turns >= deps.limits.maxTurns) {
+    return summarizeBudget(state, deps);
+  }
+
   const chunkStartMs = deps.now();
 
   const onStepFinish = async (step: StepResult<ToolSet>): Promise<void> => {
@@ -155,6 +164,9 @@ export async function runResumableChunk(
   };
 
   const stopWhen = [
+    // The entry guard above guarantees `maxTurns - state.turns >= 1` here, so the
+    // `Math.max(1, …)` is defensive only — it keeps `stepCountIs` from ever seeing
+    // a non-positive count for any future caller.
     stepCountIs(
       Math.max(
         1,

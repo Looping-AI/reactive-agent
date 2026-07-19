@@ -117,6 +117,44 @@ describe("runResumableChunk", () => {
     expect(second.state.turns).toBe(4);
   });
 
+  it("resumes at the turn ceiling straight into the summary, running no extra turn", async () => {
+    // A retry can re-enter with turns == maxTurns (checkpoint taken on the final
+    // allowed turn, before the chunk returned). The chunk must summarize, never
+    // run another (unbudgeted, side-effecting) tool turn.
+    let echoCalls = 0;
+    const spyTools: ToolSet = {
+      echo: tool({
+        description: "echo",
+        inputSchema: z.object({}),
+        execute: async () => {
+          echoCalls += 1;
+          return "ok";
+        }
+      })
+    };
+    // The model would emit a tool call if asked — proves the guard prevented it.
+    const model = mockModel(CALL_ECHO, { text: "final report" });
+    const d = deps({ model, tools: spyTools, limits: { maxTurns: 2 } });
+    const resumed: ChunkRunState = {
+      messages: [{ role: "user", content: "Do the work." }],
+      turns: 2,
+      llmCalls: 4,
+      startedAtMs: 500
+    };
+
+    const out = await runResumableChunk(resumed, d);
+
+    expect(out.outcome.done).toBe(true);
+    if (!out.outcome.done) return;
+    expect(out.outcome.result.status).toBe("completed");
+    if (out.outcome.result.status === "completed") {
+      expect(out.outcome.result.resultParts[0].text).toBe("final report");
+    }
+    // No extra turn executed and no tool side effect.
+    expect(out.state.turns).toBe(2);
+    expect(echoCalls).toBe(0);
+  });
+
   it("ends a chunk as soon as a tool emits a progress event", async () => {
     const progress: ProgressEvent[] = [];
     const tools: ToolSet = {
