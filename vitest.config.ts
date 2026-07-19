@@ -1,17 +1,42 @@
 import { defineConfig } from "vitest/config";
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
-import { MockAgent } from "undici";
+import { existsSync } from "node:fs";
 import path from "path";
 import {
   GATEWAY_ORIGIN,
   TEST_AGENT_PRIVATE_JWK,
   gatewayPublicJwks
 } from "./test/fixtures";
+import { createVcrAgent } from "./test/helpers/vcr";
 
-// Intercept the gateway's JWKS fetch (triggered by createRemoteJWKSet during
-// token verification) so tests never hit the network. disableNetConnect makes
-// any unmocked outbound request throw, keeping the suite hermetic.
-const fetchMock = new MockAgent();
+// Real secrets for `npm run test:record` (`RECORD=1 vitest run recorded.spec.ts`
+// — see package.json), loaded from a local, gitignored .env.test (see
+// .env.test.example) so recording never requires pasting a key on the shell.
+// Values already in process.env (CI/shell) win — Node's loader never
+// overwrites an existing var. A no-op when the file is absent: ordinary
+// playback runs use the `??=` test-fixture defaults below.
+const ENV_TEST = path.resolve(import.meta.dirname, ".env.test");
+if (existsSync(ENV_TEST)) process.loadEnvFile(ENV_TEST);
+
+// `RECORD=1` makes every activated cassette capture real traffic; every other
+// run replays. Generic — recorded specs key their own cassettes per test, so
+// this flag and `test:record` stay recipe-agnostic as more specs are added.
+const RECORD = !!process.env.RECORD;
+
+// One agent serves the whole suite (Miniflare allows only a single `fetchMock`).
+// It record/replays per-test cassettes (announced by each recorded spec over an
+// in-band control channel — see test/helpers/vcr.ts), while ordinary MockAgent
+// interceptors (the gateway JWKS) and `disableNetConnect` handle everything
+// else. Adding a recorded spec touches only that spec file — no config here.
+const SNAPSHOTS_DIR = path.resolve(import.meta.dirname, "./test/snapshots");
+const fetchMock = createVcrAgent({
+  snapshotsDir: SNAPSHOTS_DIR,
+  record: RECORD,
+  passthroughHosts: [new URL(GATEWAY_ORIGIN).host],
+  excludeHeaders: ["x-api-key"],
+  ignoreHeaders: ["cookie"]
+});
+
 fetchMock.disableNetConnect();
 fetchMock
   .get(GATEWAY_ORIGIN)
@@ -21,9 +46,18 @@ fetchMock
   })
   .persist();
 
-// Test defaults for required secrets. Real env vars (CI/shell) take precedence via ??=.
+// Every cassette is flushed and its agent closed by the globalSetup teardown
+// (test/helpers/vcr-global-setup.ts) — see closeVcr() for why that is required
+// to avoid a record-run hang.
+
+// Test defaults for required secrets. Real env vars — from .env.test above, or
+// CI/shell — take precedence via ??=. The pool sources `secrets.required`
+// (wrangler.jsonc) from process.env into the worker `env`, so a real
+// `ARC_API_KEY` in .env.test is all `npm run test:record` needs. In playback
+// the placeholder is fine (the VCR excludes the key header from the cassette).
 process.env.A2A_SIGNING_KEY ??= JSON.stringify(TEST_AGENT_PRIVATE_JWK);
 process.env.GATEWAY_ORIGINS ??= JSON.stringify([GATEWAY_ORIGIN]);
+process.env.ARC_API_KEY ??= "test-key";
 
 // The whole suite runs in the Workers runtime (workerd via miniflare) through a
 // single `cloudflareTest()` pool — including the agent-runtime specs under
@@ -70,6 +104,7 @@ export default defineConfig({
     })
   ],
   test: {
+    globalSetup: ["./test/helpers/vcr-global-setup.ts"],
     include: ["test/**/*.spec.ts"]
   }
 });

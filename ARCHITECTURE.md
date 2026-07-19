@@ -212,7 +212,7 @@ evidence.
 A Recipe configures one isolated subagent invocation: enabled state, version,
 primary/fallback model ids, soul text, and tool families. The `default` Recipe is
 a **code constant** (`DEFAULT_RECIPE` in
-[`src/agent/subtasks/recipe.ts`](src/agent/subtasks/recipe.ts), sourcing model ids
+[`src/agent/subtasks/registry.ts`](src/agent/subtasks/registry.ts), sourcing model ids
 from [`src/config.ts`](src/config.ts)) — not a database row, so it cannot go stale
 against the configured models and needs no migration seed.
 
@@ -472,7 +472,7 @@ traffic. They are characteristics, not known bugs; none is a correctness hole.
 | [`src/agent/subtasks/types.ts`](src/agent/subtasks/types.ts)                 | RPC-safe Subtask contracts (`Subtask`, `SubtaskReference`, `RecipeExecutionRequest`, `SubtaskNode`, …).                                                                   |
 | [`src/agent/subtasks/catalog.ts`](src/agent/subtasks/catalog.ts)             | `buildReferenceCatalog` — the ephemeral 1..N numbering of eligible history turns (compaction summaries excluded).                                                         |
 | [`src/agent/subtasks/decomposition.ts`](src/agent/subtasks/decomposition.ts) | `decompositionProposalSchema` + `resolveDecomposition` — index-only reference resolution and DAG validation.                                                              |
-| [`src/agent/subtasks/recipe.ts`](src/agent/subtasks/recipe.ts)               | `DEFAULT_RECIPE` (code-owned), `resolveRecipeForType`, `validateRecipe` — the model/tool capability boundary.                                                             |
+| [`src/agent/subtasks/registry.ts`](src/agent/subtasks/registry.ts)           | `DEFAULT_RECIPE` (code-owned), `resolveRecipeForType`, `validateRecipe` — the model/tool capability boundary.                                                             |
 | [`src/agent/subtasks/scheduler.ts`](src/agent/subtasks/scheduler.ts)         | `selectWave` — pure DAG wave selection (ready / done / stuck).                                                                                                            |
 | [`src/subagent/index.ts`](src/subagent/index.ts)                             | `RecipeSubagent` — the managed facet; `executeChunk(request, chunk)` + `abortExecution` + the fingerprint-keyed terminal cache and rolling `run_state`.                   |
 | [`src/subagent/run.ts`](src/subagent/run.ts)                                 | `runResumableChunk` — the one durable-chunk runner (agentic loop, per-turn checkpoint, budget-exhaustion summary); `runRecipeExecution` runs it to completion.            |

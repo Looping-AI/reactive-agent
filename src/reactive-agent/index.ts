@@ -19,7 +19,10 @@ import { runDecompose } from "@/agent/decompose";
 import { runCompose } from "@/agent/compose";
 import { decomposeReplyMessageId, sessionText } from "@/agent/history";
 import { buildAgentSession, type SessionLike } from "@/agent/session";
-import { resolveRecipeForType, validateRecipe } from "@/agent/subtasks/recipe";
+import {
+  resolveRecipeForType,
+  validateRecipe
+} from "@/agent/subtasks/registry";
 import type {
   ComposeTaskResult,
   CompositionBranch,

@@ -3,7 +3,10 @@ import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import { createModelPair, type ModelPair } from "@/agent/model";
 import { buildRecipeTools } from "@/agent/tools";
-import { RecipeValidationError, validateRecipe } from "@/agent/subtasks/recipe";
+import {
+  RecipeValidationError,
+  validateRecipe
+} from "@/agent/subtasks/registry";
 import type {
   ProgressEvent,
   RecipeChunkResult,

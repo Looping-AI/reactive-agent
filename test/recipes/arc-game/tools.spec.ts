@@ -1,49 +1,20 @@
 /**
  * The `arc-game` tool family (src/recipes/arc-game/tools.ts): start / act /
- * inspect against a stubbed ARC API, with session state in an in-memory
- * workspace. The client uses the global `fetch`, so we stub that.
+ * inspect, with session state in an in-memory workspace.
+ *
+ * These specs script *synthetic* responses per request to exercise the
+ * state-transition branches (level-up, GAME_OVER, unavailable action) — cases
+ * that can't be captured without actually solving a game. Coverage against the
+ * *real* ARC API's response shapes lives in `recorded.spec.ts`, which drives the
+ * deterministic start/abort flow through the undici SnapshotAgent VCR
+ * (test/helpers/vcr.ts) instead of stubbing `fetch`.
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { buildArcGameTools } from "@/recipes/arc-game/tools";
-import type { ToolFamilyContext } from "@/agent/tools";
-import type { WorkspaceHandle } from "@/subagent/workspace";
 import type { ArcSession } from "@/recipes/arc-game/types";
-import type { ProgressEvent } from "@/agent/subtasks/types";
+import { ctx, callTool } from "./helpers";
 
 afterEach(() => vi.unstubAllGlobals());
-
-function memHandle(): WorkspaceHandle {
-  const files = new Map<string, string>();
-  return {
-    read: async (p) => files.get(p) ?? null,
-    write: async (p, c) => void files.set(p, c),
-    exists: async (p) => files.has(p),
-    remove: async (p) => files.delete(p),
-    list: async () =>
-      [...files.keys()].map((p) => ({
-        path: p,
-        type: "file" as const,
-        size: 0
-      })),
-    readJson: async (p) => {
-      const r = files.get(p);
-      return r ? JSON.parse(r) : null;
-    },
-    writeJson: async (p, v) => void files.set(p, JSON.stringify(v))
-  };
-}
-
-function ctx(): { ctx: ToolFamilyContext; events: ProgressEvent[] } {
-  const events: ProgressEvent[] = [];
-  return {
-    events,
-    ctx: {
-      env: { ARC_API_KEY: "test-key" } as unknown as Env,
-      workspace: memHandle(),
-      emitProgress: (e) => events.push(e)
-    }
-  };
-}
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -83,12 +54,6 @@ function stubFetch(routes: Record<string, () => unknown>) {
     })
   );
   return hits;
-}
-
-/** Invoke a tool's execute with a throwaway options object. */
-function callTool(tool: unknown, input: unknown): Promise<string> {
-  const t = tool as { execute: (i: unknown, o: unknown) => Promise<string> };
-  return t.execute(input, {});
 }
 
 describe("arc-game tool family", () => {

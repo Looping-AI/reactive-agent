@@ -149,5 +149,11 @@ dist
 !.env.example
 secrets
 
+# Real secrets for `npm run test:record` (see .env.test.example) — must never
+# be committed, unlike the CRA-style .env.test convention above which assumes
+# that file holds no secrets.
+.env.test
+!.env.test.example
+
 # Agents
 .claude
