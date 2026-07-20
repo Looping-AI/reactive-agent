@@ -105,11 +105,10 @@ export async function runHandleTask(
     jku: p.jku
   };
 
-  const started = await step.do("working", async () => {
-    if (await isCanceled(stub, p.taskId)) return false;
-    await stub.markWorking(p.taskId);
-    return true;
-  });
+  const started = await step.do(
+    "working",
+    async () => (await stub.markWorking(p.taskId)) === "ok"
+  );
   if (!started) return;
 
   // Phase 1: Decompose Task. `decomposeTask` persists the Subtask rows and emits
@@ -124,12 +123,13 @@ export async function runHandleTask(
       identity: p.identity,
       push
     });
-    return result.status === "completed"
-      ? { ok: true as const }
-      : { ok: false as const, error: result.error };
+    return result.status === "failed"
+      ? { status: result.status, error: result.error }
+      : { status: result.status };
   });
 
-  if (!decomposed.ok) {
+  if (decomposed.status === "canceled") return;
+  if (decomposed.status === "failed") {
     console.error("[handle-task] decomposition failed", {
       taskId: p.taskId,
       error: decomposed.error
@@ -146,12 +146,21 @@ export async function runHandleTask(
     return;
   }
 
-  // Phase 3: Compose Task. The single-Subtask bypass and the "no branch
-  // succeeded" failure both live inside `composeTask`; this only routes.
+  // Phase 3: Compose Task. The single-Subtask bypass, the "no branch succeeded"
+  // failure, and the cancellation checks all live inside `composeTask`; this only
+  // routes.
   const composed = await step.do("compose", async () => {
-    if (await isCanceled(stub, p.taskId))
-      return { status: "canceled" as const };
-    return await stub.composeTask({ taskId: p.taskId, identity: p.identity });
+    // Projected to a plain object: an RPC return carries a `Disposable` brand a
+    // step result cannot serialize.
+    const result = await stub.composeTask({
+      taskId: p.taskId,
+      identity: p.identity
+    });
+    if (result.status === "completed")
+      return { status: result.status, reply: result.reply };
+    if (result.status === "failed")
+      return { status: result.status, error: result.error };
+    return { status: result.status };
   });
   if (composed.status === "canceled") return;
 
@@ -187,16 +196,14 @@ async function executeDag(
   push: TurnPushContext
 ): Promise<DagOutcome> {
   for (let wave = 0; wave <= MAX_SUBTASKS; wave++) {
-    // One durable step per wave: re-check cancellation, propagate skips past any
-    // branch that just failed, and read back the refreshed DAG projection.
+    // One durable step per wave: `skipBlockedSubtasks` reports cancellation,
+    // propagates skips past any branch that just failed, and returns the
+    // refreshed DAG projection — one round trip, one consistent answer.
     const scan = await step.do(`scan:${wave}`, async () => {
-      if (await isCanceled(stub, p.taskId)) {
-        return { canceled: true as const, nodes: [] };
-      }
-      return {
-        canceled: false as const,
-        nodes: await stub.skipBlockedSubtasks(p.taskId)
-      };
+      const result = await stub.skipBlockedSubtasks(p.taskId);
+      return result.canceled
+        ? { canceled: true as const, nodes: [] }
+        : { canceled: false as const, nodes: result.nodes };
     });
 
     if (scan.canceled) {
@@ -298,6 +305,13 @@ async function runBranch(
  * The Task is built **inside** the step and returned, so `notify` posts exactly
  * what was persisted: building it in the body would re-stamp `new Date()` on
  * every replay and post a Task that differs from the stored one.
+ *
+ * **The guarded write is the cancellation check.** `saveTask` refuses to write a
+ * terminal state over a `canceled` row and says so, and it does that read and
+ * write in one synchronous pass inside the DO. Probing first and saving second
+ * would leave a window — between the two calls, and again between this step and
+ * `notify` — in which a `tasks/cancel` lands and the gateway still receives a
+ * `completed` callback. Keying the notify on "did the write apply" closes it.
  */
 async function deliver(
   p: HandleTaskParams,
@@ -306,13 +320,11 @@ async function deliver(
   reply: string | null
 ): Promise<void> {
   const task = await step.do("complete", async () => {
-    if (await isCanceled(stub, p.taskId)) return null;
     const terminal =
       reply !== null
         ? buildCompletedTask(p.taskId, p.contextId, reply)
         : buildFailedTask(p.taskId, p.contextId, TASK_FAILED_TEXT);
-    await stub.saveTask(terminal);
-    return terminal;
+    return (await stub.saveTask(terminal)) ? terminal : null;
   });
   if (!task) return;
 
@@ -330,14 +342,4 @@ async function deliver(
       throw new Error(`gateway notification failed: HTTP ${res.status}`);
     }
   });
-}
-
-/**
- * Whether the caller canceled this Task. Read fresh before every phase that would
- * start new work or publish output; `executeSubtask` re-checks on its own side
- * around the model call, where the window is widest.
- */
-async function isCanceled(stub: AgentStub, taskId: string): Promise<boolean> {
-  const current = await stub.getTask(taskId);
-  return current?.status.state === "canceled";
 }

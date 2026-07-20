@@ -113,8 +113,20 @@ export class A2AExecutor implements AgentExecutor {
   }
 
   /**
-   * `tasks/cancel`: best-effort mark the task canceled in the DO and publish the
-   * canceled Task. The in-flight workflow's `notify` step skips a canceled task.
+   * `tasks/cancel`: mark the task canceled in the DO and publish the canceled
+   * Task.
+   *
+   * Note this is **not** the path a real cancel takes. A handler is built per
+   * request (see {@link file://../index.ts}), so on a `tasks/cancel` call the
+   * a2a-js handler's event-bus registry is empty and it records the cancellation
+   * through the `TaskStore` — `ReactiveAgent.saveTask` — instead of calling here.
+   * Both converge on the DO's single `markCanceled`, so the behaviour is the same
+   * either way; this stays for the case where the SDK does route through the
+   * executor.
+   *
+   * Once the row is canceled it is terminal: `saveTask` refuses every subsequent
+   * non-canceled write, which is what stops the in-flight workflow from
+   * delivering a `completed` callback.
    */
   cancelTask = async (
     taskId: string,

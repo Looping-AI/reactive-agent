@@ -6,7 +6,11 @@ import type { Task } from "@a2a-js/sdk";
 import type { ReactiveAgent } from "@/reactive-agent";
 import { runHandleTask, type HandleTaskParams } from "@/workflows/handle-task";
 import { TASK_FAILED_TEXT } from "@/a2a/notify";
-import type { SubtaskNode, SubtaskStatus } from "@/agent/subtasks/types";
+import type {
+  SubtaskNode,
+  SubtaskScan,
+  SubtaskStatus
+} from "@/agent/subtasks/types";
 import {
   TEST_AGENT_PRIVATE_JWK,
   GATEWAY_ORIGIN,
@@ -85,6 +89,15 @@ interface AgentOptions {
   state?: Task["status"]["state"];
   /** Runs when a node starts executing — used to cancel mid-DAG. */
   onExecute?: (id: number, agent: AgentFake) => void;
+  /** Runs after composition returns — used to cancel during delivery. */
+  onCompose?: (agent: AgentFake) => void;
+  /**
+   * Make the guarded terminal write refuse while `getTask` still reports the
+   * task live — i.e. the cancel landed *after* a probe would have passed but
+   * *before* the write. That gap is the whole reason delivery keys on the
+   * write's verdict instead of on a separate check.
+   */
+  saveRefuses?: boolean;
 }
 
 interface AgentFake {
@@ -130,17 +143,27 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
       dependsOn: n.dependsOn
     }));
 
+  /** The DO's own cancellation predicate, which every phase RPC now applies. */
+  const canceled = () => agent.state === "canceled";
+
   const stub = {
     getTask: vi.fn(async (): Promise<Task | null> =>
       agent.state ? ({ status: { state: agent.state } } as Task) : null
     ),
-    markWorking: vi.fn(async () => {}),
+    markWorking: vi.fn(async () => (canceled() ? "canceled" : "ok")),
+
+    // Mirrors the guarded write: a canceled row refuses every non-canceled
+    // state and reports it, which is what keeps `notify` from firing.
     saveTask: vi.fn(async (task: Task) => {
+      if (opts.saveRefuses) return false;
+      if (canceled() && task.status.state !== "canceled") return false;
       agent.saved = task;
+      return true;
     }),
 
     decomposeTask: vi.fn(async () => {
       agent.decomposeCalls++;
+      if (canceled()) return { status: "canceled" as const };
       if (opts.decomposeFails) {
         return { status: "failed" as const, error: "both models unusable" };
       }
@@ -153,9 +176,11 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
       return { status: "completed" as const, reply: "On it.", subtasks: [] };
     }),
 
-    // Mirrors the parent's fixpoint rule: a node whose prerequisite did not
-    // succeed is skipped, and skipping propagates to its own dependents.
-    skipBlockedSubtasks: vi.fn(async (): Promise<SubtaskNode[]> => {
+    // Reports cancellation with the wave, then mirrors the parent's fixpoint
+    // rule: a node whose prerequisite did not succeed is skipped, and skipping
+    // propagates to its own dependents.
+    skipBlockedSubtasks: vi.fn(async (): Promise<SubtaskScan> => {
+      if (canceled()) return { canceled: true };
       for (;;) {
         const byId = new Map(agent.nodes.map((n) => [n.id, n]));
         const next = agent.nodes.filter(
@@ -165,7 +190,7 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
               BLOCKED.has(byId.get(d)?.status as SubtaskStatus)
             )
         );
-        if (next.length === 0) return project();
+        if (next.length === 0) return { canceled: false, nodes: project() };
         for (const n of next) n.status = "skipped";
       }
     }),
@@ -212,10 +237,13 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
     }),
 
     composeTask: vi.fn(async () => {
+      if (canceled()) return { status: "canceled" as const };
       agent.composeCalls++;
-      return opts.composeFails
+      const out = opts.composeFails
         ? { status: "failed" as const, error: "no subtask succeeded" }
         : { status: "completed" as const, reply: "the answer" };
+      opts.onCompose?.(agent);
+      return out;
     })
   } as unknown as DurableObjectStub<ReactiveAgent>;
 
@@ -589,6 +617,43 @@ describe("HandleTaskWorkflow — cancellation", () => {
     expect(agent.canceledPending).toBe(2);
     expect(names).toContain("cancel:1");
     expect(agent.composeCalls).toBe(0);
+    expect(agent.saved).toBeUndefined();
+    expect(captured.calls).toBe(0);
+  });
+
+  // The regression test for the window that existed before: the task looks live
+  // when delivery starts, so any pre-flight probe passes, and the cancel lands
+  // before the write. Ignoring the write's verdict — as a probe-then-save does —
+  // posts a `completed` callback for work the caller already gave up on.
+  it("sends no terminal callback when the guarded write refuses", async () => {
+    const agent = mockAgent({ saveRefuses: true });
+    const captured = mockFetch();
+    const { step, names } = stepFake();
+
+    await runHandleTask(params(), step);
+
+    expect(agent.composeCalls).toBe(1);
+    expect(names).toContain("complete");
+    expect(names).not.toContain("notify");
+    expect(captured.calls).toBe(0);
+  });
+
+  it("sends no terminal callback when canceled during delivery", async () => {
+    // Composition produced a real reply, and only then did the caller cancel —
+    // so the workflow reaches `complete` with a Task it fully intends to send.
+    const agent = mockAgent({
+      onCompose: (a) => {
+        a.state = "canceled";
+      }
+    });
+    const captured = mockFetch();
+    const { step, names } = stepFake();
+
+    await runHandleTask(params(), step);
+
+    expect(agent.composeCalls).toBe(1);
+    expect(names).toContain("complete");
+    expect(names).not.toContain("notify");
     expect(agent.saved).toBeUndefined();
     expect(captured.calls).toBe(0);
   });

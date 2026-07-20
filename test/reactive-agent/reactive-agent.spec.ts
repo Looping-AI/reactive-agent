@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { runInDurableObject } from "cloudflare:test";
 import type { Schedule } from "agents";
+import type { Task } from "@a2a-js/sdk";
+import type { ReactiveAgent } from "@/reactive-agent";
+import type { AgentDB } from "@/db/db";
+import { subagentName } from "@/subagent";
 import { sessionText } from "@/agent/history";
 import { freshStub } from "../helpers/do";
 
@@ -139,6 +143,65 @@ describe("ReactiveAgent — async task state (real SQLite)", () => {
       instance.getTask("t-3")
     );
     expect(loaded?.status.state).toBe("canceled");
+  });
+
+  // Both cancel entry points converge on `markCanceled`, which is what makes the
+  // in-flight abort reachable at all. `saveTask` matters most: a per-request
+  // a2a-js handler has no event bus on a `tasks/cancel`, so it records the
+  // cancellation through the TaskStore rather than through the executor.
+  it.each([
+    [
+      "cancelTask",
+      (i: ReactiveAgent, id: string) => i.cancelTask(id) as Promise<unknown>
+    ],
+    [
+      "saveTask with a canceled state",
+      (i: ReactiveAgent, id: string) =>
+        i.saveTask({
+          kind: "task",
+          id,
+          contextId: "c-ab",
+          status: { state: "canceled" }
+        } as Task) as Promise<unknown>
+    ]
+  ])("%s aborts running subagents and only those", async (_name, cancel) => {
+    const stub = freshStub(`cancel-abort-${_name.replace(/\W+/g, "-")}`);
+    await runInDurableObject(stub, async (instance) => {
+      await instance.beginTask({
+        messageId: "m-ab",
+        taskId: "t-ab",
+        contextId: "c-ab"
+      });
+      const { db } = instance as unknown as { db: AgentDB };
+      const rows = db.subtasks.createDecomposition("t-ab", [
+        {
+          localKey: "a",
+          type: "r",
+          prompt: "p",
+          references: [],
+          dependsOn: []
+        },
+        { localKey: "b", type: "r", prompt: "p", references: [], dependsOn: [] }
+      ]);
+      // Only the first is running; the second stays pending.
+      db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
+
+      const abortRun = vi.fn().mockResolvedValue(true);
+      const subAgent = vi
+        .spyOn(instance, "subAgent")
+        .mockResolvedValue({ abortRun } as never);
+
+      await cancel(instance, "t-ab");
+
+      expect(abortRun).toHaveBeenCalledTimes(1);
+      // `subAgent` creates a facet that does not exist, so a pending row must
+      // never be reached — that would materialize a child just to abort it.
+      expect(subAgent).toHaveBeenCalledTimes(1);
+      expect(subAgent.mock.calls[0][1]).toBe(subagentName("t-ab", rows[0].id));
+      await expect(instance.getTask("t-ab")).resolves.toMatchObject({
+        status: { state: "canceled" }
+      });
+    });
   });
 
   it("getTask returns null for an unknown task", async () => {
