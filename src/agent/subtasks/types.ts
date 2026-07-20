@@ -184,12 +184,15 @@ export interface DecompositionProposal {
 /**
  * Terminal outcome of Phase 1 (RPC-safe). `failed` means both models produced
  * unusable output and the parent Task must fail — no Subtask is ever synthesized.
- * Transient platform faults are not results: they throw so the enclosing Workflow
- * step can retry (mirrors {@link RecipeExecutionResult}).
+ * `canceled` means the caller cancelled during the phase: no rows were persisted
+ * and no reply was published. Transient platform faults are not results: they
+ * throw so the enclosing Workflow step can retry (mirrors
+ * {@link RecipeExecutionResult}).
  */
 export type DecomposeTaskResult =
   | { status: "completed"; reply: string; subtasks: Subtask[] }
-  | { status: "failed"; error: string };
+  | { status: "failed"; error: string }
+  | { status: "canceled" };
 
 /**
  * One branch's outcome as composition (Phase 3) sees it — a plain, RPC-safe
@@ -217,11 +220,23 @@ export interface CompositionBranch {
 
 /**
  * Terminal outcome of Phase 3 (RPC-safe). `failed` means no branch succeeded —
- * composition inference is never invoked in that case. Transient platform faults
- * throw for the Workflow step to retry.
+ * composition inference is never invoked in that case. `canceled` means the
+ * caller cancelled before or during the phase, so the composed reply is never
+ * published. Transient platform faults throw for the Workflow step to retry.
  */
 export type ComposeTaskResult =
-  { status: "completed"; reply: string } | { status: "failed"; error: string };
+  | { status: "completed"; reply: string }
+  | { status: "failed"; error: string }
+  | { status: "canceled" };
+
+/**
+ * The `scan:<n>` wave projection (RPC-safe): either the caller cancelled, or the
+ * refreshed DAG after blocked branches were skipped. Returning the verdict with
+ * the nodes is what lets the Workflow drop its separate cancellation probe — one
+ * round trip, and no gap between asking and acting.
+ */
+export type SubtaskScan =
+  { canceled: true } | { canceled: false; nodes: SubtaskNode[] };
 
 /**
  * The scheduler's view of one Subtask (Phase 2) — everything needed to pick the

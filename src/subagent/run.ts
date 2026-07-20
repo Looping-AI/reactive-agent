@@ -53,6 +53,13 @@ export interface ChunkRunDeps {
   progress: ProgressEvent[];
   /** Persist rolling state after every model turn — the crash-safety checkpoint. */
   checkpoint: (state: ChunkRunState) => void | Promise<void>;
+  /**
+   * Interrupts the in-flight model call when the parent Task is canceled. Without
+   * it a cancellation is only observed at the next chunk boundary — up to
+   * `chunkSoftMs` of unwanted play. See {@link ChunkAttempt}'s `aborted` case for
+   * why an abort is emphatically *not* a model failure.
+   */
+  abortSignal?: AbortSignal;
 }
 
 export interface ChunkRunOutput {
@@ -60,9 +67,19 @@ export interface ChunkRunOutput {
   state: ChunkRunState;
 }
 
+/**
+ * `aborted` is deliberately distinct from `failed`. A rejected `generateText`
+ * normally means "this model is unusable, try the other one" and, if both go,
+ * becomes a **cached terminal failure**. An abort means neither: the work was
+ * interrupted on purpose, a second model would only burn another call, and
+ * caching the outcome would replay a bogus failure on every future retry. It
+ * therefore yields — same rule the runner already applies to transient faults,
+ * which throw and cache nothing.
+ */
 type ChunkAttempt =
   | { kind: "completed"; text: string; modelId: string }
   | { kind: "yield" }
+  | { kind: "aborted" }
   | { kind: "failed"; diagnostic: string; error?: unknown; modelId: string };
 
 /**
@@ -143,6 +160,19 @@ export async function runResumableChunk(
     startedAtMs: deps.now()
   };
 
+  /**
+   * Hand the chunk back with no terminal result. An abort takes this exit too —
+   * that is the whole point: nothing terminal is produced, so the facet caches
+   * nothing and no bogus failure can replay on a later retry.
+   */
+  const yielded = (): ChunkRunOutput => ({
+    outcome: { done: false, progress: deps.progress },
+    state
+  });
+
+  // Already canceled before this chunk started: don't call a model at all.
+  if (deps.abortSignal?.aborted) return yielded();
+
   // A retry can resume from a checkpoint taken on the final allowed turn
   // (turns >= maxTurns) before the chunk returned — e.g. summarizeBudget's own
   // call threw a transient fault and the Workflow step retried. The budget is
@@ -192,11 +222,17 @@ export async function runResumableChunk(
         stopWhen,
         // Primary → fallback recovery is manual; SDK backoff would only add latency.
         maxRetries: 0,
+        abortSignal: deps.abortSignal,
         onStepFinish
       });
     } catch (error) {
+      // Check the signal before the error: an abort surfaces as a rejection, and
+      // reading it as bad model output would spend the fallback and cache a
+      // failure for work that was cancelled on purpose.
+      if (deps.abortSignal?.aborted) return { kind: "aborted" };
       return { kind: "failed", diagnostic: String(error), error, modelId };
     }
+    if (deps.abortSignal?.aborted) return { kind: "aborted" };
     if (result.finishReason === "length") {
       return {
         kind: "failed",
@@ -216,6 +252,7 @@ export async function runResumableChunk(
   };
 
   let a = await attempt(deps.models.primary, deps.models.primaryId());
+  if (a.kind === "aborted") return yielded();
   if (a.kind === "failed") {
     console.warn("[recipe-runner] primary attempt failed, trying fallback", {
       model: a.modelId,
@@ -223,6 +260,7 @@ export async function runResumableChunk(
     });
     const primaryFailure = a;
     a = await attempt(deps.models.fallback, deps.models.fallbackId());
+    if (a.kind === "aborted") return yielded();
 
     if (a.kind === "failed") {
       // Both attempts failed. A transient fault anywhere means a retry could
@@ -256,7 +294,7 @@ export async function runResumableChunk(
   if (state.turns >= deps.limits.maxTurns) {
     return summarizeBudget(state, deps);
   }
-  return { outcome: { done: false, progress: deps.progress }, state };
+  return yielded();
 }
 
 /**
@@ -291,21 +329,33 @@ async function summarizeBudget(
         system: deps.system,
         messages,
         stopWhen: stepCountIs(1),
-        maxRetries: 0
+        maxRetries: 0,
+        abortSignal: deps.abortSignal
       });
     } catch (error) {
+      if (deps.abortSignal?.aborted) return { kind: "aborted" };
       return { kind: "failed", diagnostic: String(error), error, modelId };
     }
+    if (deps.abortSignal?.aborted) return { kind: "aborted" };
     const text = result.text.trim();
     return text === ""
       ? { kind: "failed", diagnostic: "empty summary", modelId }
       : { kind: "completed", text, modelId };
   };
 
+  // An abort yields with no terminal result, exactly as in the main loop: the
+  // budget summary is output, and cancelled work publishes none.
+  const yielded = (): ChunkRunOutput => ({
+    outcome: { done: false, progress: deps.progress },
+    state
+  });
+
   let a = await summarize(deps.models.primary, deps.models.primaryId());
+  if (a.kind === "aborted") return yielded();
   if (a.kind === "failed") {
     const primaryFailure = a;
     a = await summarize(deps.models.fallback, deps.models.fallbackId());
+    if (a.kind === "aborted") return yielded();
     if (a.kind === "failed") {
       for (const failed of [a, primaryFailure]) {
         if (failed.error !== undefined && isTransientAiError(failed.error)) {

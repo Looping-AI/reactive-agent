@@ -165,6 +165,50 @@ describe("tasks.save", () => {
       text: "all done"
     });
   });
+
+  // The terminal write *is* the cancellation check for delivery. A cancel can
+  // land after the workflow decided to complete but before (or between) the
+  // `complete` and `notify` steps; refusing here — and saying so — is what stops
+  // the gateway receiving a `completed` callback for canceled work.
+  it("refuses a terminal write over a canceled task and reports it", async () => {
+    const result = await withTasks("save-canceled", (tasks) => {
+      const task = tasks.begin({
+        messageId: "msg-5b",
+        taskId: "t-5b",
+        contextId: "ctx-5b"
+      });
+      tasks.cancel("t-5b");
+      const applied = tasks.save({
+        ...task,
+        status: { state: "completed", timestamp: new Date().toISOString() }
+      });
+      return { applied, stored: tasks.get("t-5b") };
+    });
+
+    expect(result.applied).toBe(false);
+    expect(result.stored?.status.state).toBe("canceled");
+  });
+
+  // The a2a-js handler records a cancellation through the TaskStore (its own
+  // cancel branch), so writing `canceled` over a live row must still apply.
+  it("accepts a canceled write over a live task", async () => {
+    const result = await withTasks("save-cancel-write", (tasks) => {
+      const task = tasks.begin({
+        messageId: "msg-5c",
+        taskId: "t-5c",
+        contextId: "ctx-5c"
+      });
+      tasks.markWorking("t-5c");
+      const applied = tasks.save({
+        ...task,
+        status: { state: "canceled", timestamp: new Date().toISOString() }
+      });
+      return { applied, stored: tasks.get("t-5c") };
+    });
+
+    expect(result.applied).toBe(true);
+    expect(result.stored?.status.state).toBe("canceled");
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -55,6 +55,17 @@ function delegates(subtasks?: unknown[]): MockStep {
   };
 }
 
+/**
+ * The scan's nodes, asserting it did not report a cancellation — these specs
+ * exercise skip propagation, where a canceled verdict would mean the fixture is
+ * wrong rather than the assertion failing somewhere less obvious.
+ */
+async function scanNodes(instance: ReactiveAgent, taskId = TASK_ID) {
+  const scan = await instance.skipBlockedSubtasks(taskId);
+  if (scan.canceled) throw new Error("unexpected cancellation in scan");
+  return scan.nodes;
+}
+
 function draft(over: Partial<SubtaskDraft> = {}): SubtaskDraft {
   return {
     localKey: "a",
@@ -574,6 +585,67 @@ describe("executeSubtaskChunk — cancellation", () => {
       }
     );
   });
+
+  // An aborted run yields rather than producing a terminal result. Resolving it
+  // here — instead of waiting for the next chunk's `prepareChunk` to notice —
+  // costs one fewer round trip and, more importantly, keeps the progress the
+  // chunk emitted from being published for a task the caller abandoned.
+  it("resolves a yielding chunk and publishes nothing once canceled", async () => {
+    await runInDurableObject(
+      freshStub("exec-cancel-yield"),
+      async (instance) => {
+        const { rows } = seed(instance, [draft()]);
+        await instance.beginTask({
+          messageId: "m1",
+          taskId: TASK_ID,
+          contextId: "c1"
+        });
+
+        const posted: string[] = [];
+        vi.spyOn(
+          instance as unknown as {
+            postWorking: (...a: unknown[]) => Promise<void>;
+          },
+          "postWorking"
+        ).mockImplementation(async (...a: unknown[]) => {
+          posted.push(String(a[2]));
+        });
+
+        // The chunk is interrupted mid-flight: it yields with progress already
+        // emitted, exactly as an aborted `runResumableChunk` does.
+        const abortExecution = vi.fn().mockResolvedValue(undefined);
+        const executeChunk = vi.fn(async (): Promise<RecipeChunkResult> => {
+          await instance.cancelTask(TASK_ID);
+          return {
+            done: false,
+            progress: [{ key: "step:0", text: "half a move" }]
+          };
+        });
+        vi.spyOn(instance, "subAgent").mockResolvedValue({
+          executeChunk,
+          abortExecution
+        } as never);
+        const deleteSubAgent = vi
+          .spyOn(instance, "deleteSubAgent")
+          .mockResolvedValue(undefined);
+
+        const outcome = await instance.executeSubtaskChunk(rows[0].id, 0, {
+          taskId: TASK_ID,
+          contextId: "c1",
+          pushUrl: "https://gw.example.com/a2a/notifications",
+          pushToken: "tok",
+          jku: "https://agent.example.com/.well-known/jwks.json"
+        });
+
+        // Terminal in this same call — no further chunk is requested.
+        expect(outcome.done).toBe(true);
+        expect(outcome.status).toBe("canceled");
+        expect(posted).toEqual([]);
+        expect(abortExecution).toHaveBeenCalled();
+        expect(deleteSubAgent).toHaveBeenCalled();
+      }
+    );
+  });
 });
 
 describe("skipBlockedSubtasks", () => {
@@ -586,7 +658,7 @@ describe("skipBlockedSubtasks", () => {
       db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
       db.subtasks.fail(rows[0].id, "boom");
 
-      const after = await instance.skipBlockedSubtasks(TASK_ID);
+      const after = await scanNodes(instance);
       expect(after.map((s) => s.status)).toEqual(["failed", "skipped"]);
     });
   });
@@ -601,7 +673,7 @@ describe("skipBlockedSubtasks", () => {
       db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
       db.subtasks.fail(rows[0].id, "boom");
 
-      const after = await instance.skipBlockedSubtasks(TASK_ID);
+      const after = await scanNodes(instance);
       // c is skipped transitively, via b.
       expect(after.map((s) => s.status)).toEqual([
         "failed",
@@ -626,7 +698,7 @@ describe("skipBlockedSubtasks", () => {
         });
         db.subtasks.fail(rows[0].id, "boom");
 
-        const after = await instance.skipBlockedSubtasks(TASK_ID);
+        const after = await scanNodes(instance);
         expect(after[2].status).toBe("pending");
       }
     );
@@ -649,7 +721,7 @@ describe("skipBlockedSubtasks", () => {
       db.subtasks.complete(rows[0].id, [{ kind: "text", text: "ok" }]);
       db.subtasks.fail(rows[1].id, "boom");
 
-      const after = await instance.skipBlockedSubtasks(TASK_ID);
+      const after = await scanNodes(instance);
       expect(after[2].status).toBe("pending"); // right — root succeeded
       expect(after[3].status).toBe("skipped"); // join — left failed
     });
@@ -664,7 +736,7 @@ describe("skipBlockedSubtasks", () => {
       db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
       db.subtasks.complete(rows[0].id, [{ kind: "text", text: "ok" }]);
 
-      const after = await instance.skipBlockedSubtasks(TASK_ID);
+      const after = await scanNodes(instance);
       expect(after[1].status).toBe("pending");
     });
   });

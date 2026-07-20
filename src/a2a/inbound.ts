@@ -4,7 +4,7 @@ import type { Message, Part } from "@a2a-js/sdk";
  * Inbound A2A-message glue: pull the plain user-turn text out of an A2A
  * `Message`. This is the one place the adapter reaches into the `@a2a-js/sdk`
  * message shape. File and data parts are out of scope for now — only text
- * crosses into the agent runtime (see PLAN.md "Explicitly Out of Scope").
+ * crosses into the agent runtime.
  */
 
 /** Bounds the inbound user text carried in a durable Workflow payload (UTF-8). */

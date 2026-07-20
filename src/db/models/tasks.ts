@@ -86,9 +86,28 @@ export function makeTasks(db: DB) {
       return readOne(taskId);
     },
 
-    /** Upsert a task by id. Preserves the `message_id` set by {@link begin}. */
-    save(task: Task): void {
+    /**
+     * Upsert a task by id, preserving the `message_id` set by {@link begin}.
+     * Returns whether the write applied.
+     *
+     * Guarded exactly like {@link markWorking}, and for the same reason: a
+     * `canceled` row is terminal, so nothing may write a non-canceled state over
+     * it. That closes the window between the workflow's terminal build and its
+     * callback — the read-check-write is synchronous here, so a `tasks/cancel`
+     * landing mid-delivery makes this return `false` and the notify never fires.
+     * Writing `canceled` onto a live row stays allowed: that is how the a2a-js
+     * handler's own cancel branch records the cancellation.
+     */
+    save(task: Task): boolean {
+      const existing = readOne(task.id);
+      if (
+        existing?.status.state === "canceled" &&
+        task.status.state !== "canceled"
+      ) {
+        return false;
+      }
       upsert(task);
+      return true;
     },
 
     /**
@@ -104,8 +123,9 @@ export function makeTasks(db: DB) {
     },
 
     /**
-     * Best-effort cancel: flip the task to `canceled` and return it. The
-     * in-flight workflow's `notify` step skips a canceled task.
+     * Flip the task to `canceled` and return it. Terminal: once this lands,
+     * {@link save} refuses every non-canceled write, so no completed or failed
+     * callback can be built from this row afterwards.
      */
     cancel(taskId: string): PlainTask | null {
       const task = readOne(taskId);

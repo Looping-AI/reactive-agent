@@ -88,6 +88,13 @@ export class RecipeSubagent extends Agent<Env> {
 
   private _workspace?: Workspace;
 
+  /**
+   * The chunk currently executing here, if any. In memory only — it exists to be
+   * interrupted mid-call, and an isolate that lost it has no in-flight call left
+   * to interrupt. See {@link abortRun}.
+   */
+  private inflight?: AbortController;
+
   async onStart(): Promise<void> {
     this.ensureTables();
   }
@@ -201,18 +208,26 @@ export class RecipeSubagent extends Agent<Env> {
     });
     const { system, prompt } = renderSubagentPrompt({ ...request, recipe });
 
-    const { outcome, state } = await runResumableChunk(prev, {
-      system,
-      seedPrompt: prompt,
-      models,
-      tools,
-      limits: recipe.limits,
-      historyWindow: recipe.historyWindow,
-      reportMetrics: recipe.reportMetrics,
-      now: () => Date.now(),
-      progress,
-      checkpoint: (s) => this.saveRunState(fingerprint, s)
-    });
+    const controller = new AbortController();
+    this.inflight = controller;
+    let outcome, state;
+    try {
+      ({ outcome, state } = await runResumableChunk(prev, {
+        system,
+        seedPrompt: prompt,
+        models,
+        tools,
+        limits: recipe.limits,
+        historyWindow: recipe.historyWindow,
+        reportMetrics: recipe.reportMetrics,
+        now: () => Date.now(),
+        progress,
+        checkpoint: (s) => this.saveRunState(fingerprint, s),
+        abortSignal: controller.signal
+      }));
+    } finally {
+      this.inflight = undefined;
+    }
     // The per-step checkpoint already ran; persist the final state too so a chunk
     // that yielded without a completed step still advances durably.
     this.saveRunState(fingerprint, state);
@@ -221,6 +236,23 @@ export class RecipeSubagent extends Agent<Env> {
       return this.cacheTerminal(fingerprint, outcome.result, outcome.progress);
     }
     return { done: false, progress: outcome.progress };
+  }
+
+  /**
+   * Interrupt the chunk running here right now, so a cancellation lands on the
+   * current model call instead of at the next chunk boundary (up to `chunkSoftMs`
+   * later — minutes, for a long recipe). Returns whether there was one to stop.
+   *
+   * Distinct from {@link abortExecution}, which releases *external* state after
+   * the fact; this only stops local work. An aborted run yields rather than
+   * producing a terminal result, so nothing is cached and the parent resolves the
+   * row itself. Reaching a facet mid-`executeChunk` works because it is awaiting
+   * a model `fetch` at the time, which does not hold the input gate closed.
+   */
+  async abortRun(): Promise<boolean> {
+    if (!this.inflight) return false;
+    this.inflight.abort();
+    return true;
   }
 
   /**

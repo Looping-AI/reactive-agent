@@ -80,11 +80,13 @@ describe("runResumableChunk", () => {
     limits?: Partial<RecipeLimits>;
     reportMetrics?: boolean;
     progress?: ProgressEvent[];
+    abortSignal?: AbortSignal;
+    models?: ModelPair;
   }): ChunkRunDeps {
     return {
       system: "sys",
       seedPrompt: "Do the work.",
-      models: pairOf(over.model),
+      models: over.models ?? pairOf(over.model),
       tools: over.tools ?? {},
       limits: {
         maxTurns: over.limits?.maxTurns ?? 8,
@@ -95,9 +97,94 @@ describe("runResumableChunk", () => {
       reportMetrics: over.reportMetrics ?? false,
       now: () => 1000,
       progress: over.progress ?? [],
-      checkpoint: () => {}
+      checkpoint: () => {},
+      abortSignal: over.abortSignal
     };
   }
+
+  // Cancellation. The rule under test: an abort is *not* a model failure. It must
+  // not spend the fallback model, and it must not produce a terminal result — a
+  // cached `failed` would replay forever on every later retry.
+  describe("abort", () => {
+    it("makes no model call at all when already aborted", async () => {
+      let calls = 0;
+      const model = mockModel({ text: "should never run" });
+      const orig = model.doGenerate.bind(model);
+      model.doGenerate = async (o: Parameters<typeof orig>[0]) => {
+        calls++;
+        return orig(o);
+      };
+
+      const out = await runResumableChunk(
+        null,
+        deps({ model, abortSignal: AbortSignal.abort() })
+      );
+
+      expect(calls).toBe(0);
+      expect(out.outcome.done).toBe(false);
+    });
+
+    it("yields without trying the fallback when aborted mid-call", async () => {
+      const controller = new AbortController();
+      const ids: string[] = [];
+      // Both slots are distinguishable, so a fallback attempt would show up.
+      const make = (id: string) =>
+        new MockLanguageModelV3({
+          doGenerate: async () => {
+            ids.push(id);
+            controller.abort();
+            throw new DOMException("Aborted", "AbortError");
+          }
+        });
+      const primary = make("primary");
+      const fallback = make("fallback");
+
+      const out = await runResumableChunk(
+        null,
+        deps({
+          model: primary,
+          models: modelPair(
+            () => primary,
+            () => fallback
+          ),
+          abortSignal: controller.signal
+        })
+      );
+
+      expect(ids).toEqual(["primary"]);
+      expect(out.outcome.done).toBe(false);
+      expect(out.outcome).not.toHaveProperty("result");
+    });
+
+    it("yields instead of summarizing when aborted at the turn budget", async () => {
+      // turns === maxTurns on entry would normally force the budget summary.
+      const state: ChunkRunState = {
+        messages: [{ role: "user", content: "Do the work." }],
+        turns: 4,
+        llmCalls: 4,
+        startedAtMs: 0
+      };
+      let calls = 0;
+      const model = mockModel({ text: "summary" });
+      const orig = model.doGenerate.bind(model);
+      model.doGenerate = async (o: Parameters<typeof orig>[0]) => {
+        calls++;
+        return orig(o);
+      };
+
+      const out = await runResumableChunk(
+        state,
+        deps({
+          model,
+          limits: { maxTurns: 4, turnsPerChunk: 2 },
+          abortSignal: AbortSignal.abort()
+        })
+      );
+
+      expect(calls).toBe(0);
+      expect(out.outcome.done).toBe(false);
+    });
+  });
 
   it("completes in a single chunk on a final reply", async () => {
     const out = await runResumableChunk(

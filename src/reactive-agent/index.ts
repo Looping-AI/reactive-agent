@@ -36,6 +36,7 @@ import type {
   SubtaskChunkOutcome,
   SubtaskId,
   SubtaskNode,
+  SubtaskScan,
   SubtaskStatus
 } from "@/agent/subtasks/types";
 import { FINGERPRINT_MISMATCH, RecipeSubagent, subagentName } from "@/subagent";
@@ -278,6 +279,13 @@ export class ReactiveAgent extends Agent<Env> {
    * is supplied the reply is also emitted as a `working` callback keyed
    * `decompose` — deterministic, so a re-post dedupes at the gateway.
    *
+   * Cancellation is re-read **after** inference too, not just before it: the model
+   * call is the widest window in the phase, and neither the Subtask rows nor the
+   * `decompose` callback may land for a Task the caller already gave up on. The
+   * reply is already in the Session by then (`runDecompose` appends it under a
+   * deterministic id before returning) — that is durable history, not output the
+   * user sees.
+   *
    * Returns a typed `failed` result when both models produce unusable output (the
    * Workflow routes it to failed delivery); throws only on a transient fault, for
    * the step to retry.
@@ -290,6 +298,8 @@ export class ReactiveAgent extends Agent<Env> {
   }): Promise<DecomposeTaskResult> {
     const { taskId, text, identity, push } = input;
     const session = this.getSession(identity);
+
+    if (await this.isTaskCanceled(taskId)) return { status: "canceled" };
 
     // Recovery: the decomposition is already durable. Never re-infer — the reply
     // may already be in front of the user.
@@ -323,6 +333,9 @@ export class ReactiveAgent extends Agent<Env> {
     });
     if (outcome.status === "failed") return outcome;
 
+    // Cancelled while the model worked: persist nothing and publish nothing.
+    if (await this.isTaskCanceled(taskId)) return { status: "canceled" };
+
     // The reply is durable in the Session before the rows exist. A crash in this
     // window re-runs decomposition and persists the *retry's* drafts under the
     // *first* attempt's reply — both are valid outputs of the same input, and no
@@ -342,19 +355,22 @@ export class ReactiveAgent extends Agent<Env> {
   }
 
   /**
-   * Skip every pending Subtask blocked by a dependency that did not succeed, and
-   * return the refreshed DAG as scheduler {@link SubtaskNode}s.
+   * The Workflow's per-wave scan: report a cancellation, or skip every pending
+   * Subtask blocked by a dependency that did not succeed and return the refreshed
+   * DAG as scheduler {@link SubtaskNode}s.
    *
-   * Runs to a fixpoint because skipping propagates: a node skipped for a failed
-   * prerequisite blocks *its* dependents in turn. Bounded by the 8-Subtask
+   * Skipping runs to a fixpoint because it propagates: a node skipped for a
+   * failed prerequisite blocks *its* dependents in turn. Bounded by the 8-Subtask
    * maximum. Independent branches are untouched — one branch's failure never
    * stops work that does not depend on it.
    *
-   * Returns the **projection**, not the rows: this is the Workflow's per-wave
-   * scan, and its return crosses a `step.do` boundary capped at 1 MiB (see
-   * {@link SubtaskNode}). Use {@link listSubtasks} when the full rows are wanted.
+   * The cancellation verdict rides along rather than being probed separately, so
+   * a wave costs one round trip and cannot act on a stale answer. Returns the
+   * **projection**, not the rows: this return crosses a `step.do` boundary capped
+   * at 1 MiB (see {@link SubtaskNode}). Use {@link listSubtasks} for full rows.
    */
-  async skipBlockedSubtasks(taskId: string): Promise<SubtaskNode[]> {
+  async skipBlockedSubtasks(taskId: string): Promise<SubtaskScan> {
+    if (await this.isTaskCanceled(taskId)) return { canceled: true };
     const blocked = new Set<SubtaskStatus>(["failed", "skipped", "canceled"]);
     for (;;) {
       const current = this.db.subtasks.list(taskId);
@@ -367,7 +383,9 @@ export class ReactiveAgent extends Agent<Env> {
             return parent !== undefined && blocked.has(parent.status);
           })
       );
-      if (next.length === 0) return current.map(toSubtaskNode);
+      if (next.length === 0) {
+        return { canceled: false, nodes: current.map(toSubtaskNode) };
+      }
       for (const s of next) this.db.subtasks.skip(s.id);
     }
   }
@@ -384,14 +402,18 @@ export class ReactiveAgent extends Agent<Env> {
    *
    * The Workflow fails the *branch* rather than the Task so composition can
    * disclose the gap while sibling branches keep their durable results. The
-   * managed child is swept best-effort — nothing will read its cache now.
-   * Idempotent: a no-op once the row is terminal.
+   * managed child releases its external state and is then swept, both
+   * best-effort — nothing will read its cache now, but an abandoned run may still
+   * hold something outside this system (an open game scorecard), and dropping the
+   * child is not a reason to leak it. Idempotent: a no-op once the row is terminal.
    */
   async failSubtask(id: SubtaskId, error: string): Promise<void> {
     const subtask = this.db.subtasks.get(id);
     if (!subtask) return;
     this.db.subtasks.fail(id, error);
-    await this.deleteChildQuietly(subagentName(subtask.taskId, id));
+    const name = subagentName(subtask.taskId, id);
+    await this.abortChildQuietly(name, this.toolFamiliesForType(subtask.type));
+    await this.deleteChildQuietly(name);
   }
 
   /**
@@ -431,6 +453,22 @@ export class ReactiveAgent extends Agent<Env> {
 
     const outcome = await this.executeChunkInChild(name, request, chunk);
 
+    // The Task may have been canceled while the chunk ran — checked *before* any
+    // progress is published, so a canceled Task emits nothing further. Applies to
+    // a yield as much as to a terminal chunk: a run interrupted mid-flight by
+    // {@link markCanceled} yields rather than caching a bogus failure, and
+    // resolving it here saves a whole chunk round trip.
+    if (await this.isTaskCanceled(request.taskId)) {
+      this.db.subtasks.cancelRunning(id);
+      await this.abortChildQuietly(name, recipe.toolFamilies);
+      await this.deleteChildQuietly(name);
+      return {
+        done: true,
+        status: this.requireSubtask(id).status,
+        progress: outcome.progress
+      };
+    }
+
     // Post progress the chunk emitted (best-effort; postWorking never throws).
     // Deterministic keys let the gateway dedupe a re-posted event on replay.
     if (push) {
@@ -441,19 +479,6 @@ export class ReactiveAgent extends Agent<Env> {
 
     if (!outcome.done) {
       return { done: false, status: "running", progress: outcome.progress };
-    }
-
-    // Terminal chunk. The Task may have been canceled while it ran: discard the
-    // late result, release external state, and leave the row truthfully terminal.
-    if (await this.isTaskCanceled(request.taskId)) {
-      this.db.subtasks.cancelRunning(id);
-      await this.abortChildQuietly(name, recipe.toolFamilies);
-      await this.deleteChildQuietly(name);
-      return {
-        done: true,
-        status: this.requireSubtask(id).status,
-        progress: outcome.progress
-      };
     }
 
     const persisted = this.persistResult(id, outcome.result);
@@ -699,12 +724,18 @@ export class ReactiveAgent extends Agent<Env> {
    * Skips inference where it adds nothing: a single-Subtask Task returns its
    * result directly, and a Task with no successful branch fails without composing.
    * Idempotent — a re-run returns the durable reply from the Session.
+   *
+   * Cancellation is read on both sides of the model call, so neither a cancelled
+   * Task's composition nor its delivery proceeds. As in Phase 1, the reply may
+   * already be in the Session when the late check fires — durable history, never
+   * published.
    */
   async composeTask(input: {
     taskId: string;
     identity: GatewayIdentity;
   }): Promise<ComposeTaskResult> {
     const { taskId, identity } = input;
+    if (await this.isTaskCanceled(taskId)) return { status: "canceled" };
     const branches: CompositionBranch[] = this.db.subtasks
       .list(taskId)
       .map((s) => ({
@@ -720,13 +751,15 @@ export class ReactiveAgent extends Agent<Env> {
     if (branches.length === 0) {
       return { status: "failed", error: `task ${taskId} has no subtasks` };
     }
-    return await runCompose({
+    const composed = await runCompose({
       session: this.getSession(identity),
       taskId,
       systemSuffix: callerContext(identity),
       models: this.modelPair(),
       branches
     });
+    if (await this.isTaskCanceled(taskId)) return { status: "canceled" };
+    return composed;
   }
 
   // --- Async task state (accept + notify) ---------------------------------
@@ -751,16 +784,84 @@ export class ReactiveAgent extends Agent<Env> {
     return this.db.tasks.get(taskId);
   }
 
-  async saveTask(task: Task): Promise<void> {
-    this.db.tasks.save(task);
+  /**
+   * Persist a Task, returning whether the guarded write applied (see
+   * {@link makeTasks} `save`). The Workflow's terminal delivery keys its callback
+   * on this: `false` means a cancellation beat it to the row and nothing is sent.
+   *
+   * A `canceled` state routes to {@link markCanceled} instead of a plain write —
+   * this is the path a `tasks/cancel` actually takes today (the a2a-js handler is
+   * constructed per request, so its event bus is empty on a cancel call and it
+   * records the cancellation through the TaskStore rather than through
+   * {@link file://../a2a/executor.ts A2AExecutor.cancelTask}). Both entry points
+   * therefore converge on the same method.
+   */
+  async saveTask(task: Task): Promise<boolean> {
+    if (task.status.state === "canceled") {
+      await this.markCanceled(task.id, task);
+      return true;
+    }
+    return this.db.tasks.save(task);
   }
 
-  async markWorking(taskId: string): Promise<void> {
+  /**
+   * Move the Task to `working`. Returns `"canceled"` when the caller cancelled
+   * first — the Workflow reads that instead of probing with a separate
+   * {@link getTask}, which removes the gap between probe and act.
+   *
+   * Anything else is `"ok"`, including an unknown row and a row already `working`
+   * (a replayed step): only an actual cancellation stops the pipeline.
+   */
+  async markWorking(taskId: string): Promise<"ok" | "canceled"> {
+    if (await this.isTaskCanceled(taskId)) return "canceled";
     this.db.tasks.markWorking(taskId);
+    return "ok";
   }
 
   async cancelTask(taskId: string): Promise<PlainTask | null> {
-    return this.db.tasks.cancel(taskId);
+    return this.markCanceled(taskId);
+  }
+
+  /**
+   * The one place a Task becomes canceled. Flips the row (terminal — every
+   * non-canceled write is refused afterwards), then interrupts whatever is still
+   * running for it: each `running` Subtask's managed child gets
+   * {@link RecipeSubagent.abortRun}, so a long recipe stops at its current model
+   * call instead of at the next chunk boundary (up to `chunkSoftMs` later).
+   *
+   * `task` is supplied when the caller already built the canceled Task (the
+   * a2a-js cancel branch attaches its own status message); otherwise the row's
+   * own guarded flip produces it.
+   *
+   * Best-effort throughout: a child that cannot be reached is logged, never
+   * fatal. Cancellation must not fail because cleanup did.
+   */
+  private async markCanceled(
+    taskId: string,
+    task?: Task
+  ): Promise<PlainTask | null> {
+    const canceled = task
+      ? (this.db.tasks.save(task), this.db.tasks.get(taskId))
+      : this.db.tasks.cancel(taskId);
+    if (!canceled) return null;
+
+    // Only `running` rows have a live child. `subAgent` *creates* a facet that
+    // does not exist, so a wider fan-out would materialize children just to abort
+    // them. Bounded by MAX_SUBTASKS.
+    for (const subtask of this.db.subtasks.list(taskId)) {
+      if (subtask.status !== "running") continue;
+      const name = subagentName(taskId, subtask.id);
+      try {
+        const child = await this.subAgent(RecipeSubagent, name);
+        await child.abortRun();
+      } catch (err) {
+        console.warn("[reactive-agent] subagent abortRun failed", {
+          name,
+          err: String(err)
+        });
+      }
+    }
+    return canceled;
   }
 }
 
