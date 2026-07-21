@@ -5,8 +5,8 @@ import type { ReactiveAgent } from "@/reactive-agent";
 import { RecipeSubagent, subagentName, FINGERPRINT_MISMATCH } from "@/subagent";
 import { createModelPair, type ModelPair } from "@/agent/model";
 import {
-  decomposeReplyMessageId,
   finalReplyMessageId,
+  roundAckMessageId,
   sessionText
 } from "@/agent/history";
 import { DEFAULT_RECIPE } from "@/agent/subtasks/registry";
@@ -60,8 +60,8 @@ function delegates(subtasks?: unknown[]): MockStep {
  * exercise skip propagation, where a canceled verdict would mean the fixture is
  * wrong rather than the assertion failing somewhere less obvious.
  */
-async function scanNodes(instance: ReactiveAgent, taskId = TASK_ID) {
-  const scan = await instance.skipBlockedSubtasks(taskId);
+async function scanNodes(instance: ReactiveAgent, round = 0, taskId = TASK_ID) {
+  const scan = await instance.skipBlockedSubtasks(taskId, round);
   if (scan.canceled) throw new Error("unexpected cancellation in scan");
   return scan.nodes;
 }
@@ -153,28 +153,39 @@ const OK: RecipeExecutionResult = {
  * `db` is private on the agent; the tests drive real rows through the same handle
  * the RPCs use, so a seeded DAG is indistinguishable from a decomposed one.
  */
-function seed(instance: ReactiveAgent, drafts: SubtaskDraft[]) {
+function seed(instance: ReactiveAgent, drafts: SubtaskDraft[], round = 0) {
   const { db } = instance as unknown as { db: AgentDB };
-  return { rows: db.subtasks.createDecomposition(TASK_ID, drafts), db };
+  return { rows: db.subtasks.createDecomposition(TASK_ID, round, drafts), db };
 }
 
-describe("decomposeTask", () => {
-  it("persists the DAG and returns the first reply", async () => {
-    await runInDurableObject(freshStub("decompose"), async (instance) => {
+/** Run one round with the standard inputs; only what a test cares about varies. */
+function turn(
+  instance: ReactiveAgent,
+  over: { round?: number; text?: string; allowControl?: boolean } = {}
+) {
+  return instance.runTaskTurn({
+    taskId: TASK_ID,
+    text: over.text ?? "book me a flight",
+    identity: IDENTITY,
+    round: over.round ?? 0,
+    allowControl: over.allowControl ?? true
+  });
+}
+
+describe("runTaskTurn — delegating", () => {
+  it("persists the DAG and returns the acknowledgment", async () => {
+    await runInDurableObject(freshStub("turn-delegate"), async (instance) => {
       instance.modelsOverride = pairOf(mockModel(delegates()));
 
-      const result = await instance.decomposeTask({
-        taskId: TASK_ID,
-        text: "book me a flight",
-        identity: IDENTITY
-      });
+      const result = await turn(instance);
 
-      expect(result.status).toBe("completed");
-      if (result.status !== "completed") return;
+      expect(result.status).toBe("delegated");
+      if (result.status !== "delegated") return;
       expect(result.reply).toBe("On it.");
       expect(result.subtasks).toHaveLength(1);
       expect(result.subtasks[0].type).toBe("research");
       expect(result.subtasks[0].status).toBe("pending");
+      expect(result.subtasks[0].round).toBe(0);
       // The model selected index 1 — the inbound turn, snapshotted verbatim.
       expect(result.subtasks[0].references).toEqual([
         { role: "user", text: "book me a flight" }
@@ -182,64 +193,61 @@ describe("decomposeTask", () => {
     });
   });
 
-  it("makes the reply durable in the session", async () => {
-    await runInDurableObject(
-      freshStub("decompose-session"),
-      async (instance) => {
-        instance.modelsOverride = pairOf(mockModel(delegates()));
-        await instance.decomposeTask({
-          taskId: TASK_ID,
-          text: "hello",
-          identity: IDENTITY
-        });
+  it("puts the Session's own memory tools on the round", async () => {
+    await runInDurableObject(freshStub("turn-tools"), async (instance) => {
+      // The soul instructs the model to record durable facts with `set_context`,
+      // so it has to actually reach the provider — the Session owns that tool,
+      // and nothing else can supply it.
+      const model = mockModel(delegates());
+      const orig = model.doGenerate.bind(model);
+      let names: string[] = [];
+      model.doGenerate = async (options: Parameters<typeof orig>[0]) => {
+        names = (options.tools ?? []).map((t) => t.name);
+        return orig(options);
+      };
+      instance.modelsOverride = pairOf(model);
 
-        const stored = await instance
-          .getSession(IDENTITY)
-          .getMessage(decomposeReplyMessageId(TASK_ID));
-        expect(stored && sessionText(stored)).toBe("On it.");
-      }
-    );
+      await turn(instance);
+
+      expect(names).toContain("set_context");
+      expect(names).toContain(DELEGATE_TOOL_NAME);
+    });
+  });
+
+  it("makes the acknowledgment durable in the session", async () => {
+    await runInDurableObject(freshStub("turn-ack"), async (instance) => {
+      instance.modelsOverride = pairOf(mockModel(delegates()));
+      await turn(instance, { text: "hello" });
+
+      const stored = await instance
+        .getSession(IDENTITY)
+        .getMessage(roundAckMessageId(TASK_ID, 0));
+      expect(stored && sessionText(stored)).toBe("On it.");
+    });
   });
 
   it("recovers on a re-run without re-inferring or duplicating rows", async () => {
-    await runInDurableObject(
-      freshStub("decompose-replay"),
-      async (instance) => {
-        instance.modelsOverride = pairOf(mockModel(delegates()));
-        await instance.decomposeTask({
-          taskId: TASK_ID,
-          text: "hello",
-          identity: IDENTITY
-        });
+    await runInDurableObject(freshStub("turn-replay"), async (instance) => {
+      instance.modelsOverride = pairOf(mockModel(delegates()));
+      await turn(instance, { text: "hello" });
 
-        const models = countingPair();
-        instance.modelsOverride = models;
-        const again = await instance.decomposeTask({
-          taskId: TASK_ID,
-          text: "hello",
-          identity: IDENTITY
-        });
+      const models = countingPair();
+      instance.modelsOverride = models;
+      const again = await turn(instance, { text: "hello" });
 
-        expect(again.status).toBe("completed");
-        if (again.status !== "completed") return;
-        expect(again.reply).toBe("On it.");
-        expect(again.subtasks).toHaveLength(1);
-        expect(models.generations()).toBe(0);
-        expect(await instance.listSubtasks(TASK_ID)).toHaveLength(1);
-      }
-    );
+      expect(again.status).toBe("delegated");
+      if (again.status !== "delegated") return;
+      expect(again.reply).toBe("On it.");
+      expect(again.subtasks).toHaveLength(1);
+      expect(models.generations()).toBe(0);
+      expect(await instance.listSubtasks(TASK_ID)).toHaveLength(1);
+    });
   });
 
   it("returns a typed failure when the model output is unusable", async () => {
-    await runInDurableObject(freshStub("decompose-fail"), async (instance) => {
-      instance.modelsOverride = pairOf(
-        mockModel({ text: "Sure, here you go." })
-      );
-      const result = await instance.decomposeTask({
-        taskId: TASK_ID,
-        text: "hello",
-        identity: IDENTITY
-      });
+    await runInDurableObject(freshStub("turn-fail"), async (instance) => {
+      instance.modelsOverride = pairOf(mockModel({ text: "" }));
+      const result = await turn(instance, { text: "hello" });
       expect(result.status).toBe("failed");
       // Nothing persisted: no subtask is ever synthesized.
       expect(await instance.listSubtasks(TASK_ID)).toEqual([]);
@@ -247,7 +255,7 @@ describe("decomposeTask", () => {
   });
 
   it("persists a multi-node DAG with resolved dependency edges", async () => {
-    await runInDurableObject(freshStub("decompose-dag"), async (instance) => {
+    await runInDurableObject(freshStub("turn-dag"), async (instance) => {
       instance.modelsOverride = pairOf(
         mockModel(
           delegates([
@@ -268,14 +276,143 @@ describe("decomposeTask", () => {
           ])
         )
       );
-      const result = await instance.decomposeTask({
-        taskId: TASK_ID,
-        text: "hello",
-        identity: IDENTITY
-      });
-      if (result.status !== "completed") throw new Error("expected completed");
+      const result = await turn(instance, { text: "hello" });
+      if (result.status !== "delegated") throw new Error("expected delegated");
       const [research, drafted] = result.subtasks;
       expect(drafted.dependsOn).toEqual([research.id]);
+    });
+  });
+
+  it("persists a later round's DAG alongside the first round's rows", async () => {
+    await runInDurableObject(freshStub("turn-round-1"), async (instance) => {
+      seed(instance, [draft()]);
+      instance.modelsOverride = pairOf(
+        mockModel(
+          delegates([
+            { localKey: "more", type: "research", prompt: "dig", dependsOn: [] }
+          ])
+        )
+      );
+
+      const result = await turn(instance, { round: 1 });
+
+      if (result.status !== "delegated") throw new Error("expected delegated");
+      expect(result.subtasks.map((s) => s.round)).toEqual([1]);
+      // Both rounds' rows live under the same Task, in one stable order.
+      const all = await instance.listSubtasks(TASK_ID);
+      expect(all.map((s) => s.ordinal)).toEqual([0, 1]);
+    });
+  });
+});
+
+describe("runTaskTurn — answering", () => {
+  it("treats plain text as the terminal reply and persists it", async () => {
+    await runInDurableObject(freshStub("turn-reply"), async (instance) => {
+      instance.modelsOverride = pairOf(mockModel({ text: "the answer" }));
+
+      const result = await turn(instance);
+
+      expect(result).toEqual({ status: "replied", reply: "the answer" });
+      // No subtask was created for a request the agent answered itself.
+      expect(await instance.listSubtasks(TASK_ID)).toEqual([]);
+      const stored = await instance
+        .getSession(IDENTITY)
+        .getMessage(finalReplyMessageId(TASK_ID));
+      expect(stored && sessionText(stored)).toBe("the answer");
+    });
+  });
+
+  it("returns the durable answer on a re-run, with no inference", async () => {
+    await runInDurableObject(freshStub("turn-answered"), async (instance) => {
+      instance.modelsOverride = pairOf(mockModel({ text: "first answer" }));
+      await turn(instance);
+
+      const models = countingPair();
+      instance.modelsOverride = models;
+      const again = await turn(instance, { round: 1 });
+
+      // Re-answering could produce different words for a reply the user may
+      // already have received.
+      expect(again).toEqual({ status: "replied", reply: "first answer" });
+      expect(models.generations()).toBe(0);
+    });
+  });
+
+  it("composes a completed branch rather than shipping its text raw", async () => {
+    await runInDurableObject(freshStub("turn-compose"), async (instance) => {
+      const { rows, db } = seed(instance, [draft()]);
+      db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
+      db.subtasks.complete(rows[0].id, [{ kind: "text", text: "raw finding" }]);
+
+      instance.modelsOverride = pairOf(mockModel({ text: "composed answer" }));
+      const result = await turn(instance, { round: 1 });
+
+      expect(result).toEqual({
+        status: "replied",
+        reply: "composed answer"
+      });
+      const stored = await instance
+        .getSession(IDENTITY)
+        .getMessage(finalReplyMessageId(TASK_ID));
+      expect(stored && sessionText(stored)).toBe("composed answer");
+    });
+  });
+
+  it("gives a later round every round's branches to answer from", async () => {
+    await runInDurableObject(freshStub("turn-branches"), async (instance) => {
+      const { rows, db } = seed(instance, [
+        draft({ localKey: "a" }),
+        draft({ localKey: "b" })
+      ]);
+      for (const [i, part] of ["alpha", "beta"].entries()) {
+        db.subtasks.start(rows[i].id, {
+          recipeId: "default",
+          recipeVersion: 1
+        });
+        db.subtasks.complete(rows[i].id, [{ kind: "text", text: part }]);
+      }
+
+      const model = mockModel({ text: "composed answer" });
+      const orig = model.doGenerate.bind(model);
+      let seen = "";
+      model.doGenerate = async (options: Parameters<typeof orig>[0]) => {
+        seen = JSON.stringify(options.prompt);
+        return orig(options);
+      };
+      instance.modelsOverride = pairOf(model);
+
+      await turn(instance, { round: 1 });
+
+      // The branch outcomes reach the model as the delegate call's result.
+      expect(seen).toContain("alpha");
+      expect(seen).toContain("beta");
+    });
+  });
+
+  it("degrades to the durable work when the models are unusable", async () => {
+    await runInDurableObject(freshStub("turn-degrade"), async (instance) => {
+      const { rows, db } = seed(instance, [draft()]);
+      db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
+      db.subtasks.complete(rows[0].id, [{ kind: "text", text: "the finding" }]);
+
+      instance.modelsOverride = pairOf(mockModel({ text: "" }));
+      const result = await turn(instance, { round: 1 });
+
+      // The branch work is done and durable — deliver it rather than failing.
+      expect(result).toEqual({ status: "replied", reply: "the finding" });
+    });
+  });
+
+  it("fails when the models are unusable and nothing succeeded", async () => {
+    await runInDurableObject(freshStub("turn-nothing"), async (instance) => {
+      const { rows, db } = seed(instance, [draft()]);
+      db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
+      db.subtasks.fail(rows[0].id, "boom");
+
+      instance.modelsOverride = pairOf(mockModel({ text: "" }));
+      const result = await turn(instance, { round: 1 });
+
+      expect(result.status).toBe("failed");
     });
   });
 });
@@ -740,6 +877,23 @@ describe("skipBlockedSubtasks", () => {
       expect(after[1].status).toBe("pending");
     });
   });
+
+  it("sees only its own round's nodes", async () => {
+    await runInDurableObject(freshStub("skip-round"), async (instance) => {
+      const { rows, db } = seed(instance, [draft({ localKey: "a" })]);
+      db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
+      db.subtasks.fail(rows[0].id, "boom");
+      seed(instance, [draft({ localKey: "b" })], 1);
+
+      // Round 1's node does not depend on round 0's failure, so it stays
+      // runnable — and round 0's terminal row never enters round 1's wave, where
+      // the scheduler would have to reason about it.
+      const round1 = await scanNodes(instance, 1);
+      expect(round1.map((n) => n.status)).toEqual(["pending"]);
+      const round0 = await scanNodes(instance, 0);
+      expect(round0.map((n) => n.status)).toEqual(["failed"]);
+    });
+  });
 });
 
 describe("cancelPendingSubtasks and listSubtasks", () => {
@@ -766,82 +920,6 @@ describe("cancelPendingSubtasks and listSubtasks", () => {
       expect((await instance.listSubtasks(TASK_ID)).map((s) => s.type)).toEqual(
         ["first", "second"]
       );
-    });
-  });
-});
-
-describe("composeTask", () => {
-  it("bypasses inference for a single successful subtask", async () => {
-    await runInDurableObject(freshStub("compose-single"), async (instance) => {
-      const { rows, db } = seed(instance, [draft()]);
-      db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
-      db.subtasks.complete(rows[0].id, [{ kind: "text", text: "the answer" }]);
-
-      const models = countingPair();
-      instance.modelsOverride = models;
-      const result = await instance.composeTask({
-        taskId: TASK_ID,
-        identity: IDENTITY
-      });
-
-      expect(result).toEqual({ status: "completed", reply: "the answer" });
-      expect(models.generations()).toBe(0);
-    });
-  });
-
-  it("composes multiple branches and persists the final reply", async () => {
-    await runInDurableObject(freshStub("compose-multi"), async (instance) => {
-      const { rows, db } = seed(instance, [
-        draft({ localKey: "a" }),
-        draft({ localKey: "b" })
-      ]);
-      for (const i of [0, 1]) {
-        db.subtasks.start(rows[i].id, {
-          recipeId: "default",
-          recipeVersion: 1
-        });
-        db.subtasks.complete(rows[i].id, [{ kind: "text", text: `part ${i}` }]);
-      }
-
-      instance.modelsOverride = pairOf(mockModel({ text: "composed answer" }));
-      const result = await instance.composeTask({
-        taskId: TASK_ID,
-        identity: IDENTITY
-      });
-
-      expect(result).toEqual({ status: "completed", reply: "composed answer" });
-      const stored = await instance
-        .getSession(IDENTITY)
-        .getMessage(finalReplyMessageId(TASK_ID));
-      expect(stored && sessionText(stored)).toBe("composed answer");
-    });
-  });
-
-  it("fails without inference when no branch succeeded", async () => {
-    await runInDurableObject(freshStub("compose-none"), async (instance) => {
-      const { rows, db } = seed(instance, [draft()]);
-      db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
-      db.subtasks.fail(rows[0].id, "boom");
-
-      const models = countingPair();
-      instance.modelsOverride = models;
-      const result = await instance.composeTask({
-        taskId: TASK_ID,
-        identity: IDENTITY
-      });
-
-      expect(result.status).toBe("failed");
-      expect(models.generations()).toBe(0);
-    });
-  });
-
-  it("fails for a task with no subtasks", async () => {
-    await runInDurableObject(freshStub("compose-empty"), async (instance) => {
-      const result = await instance.composeTask({
-        taskId: "nonexistent",
-        identity: IDENTITY
-      });
-      expect(result.status).toBe("failed");
     });
   });
 });

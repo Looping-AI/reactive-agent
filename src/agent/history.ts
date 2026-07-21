@@ -72,12 +72,12 @@ export function parseTurn(text: string): ParsedTurn | null {
 }
 
 /**
- * Deterministic Session-message ids for the phased task pipeline.
+ * Deterministic Session-message ids for the task round loop.
  *
- * A phase runs inside a durable Workflow step that can re-run after a crash, so
+ * A round runs inside a durable Workflow step that can re-run after a crash, so
  * its Session appends must be exactly-once. `Session.appendMessage` already
  * dedupes on message id (an id that exists is not re-written), so deriving the id
- * from the task id + phase makes the append idempotent for free — no
+ * from the task id + round makes the append idempotent for free — no
  * read-then-write race, no duplicate turns in history on replay. Pair with
  * {@link file://./session.ts appendOnce}, which reads the durable text back so a
  * retry that re-inferred still returns the *stored* reply.
@@ -87,17 +87,23 @@ export function parseTurn(text: string): ParsedTurn | null {
  * either.
  */
 
-/** Id of the inbound user turn for a task (appended once, in Phase 1). */
+/** Id of the inbound user turn for a task (appended once, by round 0). */
 export function taskUserMessageId(taskId: string): string {
   return `task:${taskId}:user`;
 }
 
-/** Id of the Phase 1 decomposition reply (the first user-visible message). */
-export function decomposeReplyMessageId(taskId: string): string {
-  return `task:${taskId}:reply:decompose`;
+/**
+ * Id of the acknowledgment a **delegating** round publishes — the message the
+ * user sees while that round's Subtasks run. Also the anchor a later round finds
+ * to reattach the round's `delegate` call to (see
+ * {@link file://./turn.ts renderTurnMessages}), which is why it is derived from
+ * the round rather than stored.
+ */
+export function roundAckMessageId(taskId: string, round: number): string {
+  return `task:${taskId}:round:${round}:ack`;
 }
 
-/** Id of the Phase 3 composed final reply. */
+/** Id of the terminal reply — the round in which the agent answered the user. */
 export function finalReplyMessageId(taskId: string): string {
   return `task:${taskId}:reply:final`;
 }

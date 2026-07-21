@@ -87,7 +87,7 @@ function buildTaskUpdate(
 /**
  * A non-terminal `working` Task snapshot carrying a progress message. Streamed
  * live from the DO as the tool loop emits content, and emitted once per phase for
- * milestone replies (the Phase 1 decomposition acknowledgement).
+ * milestone replies (a delegating round's acknowledgement).
  *
  * `key` is a **stable semantic key** naming what produced the message, not a
  * counter: the tool loop passes `step:<n>`, decomposition passes `decompose`, and

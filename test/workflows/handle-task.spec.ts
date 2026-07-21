@@ -6,6 +6,7 @@ import type { Task } from "@a2a-js/sdk";
 import type { ReactiveAgent } from "@/reactive-agent";
 import { runHandleTask, type HandleTaskParams } from "@/workflows/handle-task";
 import { TASK_FAILED_TEXT } from "@/a2a/notify";
+import { MAX_CHUNKS_PER_BRANCH, MAX_TURN_ROUNDS } from "@/config";
 import type {
   SubtaskNode,
   SubtaskScan,
@@ -18,11 +19,13 @@ import {
 } from "../fixtures";
 
 /**
- * Workflow-level coverage of the five phases. The DO is faked, but the fake owns
+ * Workflow-level coverage of the round loop. The DO is faked, but the fake owns
  * a real in-memory DAG — it applies the same skip-to-fixpoint rule the parent
- * does — so wave ordering, skip propagation, and fan-out concurrency are actually
- * exercised here rather than scripted. The DO-side behaviour these fakes stand in
- * for is proven for real in `test/reactive-agent/subtasks-rpc.spec.ts`.
+ * does, and it honors `allowControl` the way a real round does (a round handed no
+ * control tools cannot delegate) — so wave ordering, skip propagation, fan-out
+ * concurrency, and the round budget are actually exercised here rather than
+ * scripted. The DO-side behaviour these fakes stand in for is proven for real in
+ * `test/reactive-agent/subtasks-rpc.spec.ts`.
  */
 
 const PUSH_URL = `${GATEWAY_ORIGIN}/a2a/notifications`;
@@ -74,23 +77,30 @@ function stepFake(cache?: Map<string, unknown>): StepFake {
 /** What `executeSubtaskChunk` should do for a given node. */
 type Outcome = "completed" | "failed" | "throw";
 
+/**
+ * One scripted round: it delegates a DAG (`[id, dependsOn][]`), answers the user,
+ * or reports a typed failure. A round scripted to delegate but handed
+ * `allowControl: false` answers instead — the real model has no tool to call.
+ */
+type Round =
+  { dag: [number, number[]][] } | { reply: string } | { fails: string };
+
+/** Delegate then answer — the shape a normal task takes. */
+const DEFAULT_ROUNDS: Round[] = [{ dag: [[1, []]] }, { reply: "the answer" }];
+
 interface AgentOptions {
-  /** Nodes seeded by decomposition, as `[id, dependsOn]`. Default: one node. */
-  dag?: [number, number[]][];
+  /** The rounds to script, in order. Default: delegate one node, then answer. */
+  rounds?: Round[];
   /** Per-node execution outcome. Default: `completed`. */
   outcomes?: Record<number, Outcome>;
   /** Per-node chunk count before the run terminates. Default: 1 (single chunk). */
   chunks?: Record<number, number>;
-  /** Make decomposition report a typed failure. */
-  decomposeFails?: boolean;
-  /** Make composition report a typed failure. */
-  composeFails?: boolean;
   /** Task state `getTask` reports (cancellation). */
   state?: Task["status"]["state"];
   /** Runs when a node starts executing — used to cancel mid-DAG. */
   onExecute?: (id: number, agent: AgentFake) => void;
-  /** Runs after composition returns — used to cancel during delivery. */
-  onCompose?: (agent: AgentFake) => void;
+  /** Runs after a round returns — used to cancel during delivery. */
+  onTurn?: (agent: AgentFake) => void;
   /**
    * Make the guarded terminal write refuse while `getTask` still reports the
    * task live — i.e. the cancel landed *after* a probe would have passed but
@@ -103,6 +113,7 @@ interface AgentOptions {
 interface AgentFake {
   nodes: {
     id: number;
+    round: number;
     ordinal: number;
     status: SubtaskStatus;
     dependsOn: number[];
@@ -114,15 +125,15 @@ interface AgentFake {
   failed: { id: number; error: string }[];
   canceledPending: number;
   saved?: Task;
-  composeCalls: number;
-  decomposeCalls: number;
+  /** One entry per round that actually ran an inference, in order. */
+  turns: { round: number; allowControl: boolean; decision: string }[];
 }
 
 const BLOCKED = new Set<SubtaskStatus>(["failed", "skipped", "canceled"]);
 
 /** Spy on the ReactiveAgent namespace to return a DAG-owning fake stub. */
 function mockAgent(opts: AgentOptions = {}): AgentFake {
-  const dag = opts.dag ?? [[1, []]];
+  const rounds = opts.rounds ?? DEFAULT_ROUNDS;
   const agent: AgentFake = {
     nodes: [],
     state: opts.state,
@@ -130,20 +141,21 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
     executed: [],
     failed: [],
     canceledPending: 0,
-    composeCalls: 0,
-    decomposeCalls: 0
+    turns: []
   };
   let inFlight = 0;
 
-  const project = (): SubtaskNode[] =>
-    agent.nodes.map((n) => ({
-      id: n.id,
-      ordinal: n.ordinal,
-      status: n.status,
-      dependsOn: n.dependsOn
-    }));
+  const project = (round: number): SubtaskNode[] =>
+    agent.nodes
+      .filter((n) => n.round === round)
+      .map((n) => ({
+        id: n.id,
+        ordinal: n.ordinal,
+        status: n.status,
+        dependsOn: n.dependsOn
+      }));
 
-  /** The DO's own cancellation predicate, which every phase RPC now applies. */
+  /** The DO's own cancellation predicate, which every round-loop RPC applies. */
   const canceled = () => agent.state === "canceled";
 
   const stub = {
@@ -161,39 +173,74 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
       return true;
     }),
 
-    decomposeTask: vi.fn(async () => {
-      agent.decomposeCalls++;
-      if (canceled()) return { status: "canceled" as const };
-      if (opts.decomposeFails) {
-        return { status: "failed" as const, error: "both models unusable" };
+    runTaskTurn: vi.fn(
+      async (input: { round: number; allowControl: boolean }) => {
+        if (canceled()) return { status: "canceled" as const };
+        const script = rounds[input.round] ?? { reply: "the answer" };
+
+        // A round with no control tools cannot delegate, whatever it intended.
+        const delegating = "dag" in script && input.allowControl;
+        const decision =
+          "fails" in script ? "failed" : delegating ? "delegated" : "replied";
+        agent.turns.push({
+          round: input.round,
+          allowControl: input.allowControl,
+          decision
+        });
+
+        if ("fails" in script) {
+          return { status: "failed" as const, error: script.fails };
+        }
+        if (!delegating) {
+          const reply = "reply" in script ? script.reply : "forced answer";
+          const out = { status: "replied" as const, reply };
+          opts.onTurn?.(agent);
+          return out;
+        }
+
+        const base = agent.nodes.length;
+        for (const [i, [id, dependsOn]] of script.dag.entries()) {
+          agent.nodes.push({
+            id,
+            round: input.round,
+            ordinal: base + i,
+            status: "pending",
+            dependsOn
+          });
+        }
+        const out = {
+          status: "delegated" as const,
+          reply: "On it.",
+          subtasks: []
+        };
+        opts.onTurn?.(agent);
+        return out;
       }
-      agent.nodes = dag.map(([id, dependsOn], i) => ({
-        id,
-        ordinal: i,
-        status: "pending" as SubtaskStatus,
-        dependsOn
-      }));
-      return { status: "completed" as const, reply: "On it.", subtasks: [] };
-    }),
+    ),
 
     // Reports cancellation with the wave, then mirrors the parent's fixpoint
     // rule: a node whose prerequisite did not succeed is skipped, and skipping
-    // propagates to its own dependents.
-    skipBlockedSubtasks: vi.fn(async (): Promise<SubtaskScan> => {
-      if (canceled()) return { canceled: true };
-      for (;;) {
-        const byId = new Map(agent.nodes.map((n) => [n.id, n]));
-        const next = agent.nodes.filter(
-          (n) =>
-            n.status === "pending" &&
-            n.dependsOn.some((d) =>
-              BLOCKED.has(byId.get(d)?.status as SubtaskStatus)
-            )
-        );
-        if (next.length === 0) return { canceled: false, nodes: project() };
-        for (const n of next) n.status = "skipped";
+    // propagates to its own dependents. Scoped to the round, as the DO is.
+    skipBlockedSubtasks: vi.fn(
+      async (_taskId: string, round: number): Promise<SubtaskScan> => {
+        if (canceled()) return { canceled: true };
+        for (;;) {
+          const byId = new Map(agent.nodes.map((n) => [n.id, n]));
+          const next = agent.nodes.filter(
+            (n) =>
+              n.round === round &&
+              n.status === "pending" &&
+              n.dependsOn.some((d) =>
+                BLOCKED.has(byId.get(d)?.status as SubtaskStatus)
+              )
+          );
+          if (next.length === 0) {
+            return { canceled: false, nodes: project(round) };
+          }
+          for (const n of next) n.status = "skipped";
+        }
       }
-    }),
+    ),
 
     executeSubtaskChunk: vi.fn(async (id: number, chunk: number) => {
       inFlight++;
@@ -234,16 +281,6 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
       }
       agent.canceledPending = n;
       return n;
-    }),
-
-    composeTask: vi.fn(async () => {
-      if (canceled()) return { status: "canceled" as const };
-      agent.composeCalls++;
-      const out = opts.composeFails
-        ? { status: "failed" as const, error: "no subtask succeeded" }
-        : { status: "completed" as const, reply: "the answer" };
-      opts.onCompose?.(agent);
-      return out;
     })
   } as unknown as DurableObjectStub<ReactiveAgent>;
 
@@ -298,23 +335,23 @@ afterEach(() => {
 
 // ---------------------------------------------------------------------------
 
-describe("HandleTaskWorkflow — the five phases", () => {
-  it("runs every phase in order and POSTs a signed completed-Task callback", async () => {
+describe("HandleTaskWorkflow — the round loop", () => {
+  it("runs delegate → execute → answer and POSTs a signed completed-Task callback", async () => {
     const agent = mockAgent();
     const captured = mockFetch();
     const { step, names } = stepFake();
 
     await runHandleTask(params(), step);
 
-    // The full durable step sequence — this is what proves the phase order and
-    // makes the DAG loop's shape auditable on replay.
+    // The full durable step sequence — this is what proves the loop's shape and
+    // makes it auditable on replay. Every name inside the loop carries its round.
     expect(names).toEqual([
       "working",
-      "decompose",
-      "scan:0",
+      "turn:0",
+      "scan:0:0",
       "execute:1",
-      "scan:1",
-      "compose",
+      "scan:0:1",
+      "turn:1",
       "complete",
       "notify"
     ]);
@@ -343,14 +380,68 @@ describe("HandleTaskWorkflow — the five phases", () => {
     });
   });
 
-  it("posts exactly the Task it persisted", async () => {
-    // The Task is built inside the `complete` step, so `notify` cannot post a
-    // re-stamped copy that differs from the stored one.
-    const agent = mockAgent();
+  it("delivers a round-0 answer with no subtasks at all", async () => {
+    // The emancipated path: a request the main agent is best placed to answer
+    // never reaches a subagent, and costs exactly one inference.
+    const agent = mockAgent({ rounds: [{ reply: "You said aisle seats." }] });
     const captured = mockFetch();
+    const { step, names } = stepFake();
+
+    await runHandleTask(params(), step);
+
+    expect(names).toEqual(["working", "turn:0", "complete", "notify"]);
+    expect(agent.executed).toEqual([]);
+    expect(agent.turns).toEqual([
+      { round: 0, allowControl: true, decision: "replied" }
+    ]);
+    expect(bodyOf(captured).status.message?.parts?.[0]).toMatchObject({
+      text: "You said aisle seats."
+    });
+  });
+
+  it("runs a second round of delegation before answering", async () => {
+    const agent = mockAgent({
+      rounds: [{ dag: [[1, []]] }, { dag: [[2, []]] }, { reply: "the answer" }]
+    });
+    mockFetch();
+    const { step, names } = stepFake();
+
+    await runHandleTask(params(), step);
+
+    expect(agent.executed).toEqual([1, 2]);
+    expect(names).toEqual([
+      "working",
+      "turn:0",
+      "scan:0:0",
+      "execute:1",
+      "scan:0:1",
+      "turn:1",
+      "scan:1:0",
+      "execute:2",
+      "scan:1:1",
+      "turn:2",
+      "complete",
+      "notify"
+    ]);
+    expect(agent.saved?.status.state).toBe("completed");
+  });
+
+  it("scopes each round's wave scan to that round's own DAG", async () => {
+    // Round 1 must not re-scan round 0's terminal rows — the scan feeds a
+    // scheduler that would call a completed sibling "active".
+    const agent = mockAgent({
+      rounds: [{ dag: [[1, []]] }, { dag: [[2, []]] }, { reply: "done" }]
+    });
+    mockFetch();
     await runHandleTask(params(), stepFake().step);
 
-    expect(bodyOf(captured)).toEqual(agent.saved);
+    const stub = env.ReactiveAgent.get({} as DurableObjectId) as unknown as {
+      skipBlockedSubtasks: ReturnType<typeof vi.fn>;
+    };
+    expect(stub.skipBlockedSubtasks.mock.calls.map((c) => c[1])).toEqual([
+      0, 0, 1, 1
+    ]);
+    expect(agent.nodes.map((n) => n.round)).toEqual([0, 1]);
   });
 
   it("runs a multi-chunk node as a sequence of durable chunk steps until done", async () => {
@@ -371,18 +462,19 @@ describe("HandleTaskWorkflow — the five phases", () => {
     expect(agent.saved?.status.state).toBe("completed");
   });
 
-  it("threads the push context into decomposition so it can stream the first reply", async () => {
+  it("threads the push context into every round so it can stream progress", async () => {
     mockAgent();
     mockFetch();
     await runHandleTask(params(), stepFake().step);
 
     const stub = env.ReactiveAgent.get({} as DurableObjectId) as unknown as {
-      decomposeTask: ReturnType<typeof vi.fn>;
+      runTaskTurn: ReturnType<typeof vi.fn>;
     };
-    expect(stub.decomposeTask).toHaveBeenCalledWith(
+    expect(stub.runTaskTurn).toHaveBeenCalledWith(
       expect.objectContaining({
         taskId: "task-1",
         text: "hi there",
+        round: 0,
         identity: expect.objectContaining({ key: "custom:1:ada" }),
         push: expect.objectContaining({
           taskId: "task-1",
@@ -395,13 +487,63 @@ describe("HandleTaskWorkflow — the five phases", () => {
   });
 });
 
+describe("HandleTaskWorkflow — round budget", () => {
+  it("hands the last round no control tools, so it must answer", async () => {
+    // Every round asks to delegate; only the budget stops it.
+    const agent = mockAgent({
+      rounds: Array.from({ length: MAX_TURN_ROUNDS }, (_, i) => ({
+        dag: [[i + 1, []]] as [number, number[]][]
+      }))
+    });
+    mockFetch();
+
+    await runHandleTask(params(), stepFake().step);
+
+    expect(agent.turns).toHaveLength(MAX_TURN_ROUNDS);
+    expect(agent.turns.map((t) => t.allowControl)).toEqual([
+      ...Array(MAX_TURN_ROUNDS - 1).fill(true),
+      false
+    ]);
+    // The last round answered rather than delegating a ninth DAG.
+    expect(agent.turns.at(-1)?.decision).toBe("replied");
+    expect(agent.saved?.status.state).toBe("completed");
+  });
+
+  it("stops offering delegation once the task has spent its execution budget", async () => {
+    // Two branches at the per-branch cap exceed MAX_CHUNKS_PER_TASK between them,
+    // so the third round is handed no control tools even though rounds remain.
+    const agent = mockAgent({
+      rounds: [
+        { dag: [[1, []]] },
+        { dag: [[2, []]] },
+        { dag: [[3, []]] },
+        { reply: "unreached" }
+      ],
+      chunks: { 1: MAX_CHUNKS_PER_BRANCH, 2: MAX_CHUNKS_PER_BRANCH }
+    });
+    mockFetch();
+
+    await runHandleTask(params(), stepFake().step);
+
+    expect(agent.turns.map((t) => t.allowControl)).toEqual([true, true, false]);
+    // Round 2 answered from what it had; node 3 never ran.
+    expect(agent.executed).toEqual([1, 2]);
+    expect(agent.saved?.status.state).toBe("completed");
+  });
+});
+
 describe("HandleTaskWorkflow — DAG execution", () => {
   it("runs independent branches concurrently in one wave", async () => {
     const agent = mockAgent({
-      dag: [
-        [1, []],
-        [2, []],
-        [3, []]
+      rounds: [
+        {
+          dag: [
+            [1, []],
+            [2, []],
+            [3, []]
+          ]
+        },
+        { reply: "the answer" }
       ]
     });
     mockFetch();
@@ -417,17 +559,22 @@ describe("HandleTaskWorkflow — DAG execution", () => {
     ]);
     // One wave of work, then a scan that observes `done`.
     expect(names.filter((n) => n.startsWith("scan:"))).toEqual([
-      "scan:0",
-      "scan:1"
+      "scan:0:0",
+      "scan:0:1"
     ]);
   });
 
   it("runs a dependency chain one wave at a time, in order", async () => {
     const agent = mockAgent({
-      dag: [
-        [1, []],
-        [2, [1]],
-        [3, [2]]
+      rounds: [
+        {
+          dag: [
+            [1, []],
+            [2, [1]],
+            [3, [2]]
+          ]
+        },
+        { reply: "the answer" }
       ]
     });
     mockFetch();
@@ -439,15 +586,15 @@ describe("HandleTaskWorkflow — DAG execution", () => {
     expect(agent.maxConcurrent).toBe(1);
     expect(names).toEqual([
       "working",
-      "decompose",
-      "scan:0",
+      "turn:0",
+      "scan:0:0",
       "execute:1",
-      "scan:1",
+      "scan:0:1",
       "execute:2",
-      "scan:2",
+      "scan:0:2",
       "execute:3",
-      "scan:3",
-      "compose",
+      "scan:0:3",
+      "turn:1",
       "complete",
       "notify"
     ]);
@@ -456,11 +603,16 @@ describe("HandleTaskWorkflow — DAG execution", () => {
   it("releases a fan-in node only after both prerequisites complete", async () => {
     // diamond: 1 → {2,3} → 4
     const agent = mockAgent({
-      dag: [
-        [1, []],
-        [2, [1]],
-        [3, [1]],
-        [4, [2, 3]]
+      rounds: [
+        {
+          dag: [
+            [1, []],
+            [2, [1]],
+            [3, [1]],
+            [4, [2, 3]]
+          ]
+        },
+        { reply: "the answer" }
       ]
     });
     mockFetch();
@@ -473,11 +625,16 @@ describe("HandleTaskWorkflow — DAG execution", () => {
   it("skips a failed branch's descendants while independent branches finish", async () => {
     // 1 → 2 → 3, plus an independent 4. Node 1 fails.
     const agent = mockAgent({
-      dag: [
-        [1, []],
-        [2, [1]],
-        [3, [2]],
-        [4, []]
+      rounds: [
+        {
+          dag: [
+            [1, []],
+            [2, [1]],
+            [3, [2]],
+            [4, []]
+          ]
+        },
+        { reply: "the answer" }
       ],
       outcomes: { 1: "failed" }
     });
@@ -491,16 +648,22 @@ describe("HandleTaskWorkflow — DAG execution", () => {
     expect(status(3)).toBe("skipped");
     expect(status(4)).toBe("completed");
 
-    // Composition still runs and the Task completes: partial success is a result.
-    expect(agent.composeCalls).toBe(1);
+    // The next round still runs and the Task completes: partial success is a
+    // result, and the model discloses the gap.
+    expect(agent.turns).toHaveLength(2);
     expect(agent.saved?.status.state).toBe("completed");
   });
 
-  it("fails only the branch whose step exhausted its retries, then composes", async () => {
+  it("fails only the branch whose step exhausted its retries, then answers", async () => {
     const agent = mockAgent({
-      dag: [
-        [1, []],
-        [2, []]
+      rounds: [
+        {
+          dag: [
+            [1, []],
+            [2, []]
+          ]
+        },
+        { reply: "the answer" }
       ],
       outcomes: { 1: "throw" }
     });
@@ -514,9 +677,9 @@ describe("HandleTaskWorkflow — DAG execution", () => {
     expect(agent.failed).toEqual([
       { id: 1, error: expect.stringContaining("exhausted retries") }
     ]);
-    // …and its sibling's durable work still reaches composition.
+    // …and its sibling's durable work still reaches the next round.
     expect(agent.executed).toContain(2);
-    expect(agent.composeCalls).toBe(1);
+    expect(agent.turns).toHaveLength(2);
     expect(agent.saved?.status.state).toBe("completed");
   });
 
@@ -524,9 +687,14 @@ describe("HandleTaskWorkflow — DAG execution", () => {
     // A cycle — unreachable in production (`createDecomposition` rejects it), so
     // this proves the safety net routes to failed delivery instead of spinning.
     const agent = mockAgent({
-      dag: [
-        [1, [2]],
-        [2, [1]]
+      rounds: [
+        {
+          dag: [
+            [1, [2]],
+            [2, [1]]
+          ]
+        },
+        { reply: "unreached" }
       ]
     });
     const captured = mockFetch();
@@ -535,24 +703,24 @@ describe("HandleTaskWorkflow — DAG execution", () => {
     await runHandleTask(params(), stepFake().step);
 
     expect(agent.executed).toEqual([]);
-    expect(agent.composeCalls).toBe(0);
+    expect(agent.turns).toHaveLength(1);
     expect(bodyOf(captured).status.state).toBe("failed");
     expect(errorLog).toHaveBeenCalled();
   });
 });
 
 describe("HandleTaskWorkflow — failure delivery", () => {
-  it("delivers a failed Task with user-safe text when decomposition fails", async () => {
-    const agent = mockAgent({ decomposeFails: true });
+  it("delivers a failed Task with user-safe text when a round fails", async () => {
+    const agent = mockAgent({ rounds: [{ fails: "both models unusable" }] });
     const captured = mockFetch();
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
     const { step, names } = stepFake();
 
     await runHandleTask(params(), step);
 
-    // No DAG, no composition — straight to failed delivery.
-    expect(names).toEqual(["working", "decompose", "complete", "notify"]);
-    expect(agent.composeCalls).toBe(0);
+    // No DAG, no second round — straight to failed delivery.
+    expect(names).toEqual(["working", "turn:0", "complete", "notify"]);
+    expect(agent.turns).toHaveLength(1);
 
     const body = bodyOf(captured);
     expect(body.status.state).toBe("failed");
@@ -562,27 +730,30 @@ describe("HandleTaskWorkflow — failure delivery", () => {
 
     // The diagnostic is logged, never sent to the user.
     expect(errorLog).toHaveBeenCalledWith(
-      "[handle-task] decomposition failed",
+      "[handle-task] round failed",
       expect.objectContaining({ error: "both models unusable" })
     );
     expect(JSON.stringify(body)).not.toContain("both models unusable");
   });
 
-  it("delivers a failed Task when no branch succeeded", async () => {
-    const agent = mockAgent({ outcomes: { 1: "failed" }, composeFails: true });
+  it("delivers a failed Task when a later round has nothing to answer with", async () => {
+    const agent = mockAgent({
+      rounds: [{ dag: [[1, []]] }, { fails: "no subtask succeeded" }],
+      outcomes: { 1: "failed" }
+    });
     const captured = mockFetch();
     vi.spyOn(console, "error").mockImplementation(() => {});
 
     await runHandleTask(params(), stepFake().step);
 
-    expect(agent.composeCalls).toBe(1);
+    expect(agent.turns).toHaveLength(2);
     expect(bodyOf(captured).status.state).toBe("failed");
     expect(JSON.stringify(bodyOf(captured))).not.toContain("no subtask");
   });
 });
 
 describe("HandleTaskWorkflow — cancellation", () => {
-  it("stops before decomposition when already canceled", async () => {
+  it("stops before the first round when already canceled", async () => {
     // `markWorking` would otherwise resurrect the task to `working`.
     const agent = mockAgent({ state: "canceled" });
     const captured = mockFetch();
@@ -591,17 +762,22 @@ describe("HandleTaskWorkflow — cancellation", () => {
     await runHandleTask(params(), step);
 
     expect(names).toEqual(["working"]);
-    expect(agent.decomposeCalls).toBe(0);
+    expect(agent.turns).toEqual([]);
     expect(agent.saved).toBeUndefined();
     expect(captured.calls).toBe(0);
   });
 
   it("stops scheduling and cancels pending subtasks when canceled mid-DAG", async () => {
     const agent = mockAgent({
-      dag: [
-        [1, []],
-        [2, [1]],
-        [3, [2]]
+      rounds: [
+        {
+          dag: [
+            [1, []],
+            [2, [1]],
+            [3, [2]]
+          ]
+        },
+        { reply: "unreached" }
       ],
       onExecute: (id, a) => {
         if (id === 1) a.state = "canceled";
@@ -615,8 +791,8 @@ describe("HandleTaskWorkflow — cancellation", () => {
     // Wave 0 ran; the next scan saw the cancellation and stopped.
     expect(agent.executed).toEqual([1]);
     expect(agent.canceledPending).toBe(2);
-    expect(names).toContain("cancel:1");
-    expect(agent.composeCalls).toBe(0);
+    expect(names).toContain("cancel:0:1");
+    expect(agent.turns).toHaveLength(1);
     expect(agent.saved).toBeUndefined();
     expect(captured.calls).toBe(0);
   });
@@ -632,18 +808,18 @@ describe("HandleTaskWorkflow — cancellation", () => {
 
     await runHandleTask(params(), step);
 
-    expect(agent.composeCalls).toBe(1);
+    expect(agent.turns).toHaveLength(2);
     expect(names).toContain("complete");
     expect(names).not.toContain("notify");
     expect(captured.calls).toBe(0);
   });
 
   it("sends no terminal callback when canceled during delivery", async () => {
-    // Composition produced a real reply, and only then did the caller cancel —
-    // so the workflow reaches `complete` with a Task it fully intends to send.
+    // The final round produced a real reply, and only then did the caller cancel
+    // — so the workflow reaches `complete` with a Task it fully intends to send.
     const agent = mockAgent({
-      onCompose: (a) => {
-        a.state = "canceled";
+      onTurn: (a) => {
+        if (a.turns.at(-1)?.decision === "replied") a.state = "canceled";
       }
     });
     const captured = mockFetch();
@@ -651,14 +827,14 @@ describe("HandleTaskWorkflow — cancellation", () => {
 
     await runHandleTask(params(), step);
 
-    expect(agent.composeCalls).toBe(1);
+    expect(agent.turns).toHaveLength(2);
     expect(names).toContain("complete");
     expect(names).not.toContain("notify");
     expect(agent.saved).toBeUndefined();
     expect(captured.calls).toBe(0);
   });
 
-  it("does not compose or deliver when canceled after the DAG finished", async () => {
+  it("does not start the next round or deliver when canceled after the DAG finished", async () => {
     const agent = mockAgent({
       onExecute: (_id, a) => {
         a.state = "canceled";
@@ -668,7 +844,7 @@ describe("HandleTaskWorkflow — cancellation", () => {
 
     await runHandleTask(params(), stepFake().step);
 
-    expect(agent.composeCalls).toBe(0);
+    expect(agent.turns).toHaveLength(1);
     expect(agent.saved).toBeUndefined();
     expect(captured.calls).toBe(0);
   });
@@ -677,9 +853,14 @@ describe("HandleTaskWorkflow — cancellation", () => {
 describe("HandleTaskWorkflow — replay", () => {
   it("repeats no inference, no persistence, and no delivery on a replayed run", async () => {
     const agent = mockAgent({
-      dag: [
-        [1, []],
-        [2, [1]]
+      rounds: [
+        {
+          dag: [
+            [1, []],
+            [2, [1]]
+          ]
+        },
+        { reply: "the answer" }
       ]
     });
     const captured = mockFetch();
@@ -687,8 +868,7 @@ describe("HandleTaskWorkflow — replay", () => {
 
     await runHandleTask(params(), stepFake(cache).step);
 
-    expect(agent.decomposeCalls).toBe(1);
-    expect(agent.composeCalls).toBe(1);
+    expect(agent.turns).toHaveLength(2);
     expect(agent.executed).toEqual([1, 2]);
     expect(captured.calls).toBe(1);
 
@@ -696,22 +876,21 @@ describe("HandleTaskWorkflow — replay", () => {
     const replay = stepFake(cache);
     await runHandleTask(params(), replay.step);
 
-    // Every step replayed from cache: no second decomposition, no second
-    // execution, no second composition, no duplicate callback.
-    expect(agent.decomposeCalls).toBe(1);
-    expect(agent.composeCalls).toBe(1);
+    // Every step replayed from cache: no second inference, no second execution,
+    // no duplicate callback.
+    expect(agent.turns).toHaveLength(2);
     expect(agent.executed).toEqual([1, 2]);
     expect(captured.calls).toBe(1);
     // …and the replayed run still walked the identical step sequence.
     expect(replay.names).toEqual([
       "working",
-      "decompose",
-      "scan:0",
+      "turn:0",
+      "scan:0:0",
       "execute:1",
-      "scan:1",
+      "scan:0:1",
       "execute:2",
-      "scan:2",
-      "compose",
+      "scan:0:2",
+      "turn:1",
       "complete",
       "notify"
     ]);

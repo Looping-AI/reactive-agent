@@ -15,18 +15,19 @@ import { createModelPair, embedTexts, type ModelPair } from "@/agent/model";
 import { callerContext, soulPrompt } from "@/agent/prompt";
 import { buildTools } from "@/agent/tools";
 import { archiveMessages } from "@/agent/recall";
-import { runDecompose } from "@/agent/decompose";
-import { runCompose } from "@/agent/compose";
-import { decomposeReplyMessageId, sessionText } from "@/agent/history";
+import { runTurn } from "@/agent/turn";
+import {
+  finalReplyMessageId,
+  roundAckMessageId,
+  sessionText
+} from "@/agent/history";
 import { buildAgentSession, type SessionLike } from "@/agent/session";
 import {
   resolveRecipeForType,
   validateRecipe
 } from "@/agent/subtasks/registry";
 import type {
-  ComposeTaskResult,
   CompositionBranch,
-  DecomposeTaskResult,
   DependencyResult,
   RecipeChunkResult,
   RecipeExecutionRequest,
@@ -37,7 +38,8 @@ import type {
   SubtaskId,
   SubtaskNode,
   SubtaskScan,
-  SubtaskStatus
+  SubtaskStatus,
+  TurnTaskResult
 } from "@/agent/subtasks/types";
 import { FINGERPRINT_MISMATCH, RecipeSubagent, subagentName } from "@/subagent";
 import {
@@ -67,10 +69,10 @@ export interface TurnPushContext {
 }
 
 /**
- * Stand-in acknowledgement for the unreachable case where a Task's Subtasks are
- * durable but its decomposition reply is not in the Session (the reply is always
- * appended first). Neutral by design: the work is valid and running, so the user
- * gets an honest acknowledgement rather than a failed Task.
+ * Stand-in acknowledgement for the unreachable case where a round's Subtasks are
+ * durable but its acknowledgment is not in the Session (the ack is always appended
+ * first). Neutral by design: the work is valid and running, so the user gets an
+ * honest acknowledgement rather than a failed Task.
  */
 const RECOVERED_REPLY = "Working on your request.";
 
@@ -82,10 +84,10 @@ const RECOVERED_REPLY = "Working on your request.";
  * single conversation.
  *
  * The {@link file://../workflows/handle-task.ts HandleTaskWorkflow} drives the
- * five task phases here through native Cloudflare RPC (`decomposeTask`,
- * `executeSubtask`, `composeTask`, …) — not HTTP: the DO is a private
- * implementation detail of the Worker, never exposed over the network, so it
- * needs no internal A2A/JSON-RPC layer of its own.
+ * task round loop here through native Cloudflare RPC (`runTaskTurn`,
+ * `skipBlockedSubtasks`, `executeSubtaskChunk`, …) — not HTTP: the DO is a
+ * private implementation detail of the Worker, never exposed over the network, so
+ * it needs no internal A2A/JSON-RPC layer of its own.
  *
  * History is compacted automatically once it grows past {@link COMPACT_AFTER_TOKENS}
  * (the Sessions `compactAfter` mechanism). (Phase 5 will also serve a self-generated
@@ -165,30 +167,39 @@ export class ReactiveAgent extends Agent<Env> {
   }
 
   /**
-   * The main agent's gated tool set for this caller. The `recall` tool is gated on
-   * "has compacted at least once" — nothing is archived (and the tool would only
-   * return empties) before the first compaction.
+   * The main agent's **work tools** for this caller — the `execute`-bearing tools
+   * every round runs its loop over (see {@link file://../agent/turn.ts}). The
+   * control tools that *end* a round are not here; `runTurn` adds those.
+   *
+   * The Session's own `set_context`/`load_context` come first, with the agent's
+   * gated tools layered over them: the soul instructs the model to record durable
+   * facts with `set_context`, so it has to actually be on the call. `recall` is
+   * gated on "has compacted at least once" — nothing is archived (and the tool
+   * would only return empties) before the first compaction.
    */
   private async mainAgentTools(
     session: SessionLike,
     identity: GatewayIdentity
   ): Promise<ToolSet> {
     const hasArchive = (await session.getCompactions()).length > 0;
-    return buildTools(
-      {
-        index: this.env.VECTORIZE,
-        namespace: recallNamespace(identity),
-        embed: embedTexts,
-        hasArchive
-      },
-      this.env.BROWSER
-    );
+    return {
+      ...(await session.tools()),
+      ...buildTools(
+        {
+          index: this.env.VECTORIZE,
+          namespace: recallNamespace(identity),
+          embed: embedTexts,
+          hasArchive
+        },
+        this.env.BROWSER
+      )
+    };
   }
 
   /**
    * POST one `working` Task snapshot to the gateway callback, keyed by a stable
-   * semantic `key` (`step:<n>` for tool-loop content, `decompose` for the Phase 1
-   * reply — see {@link buildWorkingTask}). Best-effort: every failure is logged
+   * semantic `key` (`r<round>:step:<n>` for tool-loop content, `ack:<round>` for a
+   * delegating round's acknowledgment — see {@link buildWorkingTask}). Best-effort: every failure is logged
    * and swallowed, so a progress post never aborts generation or fails a phase.
    *
    * The JWT is signed per call (5m TTL). {@link streamWorking} caches one across a
@@ -231,14 +242,15 @@ export class ReactiveAgent extends Agent<Env> {
   }
 
   /**
-   * Build the intermediate-content sink for a turn: sign the callback JWT once
+   * Build the intermediate-content sink for one round: sign the callback JWT once
    * (lazily, reused across every progress message; 5m TTL), then POST each content
-   * message as a `working` Task snapshot via {@link postWorking}. `messageId` is
-   * `${taskId}:step:${stepIndex}` so a re-run dedupes on the gateway and cannot
-   * collide with milestone keys (`decompose`, `final`).
+   * message as a `working` Task snapshot via {@link postWorking}. The key is
+   * `r<round>:step:<stepIndex>` so a re-run dedupes on the gateway — and so two
+   * rounds of the same Task cannot collide, which a bare step index would.
    */
   private streamWorking(
-    push: TurnPushContext
+    push: TurnPushContext,
+    round: number
   ): (text: string, stepIndex: number) => Promise<void> {
     let jwt: string | undefined;
     return async (text: string, stepIndex: number) => {
@@ -257,123 +269,170 @@ export class ReactiveAgent extends Agent<Env> {
         });
         return;
       }
-      await this.postWorking(push, text, `step:${stepIndex}`, jwt);
+      await this.postWorking(push, text, `r${round}:step:${stepIndex}`, jwt);
     };
   }
 
-  // --- Phased task pipeline (decompose → execute → compose) ----------------
+  // --- The task round loop (turn → execute → turn → …) ---------------------
   //
-  // The parent-owned half of the five-phase Task flow. The Workflow drives these
-  // over DO RPC (it cannot touch this SQLite or this Session directly); each is a
-  // durable step, so every method here is safe to call again after a crash —
-  // decomposition is idempotent on the Task, execution recovers from either the
-  // parent row or the child's cached result, and composition recovers from the
-  // Session.
+  // The parent-owned half of the Task flow. The Workflow drives these over DO RPC
+  // (it cannot touch this SQLite or this Session directly); each is a durable
+  // step, so every method here is safe to call again after a crash — a round is
+  // idempotent on its durable output, and execution recovers from either the
+  // parent row or the child's cached result.
 
   /**
-   * Phase 1: decompose one accepted Task into a durable 1..8-node Subtask DAG and
-   * return the first user-visible reply.
+   * One main-agent round: answer the user, or delegate a durable 1..8-node
+   * Subtask DAG and return the acknowledgment the user sees while it runs.
    *
-   * Idempotent: a re-run finds the persisted Subtasks and recovers the original
-   * reply from the Session, with no inference and no duplicate rows. When `push`
-   * is supplied the reply is also emitted as a `working` callback keyed
-   * `decompose` — deterministic, so a re-post dedupes at the gateway.
+   * Idempotent, and the recovery order is the contract:
+   *
+   * 1. A canceled Task stops here.
+   * 2. A durable **final reply** means some round already answered — return it
+   *    without inference. Re-answering could produce different words for a reply
+   *    the user may already have received.
+   * 3. Durable **rows for this round** mean this round already delegated —
+   *    recover its acknowledgment from the Session, with no inference and no
+   *    duplicate rows.
+   * 4. Otherwise, infer.
+   *
+   * When `push` is supplied a delegating round's acknowledgment is emitted as a
+   * `working` callback keyed `ack:<round>` — deterministic, so a re-post dedupes
+   * at the gateway.
    *
    * Cancellation is re-read **after** inference too, not just before it: the model
-   * call is the widest window in the phase, and neither the Subtask rows nor the
-   * `decompose` callback may land for a Task the caller already gave up on. The
-   * reply is already in the Session by then (`runDecompose` appends it under a
-   * deterministic id before returning) — that is durable history, not output the
-   * user sees.
+   * call is the widest window in the round, and neither the Subtask rows nor the
+   * callback may land for a Task the caller already gave up on. The reply is
+   * already in the Session by then (`runTurn` appends under deterministic ids
+   * before returning) — that is durable history, not output the user sees.
    *
-   * Returns a typed `failed` result when both models produce unusable output (the
-   * Workflow routes it to failed delivery); throws only on a transient fault, for
-   * the step to retry.
+   * Returns a typed `failed` result when both models produce unusable output and
+   * no durable work exists to fall back on (the Workflow routes it to failed
+   * delivery); throws only on a transient fault, for the step to retry.
    */
-  async decomposeTask(input: {
+  async runTaskTurn(input: {
     taskId: string;
     text: string;
     identity: GatewayIdentity;
+    round: number;
+    allowControl: boolean;
     push?: TurnPushContext;
-  }): Promise<DecomposeTaskResult> {
-    const { taskId, text, identity, push } = input;
+  }): Promise<TurnTaskResult> {
+    const { taskId, text, identity, round, allowControl, push } = input;
     const session = this.getSession(identity);
 
     if (await this.isTaskCanceled(taskId)) return { status: "canceled" };
 
-    // Recovery: the decomposition is already durable. Never re-infer — the reply
-    // may already be in front of the user.
-    const existing = this.db.subtasks.list(taskId);
-    if (existing.length > 0) {
-      const stored = await session.getMessage(decomposeReplyMessageId(taskId));
-      const reply = stored ? sessionText(stored) : RECOVERED_REPLY;
-      if (!stored) {
-        // Unreachable: the reply is appended before the rows are persisted. Warn
-        // and deliver a neutral acknowledgement rather than poisoning a Task
-        // whose subtasks are valid and ready to run.
-        console.warn(
-          "[reactive-agent] decomposition reply missing on recovery",
-          {
-            taskId
-          }
-        );
-      }
-      if (push) await this.postWorking(push, reply, "decompose");
-      return { status: "completed", reply, subtasks: existing };
+    const answered = await session.getMessage(finalReplyMessageId(taskId));
+    if (answered) {
+      return { status: "replied", reply: sessionText(answered) };
     }
 
-    const outcome = await runDecompose({
+    const existing = this.db.subtasks.listRound(taskId, round);
+    if (existing.length > 0) {
+      const stored = await session.getMessage(roundAckMessageId(taskId, round));
+      const reply = stored ? sessionText(stored) : RECOVERED_REPLY;
+      if (!stored) {
+        // Unreachable: the ack is appended before the rows are persisted. Warn
+        // and deliver a neutral acknowledgement rather than poisoning a Task
+        // whose subtasks are valid and ready to run.
+        console.warn("[reactive-agent] round ack missing on recovery", {
+          taskId,
+          round
+        });
+      }
+      if (push) await this.postWorking(push, reply, `ack:${round}`);
+      return { status: "delegated", reply, subtasks: existing };
+    }
+
+    const outcome = await runTurn({
       session,
       taskId,
+      round,
       text,
+      allowControl,
       systemSuffix: callerContext(identity),
       tools: await this.mainAgentTools(session, identity),
       models: this.modelPair(),
-      onContent: push ? this.streamWorking(push) : undefined
+      branches: this.compositionBranches(taskId),
+      onContent: push ? this.streamWorking(push, round) : undefined
     });
     if (outcome.status === "failed") return outcome;
 
     // Cancelled while the model worked: persist nothing and publish nothing.
     if (await this.isTaskCanceled(taskId)) return { status: "canceled" };
 
-    // The reply is durable in the Session before the rows exist. A crash in this
-    // window re-runs decomposition and persists the *retry's* drafts under the
-    // *first* attempt's reply — both are valid outputs of the same input, and no
+    if (outcome.status === "replied") {
+      return { status: "replied", reply: outcome.reply };
+    }
+
+    // The ack is durable in the Session before the rows exist. A crash in this
+    // window re-runs the round and persists the *retry's* drafts under the
+    // *first* attempt's ack — both are valid outputs of the same input, and no
     // invariant breaks. The reverse order could strand persisted subtasks with no
-    // recoverable reply.
+    // recoverable acknowledgment.
     const subtasks = this.db.subtasks.createDecomposition(
       taskId,
+      round,
       outcome.drafts
     );
-    if (push) await this.postWorking(push, outcome.reply, "decompose");
-    return { status: "completed", reply: outcome.reply, subtasks };
+    if (push) await this.postWorking(push, outcome.reply, `ack:${round}`);
+    return { status: "delegated", reply: outcome.reply, subtasks };
   }
 
-  /** A Task's Subtasks in stable ordinal order (the scheduler's view of the DAG). */
+  /**
+   * Every round's branches for a Task, in stable ordinal order — what a round
+   * needs to reunite each earlier `delegate` call with its result (see
+   * {@link file://../agent/turn.ts renderTurnMessages}). Built inside the DO and
+   * consumed here, so the 1 MiB Workflow-step cap that keeps {@link SubtaskNode}
+   * narrow does not apply.
+   */
+  private compositionBranches(taskId: string): CompositionBranch[] {
+    return this.db.subtasks.list(taskId).map((s) => ({
+      subtaskId: s.id,
+      round: s.round,
+      ordinal: s.ordinal,
+      type: s.type,
+      prompt: s.prompt,
+      dependsOn: s.dependsOn,
+      status: s.status,
+      resultParts: s.resultParts,
+      error: s.error
+    }));
+  }
+
+  /** A Task's Subtasks, every round, in stable ordinal order. */
   async listSubtasks(taskId: string): Promise<Subtask[]> {
     return this.db.subtasks.list(taskId);
   }
 
   /**
-   * The Workflow's per-wave scan: report a cancellation, or skip every pending
-   * Subtask blocked by a dependency that did not succeed and return the refreshed
-   * DAG as scheduler {@link SubtaskNode}s.
+   * The Workflow's per-wave scan for **one round's** DAG: report a cancellation,
+   * or skip every pending Subtask blocked by a dependency that did not succeed and
+   * return the refreshed DAG as scheduler {@link SubtaskNode}s.
+   *
+   * Scoped to the round because dependency edges never cross one: an earlier
+   * round's rows are already terminal and irrelevant to this wave, and including
+   * them would only widen a projection that has a size cap.
    *
    * Skipping runs to a fixpoint because it propagates: a node skipped for a
    * failed prerequisite blocks *its* dependents in turn. Bounded by the 8-Subtask
-   * maximum. Independent branches are untouched — one branch's failure never
-   * stops work that does not depend on it.
+   * per-round maximum. Independent branches are untouched — one branch's failure
+   * never stops work that does not depend on it.
    *
    * The cancellation verdict rides along rather than being probed separately, so
    * a wave costs one round trip and cannot act on a stale answer. Returns the
    * **projection**, not the rows: this return crosses a `step.do` boundary capped
    * at 1 MiB (see {@link SubtaskNode}). Use {@link listSubtasks} for full rows.
    */
-  async skipBlockedSubtasks(taskId: string): Promise<SubtaskScan> {
+  async skipBlockedSubtasks(
+    taskId: string,
+    round: number
+  ): Promise<SubtaskScan> {
     if (await this.isTaskCanceled(taskId)) return { canceled: true };
     const blocked = new Set<SubtaskStatus>(["failed", "skipped", "canceled"]);
     for (;;) {
-      const current = this.db.subtasks.list(taskId);
+      const current = this.db.subtasks.listRound(taskId, round);
       const byId = new Map(current.map((s) => [s.id, s]));
       const next = current.filter(
         (s) =>
@@ -715,51 +774,6 @@ export class ReactiveAgent extends Agent<Env> {
   /** Whether the parent Task has been canceled (checked before and after work). */
   private async isTaskCanceled(taskId: string): Promise<boolean> {
     return this.db.tasks.get(taskId)?.status.state === "canceled";
-  }
-
-  /**
-   * Phase 3: compose the executed DAG's outcomes into the terminal reply and
-   * persist it to the Session.
-   *
-   * Skips inference where it adds nothing: a single-Subtask Task returns its
-   * result directly, and a Task with no successful branch fails without composing.
-   * Idempotent — a re-run returns the durable reply from the Session.
-   *
-   * Cancellation is read on both sides of the model call, so neither a cancelled
-   * Task's composition nor its delivery proceeds. As in Phase 1, the reply may
-   * already be in the Session when the late check fires — durable history, never
-   * published.
-   */
-  async composeTask(input: {
-    taskId: string;
-    identity: GatewayIdentity;
-  }): Promise<ComposeTaskResult> {
-    const { taskId, identity } = input;
-    if (await this.isTaskCanceled(taskId)) return { status: "canceled" };
-    const branches: CompositionBranch[] = this.db.subtasks
-      .list(taskId)
-      .map((s) => ({
-        subtaskId: s.id,
-        ordinal: s.ordinal,
-        type: s.type,
-        prompt: s.prompt,
-        dependsOn: s.dependsOn,
-        status: s.status,
-        resultParts: s.resultParts,
-        error: s.error
-      }));
-    if (branches.length === 0) {
-      return { status: "failed", error: `task ${taskId} has no subtasks` };
-    }
-    const composed = await runCompose({
-      session: this.getSession(identity),
-      taskId,
-      systemSuffix: callerContext(identity),
-      models: this.modelPair(),
-      branches
-    });
-    if (await this.isTaskCanceled(taskId)) return { status: "canceled" };
-    return composed;
   }
 
   // --- Async task state (accept + notify) ---------------------------------

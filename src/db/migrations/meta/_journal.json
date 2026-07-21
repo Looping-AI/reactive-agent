@@ -15,6 +15,13 @@
       "when": 1784128150521,
       "tag": "0001_great_goliath",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1784631097834,
+      "tag": "0002_add_subtask_round",
+      "breakpoints": true
     }
   ]
 }

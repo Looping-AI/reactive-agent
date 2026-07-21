@@ -12,6 +12,7 @@ import { drizzle } from "drizzle-orm/durable-sqlite";
 import { AgentDB, type DB } from "@/db/db";
 import * as schema from "@/db/schema";
 import { makeSubtasks } from "@/db/models/subtasks";
+import dbMigrations from "@/db/migrations";
 import type { SubtaskDraft } from "@/agent/subtasks/types";
 import { freshStub, doStorage, withSubtasks } from "../helpers/do";
 
@@ -32,7 +33,7 @@ const draft = (
 describe("subtasks.createDecomposition", () => {
   it("persists drafts in order with ascending ids and pending status", async () => {
     const rows = await withSubtasks("decomp-order", (s) =>
-      s.createDecomposition("t-1", [
+      s.createDecomposition("t-1", 0, [
         draft({ localKey: "a" }),
         draft({ localKey: "b" }),
         draft({ localKey: "c" })
@@ -51,7 +52,7 @@ describe("subtasks.createDecomposition", () => {
 
   it("resolves draft-local dependency keys to real SubtaskIds", async () => {
     const rows = await withSubtasks("decomp-deps", (s) =>
-      s.createDecomposition("t-1", [
+      s.createDecomposition("t-1", 0, [
         draft({ localKey: "a" }),
         draft({ localKey: "b", dependsOn: ["a"] }),
         draft({ localKey: "c", dependsOn: ["a", "b"] })
@@ -65,7 +66,7 @@ describe("subtasks.createDecomposition", () => {
 
   it("snapshots reference role+text verbatim onto the row", async () => {
     const [row] = await withSubtasks("decomp-refs", (s) =>
-      s.createDecomposition("t-1", [
+      s.createDecomposition("t-1", 0, [
         draft({
           localKey: "a",
           references: [
@@ -82,10 +83,10 @@ describe("subtasks.createDecomposition", () => {
     ]);
   });
 
-  it("is idempotent on taskId — a retry returns the original rows unchanged", async () => {
+  it("is idempotent on (taskId, round) — a retry returns the original rows unchanged", async () => {
     const { first, retry } = await withSubtasks("decomp-idempotent", (s) => {
-      const first = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
-      const retry = s.createDecomposition("t-1", [
+      const first = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
+      const retry = s.createDecomposition("t-1", 0, [
         draft({ localKey: "x" }),
         draft({ localKey: "y" })
       ]);
@@ -97,9 +98,55 @@ describe("subtasks.createDecomposition", () => {
     expect(retry[0].prompt).toBe("do a");
   });
 
+  it("takes a later round's decomposition despite the first round's rows", async () => {
+    // The idempotency guard is per round, or a second delegation could never
+    // persist anything.
+    const { first, second } = await withSubtasks("decomp-rounds", (s) => {
+      const first = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
+      const second = s.createDecomposition("t-1", 1, [
+        draft({ localKey: "b" }),
+        draft({ localKey: "c" })
+      ]);
+      return { first, second };
+    });
+
+    expect(first.map((r) => r.round)).toEqual([0]);
+    expect(second.map((r) => r.round)).toEqual([1, 1]);
+    expect(second.map((r) => r.prompt)).toEqual(["do b", "do c"]);
+  });
+
+  it("continues ordinals across rounds so the task keeps one stable order", async () => {
+    // `ordinal` is the Task-wide position — and the column the unique index is
+    // built on, so restarting at 0 each round would collide.
+    const rows = await withSubtasks("decomp-ordinals", (s) => {
+      s.createDecomposition("t-1", 0, [
+        draft({ localKey: "a" }),
+        draft({ localKey: "b" })
+      ]);
+      s.createDecomposition("t-1", 1, [draft({ localKey: "c" })]);
+      return s.list("t-1");
+    });
+
+    expect(rows.map((r) => r.ordinal)).toEqual([0, 1, 2]);
+    expect(rows.map((r) => r.round)).toEqual([0, 0, 1]);
+  });
+
+  it("keeps a later round's dependency edges inside its own round", async () => {
+    const rows = await withSubtasks("decomp-round-deps", (s) => {
+      s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
+      return s.createDecomposition("t-1", 1, [
+        draft({ localKey: "b" }),
+        draft({ localKey: "c", dependsOn: ["b"] })
+      ]);
+    });
+
+    const [b, c] = rows;
+    expect(c.dependsOn).toEqual([b.id]);
+  });
+
   it("rejects an empty decomposition", async () => {
     await expect(
-      withSubtasks("decomp-empty", (s) => s.createDecomposition("t-1", []))
+      withSubtasks("decomp-empty", (s) => s.createDecomposition("t-1", 0, []))
     ).rejects.toThrow(/1\.\.8/);
   });
 
@@ -109,7 +156,7 @@ describe("subtasks.createDecomposition", () => {
     );
     await expect(
       withSubtasks("decomp-toomany", (s) =>
-        s.createDecomposition("t-1", drafts)
+        s.createDecomposition("t-1", 0, drafts)
       )
     ).rejects.toThrow(/1\.\.8/);
   });
@@ -117,7 +164,7 @@ describe("subtasks.createDecomposition", () => {
   it("rejects duplicate local keys", async () => {
     await expect(
       withSubtasks("decomp-dupkey", (s) =>
-        s.createDecomposition("t-1", [
+        s.createDecomposition("t-1", 0, [
           draft({ localKey: "a" }),
           draft({ localKey: "a" })
         ])
@@ -128,7 +175,7 @@ describe("subtasks.createDecomposition", () => {
   it("rejects a dependency on an unknown key", async () => {
     await expect(
       withSubtasks("decomp-unknowndep", (s) =>
-        s.createDecomposition("t-1", [
+        s.createDecomposition("t-1", 0, [
           draft({ localKey: "a", dependsOn: ["z"] })
         ])
       )
@@ -138,7 +185,7 @@ describe("subtasks.createDecomposition", () => {
   it("rejects a self-dependency", async () => {
     await expect(
       withSubtasks("decomp-selfdep", (s) =>
-        s.createDecomposition("t-1", [
+        s.createDecomposition("t-1", 0, [
           draft({ localKey: "a", dependsOn: ["a"] })
         ])
       )
@@ -152,14 +199,28 @@ describe("subtasks.createDecomposition", () => {
         const insert = () =>
           void instance.sql`
             INSERT INTO subtasks
-              (task_id, ordinal, type, prompt, references_json,
+              (task_id, round, ordinal, type, prompt, references_json,
                depends_on_json, status, created_at, updated_at)
-            VALUES ('t-1', 0, 'general', 'p', '[]', '[]', 'pending', 1, 1)
+            VALUES ('t-1', 0, 0, 'general', 'p', '[]', '[]', 'pending', 1, 1)
           `;
         insert();
         insert();
       })
     ).rejects.toThrow(/UNIQUE constraint/);
+  });
+
+  it("requires round at the schema level (no default to fall back on)", async () => {
+    await expect(
+      runInDurableObject(freshStub("decomp-round-required"), (instance) => {
+        void new AgentDB(doStorage(instance));
+        void instance.sql`
+          INSERT INTO subtasks
+            (task_id, ordinal, type, prompt, references_json,
+             depends_on_json, status, created_at, updated_at)
+          VALUES ('t-1', 0, 'general', 'p', '[]', '[]', 'pending', 1, 1)
+        `;
+      })
+    ).rejects.toThrow(/NOT NULL constraint failed: subtasks.round/);
   });
 
   it("rolls back the whole create when a statement fails mid-create", async () => {
@@ -188,13 +249,13 @@ describe("subtasks.createDecomposition", () => {
         ];
         let thrown = "";
         try {
-          makeSubtasks(failing).createDecomposition("t-1", drafts);
+          makeSubtasks(failing).createDecomposition("t-1", 0, drafts);
         } catch (e) {
           thrown = e instanceof Error ? e.message : String(e);
         }
         const afterFailure = subtasks.list("t-1");
         // A retry against the healthy handle starts from a clean slate.
-        const retried = subtasks.createDecomposition("t-1", drafts);
+        const retried = subtasks.createDecomposition("t-1", 0, drafts);
         return { thrown, afterFailure, retried };
       }
     );
@@ -210,6 +271,37 @@ describe("subtasks.createDecomposition", () => {
 // get / list
 // ---------------------------------------------------------------------------
 
+describe("subtasks migrations", () => {
+  /** Apply one bundled migration's statements to a raw DO SQLite handle. */
+  function apply(sql: SqlStorage, key: "m0001" | "m0002") {
+    const migration = dbMigrations.migrations?.[key];
+    if (!migration) throw new Error(`missing migration ${key}`);
+    for (const statement of migration.split("--> statement-breakpoint")) {
+      sql.exec(statement);
+    }
+  }
+
+  it("backfills rows written before the round column existed", async () => {
+    // Every DO instance self-migrates on wake-up, so a caller with in-flight
+    // Subtasks from the previous deploy must read back as round 0 — not null,
+    // which every round-scoped query would then miss.
+    await runInDurableObject(freshStub("migrate-round"), (instance) => {
+      const sql = doStorage(instance).sql;
+      apply(sql, "m0001");
+      sql.exec(
+        `INSERT INTO subtasks (task_id, ordinal, type, prompt, references_json,
+           depends_on_json, status, created_at, updated_at)
+         VALUES ('t-1', 0, 'general', 'do a', '[]', '[]', 'pending', 1, 1)`
+      );
+
+      apply(sql, "m0002");
+
+      const rows = [...sql.exec("SELECT round FROM subtasks").raw()];
+      expect(rows).toEqual([[0]]);
+    });
+  });
+});
+
 describe("subtasks.get / list", () => {
   it("get returns null for an unknown id", async () => {
     const row = await withSubtasks("get-missing", (s) => s.get(999));
@@ -218,15 +310,33 @@ describe("subtasks.get / list", () => {
 
   it("list is scoped to a task and ordered by ordinal", async () => {
     const rows = await withSubtasks("list-scope", (s) => {
-      s.createDecomposition("t-1", [
+      s.createDecomposition("t-1", 0, [
         draft({ localKey: "a" }),
         draft({ localKey: "b" })
       ]);
-      s.createDecomposition("t-2", [draft({ localKey: "c" })]);
+      s.createDecomposition("t-2", 0, [draft({ localKey: "c" })]);
       return s.list("t-1");
     });
 
     expect(rows.map((r) => r.prompt)).toEqual(["do a", "do b"]);
+  });
+
+  it("listRound sees one round's DAG, list sees every round", async () => {
+    const { round0, round1, all } = await withSubtasks("list-round", (s) => {
+      s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
+      s.createDecomposition("t-1", 1, [draft({ localKey: "b" })]);
+      return {
+        round0: s.listRound("t-1", 0),
+        round1: s.listRound("t-1", 1),
+        all: s.list("t-1")
+      };
+    });
+
+    // The scheduler drives one round at a time; a sibling round's rows would
+    // only widen a projection that has a size cap.
+    expect(round0.map((r) => r.prompt)).toEqual(["do a"]);
+    expect(round1.map((r) => r.prompt)).toEqual(["do b"]);
+    expect(all.map((r) => r.prompt)).toEqual(["do a", "do b"]);
   });
 });
 
@@ -237,7 +347,7 @@ describe("subtasks.get / list", () => {
 describe("subtasks transitions", () => {
   it("start moves pending -> running and records recipe id/version", async () => {
     const row = await withSubtasks("start", (s) => {
-      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      const [a] = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
       const ok = s.start(a.id, { recipeId: "default", recipeVersion: 1 });
       expect(ok).toBe(true);
       return s.get(a.id);
@@ -250,7 +360,7 @@ describe("subtasks transitions", () => {
 
   it("start is a no-op on a non-pending subtask", async () => {
     const ok = await withSubtasks("start-guard", (s) => {
-      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      const [a] = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
       s.start(a.id, { recipeId: "default", recipeVersion: 1 });
       return s.start(a.id, { recipeId: "default", recipeVersion: 1 });
     });
@@ -259,7 +369,7 @@ describe("subtasks transitions", () => {
 
   it("complete persists result parts and completedAt from running", async () => {
     const row = await withSubtasks("complete", (s) => {
-      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      const [a] = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
       s.start(a.id, { recipeId: "default", recipeVersion: 1 });
       const ok = s.complete(a.id, [{ kind: "text", text: "the answer" }]);
       expect(ok).toBe(true);
@@ -273,7 +383,7 @@ describe("subtasks transitions", () => {
 
   it("complete is a no-op when not running (cannot skip pending -> completed)", async () => {
     const ok = await withSubtasks("complete-guard", (s) => {
-      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      const [a] = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
       return s.complete(a.id, [{ kind: "text", text: "x" }]);
     });
     expect(ok).toBe(false);
@@ -282,7 +392,7 @@ describe("subtasks transitions", () => {
   it("complete rejects a result with no non-empty text part", async () => {
     await expect(
       withSubtasks("complete-empty", (s) => {
-        const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+        const [a] = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
         s.start(a.id, { recipeId: "default", recipeVersion: 1 });
         return s.complete(a.id, [{ kind: "text", text: "   " }]);
       })
@@ -291,7 +401,7 @@ describe("subtasks transitions", () => {
 
   it("skip moves pending -> skipped", async () => {
     const row = await withSubtasks("skip", (s) => {
-      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      const [a] = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
       const ok = s.skip(a.id);
       expect(ok).toBe(true);
       return s.get(a.id);
@@ -301,7 +411,7 @@ describe("subtasks transitions", () => {
 
   it("cancelPending cancels only pending subtasks and leaves running ones", async () => {
     const { canceled, states } = await withSubtasks("cancel", (s) => {
-      const rows = s.createDecomposition("t-1", [
+      const rows = s.createDecomposition("t-1", 0, [
         draft({ localKey: "a" }),
         draft({ localKey: "b" }),
         draft({ localKey: "c" })
@@ -319,7 +429,7 @@ describe("subtasks transitions", () => {
 
   it("cancelRunning transitions a running subtask whose late result was discarded", async () => {
     const { applied, row } = await withSubtasks("cancel-running", (s) => {
-      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      const [a] = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
       s.start(a.id, { recipeId: "default", recipeVersion: 1 });
       const applied = s.cancelRunning(a.id);
       return { applied, row: s.get(a.id) };
@@ -334,7 +444,7 @@ describe("subtasks transitions", () => {
     const { applied, status } = await withSubtasks(
       "cancel-running-pending",
       (s) => {
-        const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+        const [a] = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
         const applied = s.cancelRunning(a.id);
         return { applied, status: s.get(a.id)?.status };
       }
@@ -348,7 +458,7 @@ describe("subtasks transitions", () => {
     const { applied, status } = await withSubtasks(
       "cancel-running-done",
       (s) => {
-        const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+        const [a] = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
         s.start(a.id, { recipeId: "default", recipeVersion: 1 });
         s.complete(a.id, [{ kind: "text", text: "done" }]);
         const applied = s.cancelRunning(a.id);
@@ -362,7 +472,7 @@ describe("subtasks transitions", () => {
 
   it("fail persists the error from running", async () => {
     const { applied, row } = await withSubtasks("fail-running", (s) => {
-      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      const [a] = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
       s.start(a.id, { recipeId: "default", recipeVersion: 1 });
       const applied = s.fail(a.id, "retries exhausted");
       return { applied, row: s.get(a.id) };
@@ -376,7 +486,7 @@ describe("subtasks transitions", () => {
 
   it("fail lands on a subtask that threw before it was ever claimed", async () => {
     const { applied, row } = await withSubtasks("fail-pending", (s) => {
-      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      const [a] = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
       const applied = s.fail(a.id, "never started");
       return { applied, row: s.get(a.id) };
     });
@@ -388,7 +498,7 @@ describe("subtasks transitions", () => {
 
   it("fail cannot overwrite a terminal result", async () => {
     const { applied, row } = await withSubtasks("fail-done", (s) => {
-      const [a] = s.createDecomposition("t-1", [draft({ localKey: "a" })]);
+      const [a] = s.createDecomposition("t-1", 0, [draft({ localKey: "a" })]);
       s.start(a.id, { recipeId: "default", recipeVersion: 1 });
       s.complete(a.id, [{ kind: "text", text: "done" }]);
       const applied = s.fail(a.id, "too late");
@@ -413,10 +523,10 @@ describe("subtasks.cleanup", () => {
       freshStub("subtasks-cleanup"),
       (instance) => {
         const { subtasks } = new AgentDB(doStorage(instance));
-        const old = subtasks.createDecomposition("t-old", [
+        const old = subtasks.createDecomposition("t-old", 0, [
           draft({ localKey: "a" })
         ]);
-        subtasks.createDecomposition("t-new", [draft({ localKey: "b" })]);
+        subtasks.createDecomposition("t-new", 0, [draft({ localKey: "b" })]);
         void instance.sql`
           UPDATE subtasks SET created_at = ${thirtyOneDaysAgo} WHERE task_id = 't-old'
         `;

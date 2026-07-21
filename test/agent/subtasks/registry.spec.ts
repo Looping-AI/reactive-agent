@@ -17,6 +17,7 @@ import {
   CHAT_MODEL_ID,
   CHAT_FALLBACK_MODEL_ID,
   DEFAULT_MAX_TURNS,
+  MAX_CHUNKS_PER_BRANCH,
   MAX_STEPS
 } from "@/config";
 
@@ -59,6 +60,17 @@ describe("resolveRecipeForType", () => {
     expect(recipe.limits.maxTurns).toBeGreaterThan(recipe.limits.turnsPerChunk);
     expect(recipe.reportMetrics).toBe(true);
     expect(recipe.toolFamilies).toEqual(["workspace", "arc-game"]);
+  });
+
+  it("keeps the longest recipe inside the Workflow's per-branch chunk cap", () => {
+    // `MAX_CHUNKS_PER_BRANCH` is what stops a branch approaching the Workflows
+    // per-instance step ceiling, and the Workflow *fails* a branch that hits it.
+    // So a recipe's nominal chunk count must stay well under the cap — with room
+    // for the progress events that end a chunk early. Raising `maxTurns` without
+    // raising the cap would silently start killing long games mid-run.
+    const { maxTurns, turnsPerChunk } = resolveRecipeForType("arc-game").limits;
+    const nominalChunks = Math.ceil(maxTurns / turnsPerChunk);
+    expect(nominalChunks).toBeLessThanOrEqual(MAX_CHUNKS_PER_BRANCH / 2);
   });
 });
 
