@@ -15,6 +15,7 @@ import {
 import {
   deterministicSessionMessage,
   finalReplyMessageId,
+  parseRoundAckMessageId,
   roundAckMessageId,
   sessionText,
   taskUserMessageId
@@ -251,7 +252,8 @@ function delegationPair(
  *
  * Acks are deliberately **not** catalog-eligible: they are the agent's own
  * scaffolding, and a subtask referencing "I'm on it" as verbatim conversation
- * evidence would be noise.
+ * evidence would be noise. That holds for every ack in the Session, not only the
+ * ones this render can pair with branches — see {@link parseRoundAckMessageId}.
  *
  * Everything here is ephemeral — scaffolding for this call only. Reference text is
  * snapshotted from the catalog (see
@@ -283,6 +285,21 @@ export function renderTurnMessages(
         ...delegationPair(taskId, round, text, rounds.get(round) ?? [])
       );
       anchored.add(round);
+      continue;
+    }
+
+    // An acknowledgment with no branches behind it — recognized by id, since
+    // nothing in the message body distinguishes an ack from ordinary assistant
+    // prose. This Task's own is the crash-window leftover: the ack landed, the
+    // rows did not, and this render belongs to the retry that will decide the
+    // round again. Dropping it is what makes that retry a clean re-decision —
+    // left in, it reads as "already delegated" and invites the model to answer
+    // instead of delegating, ending the Task with no work done. Another Task's
+    // ack is real history the user saw, so it stays as context, but uncitable:
+    // no round of *this* Task can hold it up as conversation evidence.
+    const ack = parseRoundAckMessageId(message.id);
+    if (ack) {
+      if (ack.taskId !== taskId) messages.push({ role, content: text });
       continue;
     }
 

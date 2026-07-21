@@ -1,4 +1,4 @@
-import { and, count, eq, inArray, lt } from "drizzle-orm";
+import { and, eq, inArray, lt, max } from "drizzle-orm";
 import { z } from "zod";
 import { subtasks } from "@/db/schema";
 import { MAX_SUBTASKS } from "@/config";
@@ -169,12 +169,17 @@ export function makeSubtasks(db: DB) {
         const keyToId = new Map<string, SubtaskId>();
 
         // Pass 1: insert nodes (deps empty for now) to assign ids. Ordinals
-        // continue after every earlier round's rows.
-        const firstOrdinal = db
-          .select({ count: count() })
-          .from(subtasks)
-          .where(eq(subtasks.taskId, taskId))
-          .get()!.count;
+        // continue above every earlier round's rows — from the current maximum,
+        // not a row count, so a gap left by {@link cleanup} deleting part of a
+        // Task cannot hand a later round an ordinal that is already taken. Both
+        // read the `(task_id, ordinal)` index; only this one stays monotonic.
+        const highest =
+          db
+            .select({ max: max(subtasks.ordinal) })
+            .from(subtasks)
+            .where(eq(subtasks.taskId, taskId))
+            .get()?.max ?? null;
+        const firstOrdinal = highest === null ? 0 : highest + 1;
         drafts.forEach((d, offset) => {
           const { id } = db
             .insert(subtasks)

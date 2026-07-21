@@ -209,6 +209,27 @@ describe("subtasks.createDecomposition", () => {
     ).rejects.toThrow(/UNIQUE constraint/);
   });
 
+  it("continues ordinals above the highest, not from a row count", async () => {
+    // A gap — cleanup deleting part of a Task — must not hand a later round an
+    // ordinal that is still taken, which a count-based sequence would.
+    const rows = await runInDurableObject(
+      freshStub("decomp-ordinal-gap"),
+      (instance) => {
+        const { subtasks } = new AgentDB(doStorage(instance));
+        subtasks.createDecomposition("t-1", 0, [
+          draft({ localKey: "a" }),
+          draft({ localKey: "b" }),
+          draft({ localKey: "c" })
+        ]);
+        instance.sql`DELETE FROM subtasks WHERE task_id = 't-1' AND ordinal < 2`;
+        subtasks.createDecomposition("t-1", 1, [draft({ localKey: "d" })]);
+        return subtasks.list("t-1");
+      }
+    );
+
+    expect(rows.map((r) => r.ordinal)).toEqual([2, 3]);
+  });
+
   it("requires round at the schema level (no default to fall back on)", async () => {
     await expect(
       runInDurableObject(freshStub("decomp-round-required"), (instance) => {

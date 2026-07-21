@@ -254,6 +254,58 @@ describe("renderTurnMessages — reference catalog", () => {
     );
     expect(catalog.map((c) => c.text)).toEqual(["the request"]);
   });
+
+  it("drops this Task's ack when the round has no persisted branches", () => {
+    // The crash window: the ack landed, `createDecomposition` did not, and this
+    // render belongs to the retry. The leftover must not read as a delegation
+    // that happened, and must not be citable.
+    const { messages, catalog } = renderTurnMessages(
+      [
+        deterministicSessionMessage(
+          taskUserMessageId(TASK_ID),
+          "user",
+          "the request"
+        ),
+        deterministicSessionMessage(
+          roundAckMessageId(TASK_ID, 0),
+          "assistant",
+          "on it"
+        )
+      ],
+      TASK_ID,
+      []
+    );
+    expect(messages).toEqual([
+      { role: "user", content: "[ref 1] the request" }
+    ]);
+    expect(catalog.map((c) => c.text)).toEqual(["the request"]);
+  });
+
+  it("keeps another Task's ack as context but never as a reference", () => {
+    // Sessions outlive Tasks and are shared across them, so an earlier Task's
+    // scaffolding is in this history. It reads as context; it is not evidence.
+    const { messages, catalog } = renderTurnMessages(
+      [
+        deterministicSessionMessage(
+          roundAckMessageId("task-earlier", 2),
+          "assistant",
+          "on it — the earlier task"
+        ),
+        deterministicSessionMessage(
+          taskUserMessageId(TASK_ID),
+          "user",
+          "the request"
+        )
+      ],
+      TASK_ID,
+      []
+    );
+    expect(messages).toEqual([
+      { role: "assistant", content: "on it — the earlier task" },
+      { role: "user", content: "[ref 1] the request" }
+    ]);
+    expect(catalog.map((c) => c.text)).toEqual(["the request"]);
+  });
 });
 
 describe("renderTurnMessages — reuniting delegate calls with their results", () => {

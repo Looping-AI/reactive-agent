@@ -103,6 +103,28 @@ export function roundAckMessageId(taskId: string, round: number): string {
   return `task:${taskId}:round:${round}:ack`;
 }
 
+/** Matches {@link roundAckMessageId}; the trailing suffix is fixed, so the greedy
+ * task-id group cannot swallow it. */
+const ROUND_ACK_ID = /^task:(.+):round:(\d+):ack$/;
+
+/**
+ * Recognize an acknowledgment id — **any** Task's, not just the one being
+ * rendered. A Session outlives the Task that wrote it and is shared by every Task
+ * from the same caller, so its history accumulates acks the current render has no
+ * branches for: earlier Tasks' acks, and (in the window between a round's ack
+ * append and its Subtask rows) this Task's own. Both are the agent's scaffolding
+ * rather than conversation, so both must stay out of the reference catalog; the
+ * `branches`-derived anchor map alone cannot see either.
+ *
+ * Returns the parsed Task id and round so the caller can tell whose ack it is.
+ */
+export function parseRoundAckMessageId(
+  id: string
+): { taskId: string; round: number } | null {
+  const match = ROUND_ACK_ID.exec(id);
+  return match ? { taskId: match[1] as string, round: Number(match[2]) } : null;
+}
+
 /** Id of the terminal reply — the round in which the agent answered the user. */
 export function finalReplyMessageId(taskId: string): string {
   return `task:${taskId}:reply:final`;
