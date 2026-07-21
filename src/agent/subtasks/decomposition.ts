@@ -8,10 +8,10 @@ import type {
 } from "./types";
 
 /**
- * Pure validation and resolution of the decomposition model's output (Phase 1).
- * No model, no Session, no database — given a {@link DecompositionProposal} and
- * the ephemeral reference catalog it was generated against, this either produces
- * the drafts to persist or throws.
+ * Pure validation and resolution of a `delegate` call's input. No model, no
+ * Session, no database — given a {@link DecompositionProposal} and the ephemeral
+ * reference catalog it was generated against, this either produces the drafts to
+ * persist or throws.
  *
  * Two invariants live here:
  *
@@ -50,18 +50,22 @@ const subtaskProposalSchema = z.object({
   localKey: nonBlank("localKey"),
   type: nonBlank("type"),
   prompt: nonBlank("prompt"),
-  referenceIndexes: z.array(z.number().int().min(1)),
+  referenceIndexes: z.array(z.number().int().min(1)).optional(),
   dependsOn: z.array(nonBlank("dependsOn entry"))
 });
 
 /**
- * The structured-output schema handed to `Output.object()`. The 1..8 bound is
- * enforced here (the model is told it, and the SDK rejects output that breaks it)
- * and again in the data layer, which owns the durable invariant.
+ * The `delegate` tool's input schema. The 1..8 per-round bound is enforced here
+ * (the model is told it, and the SDK rejects a call that breaks it) and again in
+ * the data layer, which owns the durable invariant.
  *
  * Blank strings are rejected at the schema edge rather than deep in execution: an
  * empty `prompt` would otherwise burn a Subtask slot and only fail later, inside
  * the child, with no useful diagnostic.
+ *
+ * `referenceIndexes` is optional because this one schema also has to describe the
+ * calls **reconstructed from durable rows** in later rounds, whose references
+ * were resolved to verbatim snapshots at the time and no longer have indices.
  */
 export const decompositionProposalSchema = z.object({
   reply: nonBlank("reply"),
@@ -103,9 +107,10 @@ function assertAcyclic(proposal: DecompositionProposal): void {
  */
 function resolveReferences(
   localKey: string,
-  referenceIndexes: number[],
+  referenceIndexes: number[] | undefined,
   catalog: ReferenceCatalogEntry[]
 ): SubtaskReference[] {
+  if (!referenceIndexes) return [];
   const seen = new Set<number>();
   for (const index of referenceIndexes) {
     if (seen.has(index)) {

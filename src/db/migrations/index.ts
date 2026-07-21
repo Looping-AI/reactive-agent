@@ -30,6 +30,12 @@ const dbMigrations: MigrationConfig = {
         when: 1784128150521,
         tag: "0001_great_goliath",
         breakpoints: true
+      },
+      {
+        idx: 2,
+        when: 1784631097834,
+        tag: "0002_add_subtask_round",
+        breakpoints: true
       }
     ]
   },
@@ -65,6 +71,34 @@ CREATE INDEX \`idx_notify_tasks_created_at\` ON \`notify_tasks\` (\`created_at\`
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX \`idx_subtasks_task_ordinal\` ON \`subtasks\` (\`task_id\`,\`ordinal\`);--> statement-breakpoint
+CREATE INDEX \`idx_subtasks_status\` ON \`subtasks\` (\`status\`);--> statement-breakpoint
+CREATE INDEX \`idx_subtasks_created_at\` ON \`subtasks\` (\`created_at\`);`,
+    // `round` is required with no default, so SQLite cannot ADD COLUMN it —
+    // the table is rebuilt and pre-existing rows are backfilled with round 0.
+    m0002: `CREATE TABLE \`__new_subtasks\` (
+\t\`id\` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+\t\`task_id\` text NOT NULL,
+\t\`round\` integer NOT NULL,
+\t\`ordinal\` integer NOT NULL,
+\t\`type\` text NOT NULL,
+\t\`recipe_id\` text,
+\t\`recipe_version\` integer,
+\t\`prompt\` text NOT NULL,
+\t\`references_json\` text NOT NULL,
+\t\`depends_on_json\` text NOT NULL,
+\t\`status\` text NOT NULL,
+\t\`result_parts_json\` text,
+\t\`error\` text,
+\t\`created_at\` integer NOT NULL,
+\t\`updated_at\` integer NOT NULL,
+\t\`completed_at\` integer
+);
+--> statement-breakpoint
+INSERT INTO \`__new_subtasks\`("id", "task_id", "round", "ordinal", "type", "recipe_id", "recipe_version", "prompt", "references_json", "depends_on_json", "status", "result_parts_json", "error", "created_at", "updated_at", "completed_at") SELECT "id", "task_id", 0, "ordinal", "type", "recipe_id", "recipe_version", "prompt", "references_json", "depends_on_json", "status", "result_parts_json", "error", "created_at", "updated_at", "completed_at" FROM \`subtasks\`;--> statement-breakpoint
+DROP TABLE \`subtasks\`;--> statement-breakpoint
+ALTER TABLE \`__new_subtasks\` RENAME TO \`subtasks\`;--> statement-breakpoint
+CREATE UNIQUE INDEX \`idx_subtasks_task_ordinal\` ON \`subtasks\` (\`task_id\`,\`ordinal\`);--> statement-breakpoint
+CREATE INDEX \`idx_subtasks_task_round\` ON \`subtasks\` (\`task_id\`,\`round\`);--> statement-breakpoint
 CREATE INDEX \`idx_subtasks_status\` ON \`subtasks\` (\`status\`);--> statement-breakpoint
 CREATE INDEX \`idx_subtasks_created_at\` ON \`subtasks\` (\`created_at\`);`
   }

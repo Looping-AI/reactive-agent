@@ -13,17 +13,17 @@ import { freshStub } from "../helpers/do";
  * ownership — everything `test/index.spec.ts`'s fake-DO test deliberately does NOT
  * exercise. That test unit-tests the outer Worker's own routing/identity forwarding
  * in isolation; this one integration-tests the DO's internals for real (real
- * SQLite-backed Session), driving Phase 1 via the `decomposeTask(...)` native RPC
+ * SQLite-backed Session), driving one round via the `runTaskTurn(...)` native RPC
  * method and reading state directly with `runInDurableObject`. It doesn't care how
  * a caller got here, so no gateway JWT is involved.
  *
  * `env.AI.run()` throws "needs to be run remotely" immediately (no network), and
- * that is not a transient fault, so decomposition exhausts both models and returns
- * a typed `failed` — the same graceful path production takes when both models
+ * that is not a transient fault, so the round exhausts both models and returns a
+ * typed `failed` — the same graceful path production takes when both models
  * produce nothing usable, minus the model.
  */
 
-/** The verified caller a real Worker would pass to `decomposeTask`. */
+/** The verified caller a real Worker would pass to `runTaskTurn`. */
 const IDENTITY = { key: "test:1:ada", name: "Ada", kind: "custom" };
 
 describe("ReactiveAgent — Session persistence (real SQLite)", () => {
@@ -31,12 +31,14 @@ describe("ReactiveAgent — Session persistence (real SQLite)", () => {
 
   it("persists the raw user turn before the (unavailable) model is called", async () => {
     const stub = freshStub("session");
-    // Decomposition appends the inbound turn first, then infers — so the turn is
+    // Round 0 appends the inbound turn first, then infers — so the turn is
     // durable even though the model never answers and no reply is appended.
-    await stub.decomposeTask({
+    await stub.runTaskTurn({
       taskId: "t-session",
       text: "remember: my favorite color is teal",
-      identity: IDENTITY
+      identity: IDENTITY,
+      round: 0,
+      allowControl: true
     });
 
     const history = await runInDurableObject(stub, (instance) =>
@@ -47,8 +49,8 @@ describe("ReactiveAgent — Session persistence (real SQLite)", () => {
     expect(sessionText(history[0])).toBe("remember: my favorite color is teal");
   });
 
-  it("accepts a push context without posting when decomposition never succeeds", async () => {
-    // With no AI binding decomposition fails before any reply exists, so nothing
+  it("accepts a push context without posting when the round never succeeds", async () => {
+    // With no AI binding the round fails before any reply exists, so nothing
     // may be posted — the push context must be harmless. (The streaming path
     // itself is unit-covered by inference.spec's `onContent` and notify.spec's
     // build/sign/post helpers.)
@@ -56,10 +58,12 @@ describe("ReactiveAgent — Session persistence (real SQLite)", () => {
     vi.stubGlobal("fetch", fetchSpy);
 
     const stub = freshStub("push-ctx");
-    const result = await stub.decomposeTask({
+    const result = await stub.runTaskTurn({
       taskId: "t-push",
       text: "hello",
       identity: IDENTITY,
+      round: 0,
+      allowControl: true,
       push: {
         taskId: "t-push",
         contextId: "c-push",
@@ -173,7 +177,7 @@ describe("ReactiveAgent — async task state (real SQLite)", () => {
         contextId: "c-ab"
       });
       const { db } = instance as unknown as { db: AgentDB };
-      const rows = db.subtasks.createDecomposition("t-ab", [
+      const rows = db.subtasks.createDecomposition("t-ab", 0, [
         {
           localKey: "a",
           type: "r",

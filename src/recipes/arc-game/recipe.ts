@@ -31,11 +31,12 @@ export const ARC_GAME_RECIPE: ResolvedRecipe = {
   soul: ARC_GAME_SOUL,
   toolFamilies: ["workspace", "arc-game"],
   enabled: true,
-  // Uncapped in spirit (a full 254-level win is unrealistic in one session) but
-  // bounded by a distant safety ceiling: 20k turns → terminal "budget exhausted"
-  // with full metrics. 25 turns/chunk keeps a chunk well under the step timeout.
+  // Long, but deliberately bounded: 1k turns → terminal "budget exhausted" with
+  // full metrics. 25 turns/chunk keeps a chunk well under the step timeout, and
+  // the resulting 40 nominal chunks sit inside `MAX_CHUNKS_PER_BRANCH` (80) with
+  // room for the level-up progress events that end a chunk early.
   limits: {
-    maxTurns: 20_000,
+    maxTurns: 1_000,
     turnsPerChunk: 25,
     chunkSoftMs: 4 * 60_000
   },

@@ -1,11 +1,12 @@
 /**
- * Unit tests for the ephemeral decomposition-time reference catalog
- * (src/agent/subtasks/catalog.ts). Pure over plain SessionMessage arrays — no
- * Session, no DB.
+ * Unit tests for the reference-catalog eligibility rule
+ * (src/agent/subtasks/catalog.ts). Pure over plain SessionMessages — no Session,
+ * no DB. What the rule *produces* (the `[ref N]` markers and the catalog they
+ * index) is covered in test/agent/turn.spec.ts, which walks the same predicate.
  */
 import { describe, it, expect } from "vitest";
 import type { SessionMessage } from "agents/experimental/memory/session";
-import { buildReferenceCatalog } from "@/agent/subtasks/catalog";
+import { isCatalogEligible } from "@/agent/subtasks/catalog";
 
 const msg = (
   role: string,
@@ -18,55 +19,34 @@ const msg = (
   parts: [{ type: "text", text }]
 });
 
-describe("buildReferenceCatalog", () => {
-  it("numbers eligible user/assistant turns 1..N in history order", () => {
-    const catalog = buildReferenceCatalog([
-      msg("user", "<turn>first</turn>"),
-      msg("assistant", "reply one"),
-      msg("user", "<turn>second</turn>")
-    ]);
-
-    expect(catalog).toEqual([
-      { index: 1, role: "user", text: "<turn>first</turn>" },
-      { index: 2, role: "assistant", text: "reply one" },
-      { index: 3, role: "user", text: "<turn>second</turn>" }
-    ]);
+describe("isCatalogEligible", () => {
+  it("accepts verbatim user and assistant turns", () => {
+    expect(isCatalogEligible(msg("user", "<turn>first</turn>"))).toBe(true);
+    expect(isCatalogEligible(msg("assistant", "reply one"))).toBe(true);
   });
 
   it("excludes compaction summaries (compaction_ id prefix)", () => {
-    const catalog = buildReferenceCatalog([
-      msg("user", "kept"),
-      msg("assistant", "a summary of older history", "compaction_abc123"),
-      msg("assistant", "also kept")
-    ]);
-
-    expect(catalog.map((e) => e.text)).toEqual(["kept", "also kept"]);
-    // Re-numbered contiguously with the summary removed.
-    expect(catalog.map((e) => e.index)).toEqual([1, 2]);
+    // Generated text, never original conversation evidence — readable as
+    // context, structurally uncitable as a reference.
+    const summary = msg(
+      "assistant",
+      "a summary of older history",
+      "compaction_abc123"
+    );
+    expect(isCatalogEligible(summary)).toBe(false);
   });
 
   it("excludes non-user/assistant roles", () => {
-    const catalog = buildReferenceCatalog([
-      msg("system", "you are a bot"),
-      msg("user", "hi"),
-      msg("tool", "some tool output")
-    ]);
-
-    expect(catalog).toEqual([{ index: 1, role: "user", text: "hi" }]);
+    expect(isCatalogEligible(msg("system", "you are a bot"))).toBe(false);
+    expect(isCatalogEligible(msg("tool", "some tool output"))).toBe(false);
   });
 
-  it("skips whitespace-only turns", () => {
-    const catalog = buildReferenceCatalog([
-      msg("user", "real"),
-      msg("assistant", "   \n  "),
-      msg("user", "also real")
-    ]);
-
-    expect(catalog.map((e) => e.text)).toEqual(["real", "also real"]);
-    expect(catalog.map((e) => e.index)).toEqual([1, 2]);
+  it("excludes whitespace-only turns", () => {
+    expect(isCatalogEligible(msg("assistant", "   \n  "))).toBe(false);
+    expect(isCatalogEligible(msg("user", ""))).toBe(false);
   });
 
-  it("concatenates multiple text parts and ignores non-text parts", () => {
+  it("reads across multiple text parts, ignoring non-text ones", () => {
     const message: SessionMessage = {
       id: crypto.randomUUID(),
       role: "assistant",
@@ -77,14 +57,16 @@ describe("buildReferenceCatalog", () => {
         { type: "text", text: "answer" }
       ]
     };
-
-    const catalog = buildReferenceCatalog([message]);
-    expect(catalog).toEqual([
-      { index: 1, role: "assistant", text: "final answer" }
-    ]);
+    expect(isCatalogEligible(message)).toBe(true);
   });
 
-  it("returns an empty catalog for empty history", () => {
-    expect(buildReferenceCatalog([])).toEqual([]);
+  it("excludes a message whose only content is a non-text part", () => {
+    const message: SessionMessage = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      createdAt: new Date(),
+      parts: [{ type: "reasoning", reasoning: "thinking..." }]
+    };
+    expect(isCatalogEligible(message)).toBe(false);
   });
 });

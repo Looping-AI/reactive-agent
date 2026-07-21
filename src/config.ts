@@ -37,18 +37,42 @@ export const DEFAULT_HISTORY_WINDOW = 64;
 /**
  * Hard cap on durable chunk steps the Workflow will run for one Subtask branch
  * before failing it. Bounds `runBranch`'s chunk loop against the Cloudflare
- * Workflows per-instance step ceiling (10,000 on the paid plan): even at the
- * longest recipe (`maxTurns / turnsPerChunk` chunks, plus one level-up-ended
- * chunk per progress event) this stays comfortably under the platform limit.
+ * Workflows per-instance step ceiling (10,000 on the paid plan).
+ *
+ * Sized against the longest recipe: ARC game play is `maxTurns / turnsPerChunk`
+ * = 40 nominal chunks, plus one early-ended chunk per level-up progress event —
+ * so 80 leaves an equal margin of progress-ended chunks. Even the worst fan-out
+ * (8 concurrent branches at the cap) is 640 steps, well under the ceiling.
  */
-export const MAX_CHUNKS_PER_BRANCH = 1500;
+export const MAX_CHUNKS_PER_BRANCH = 80;
 
 /**
- * Upper bound on Subtasks per parent Task — a Core Invariant: every accepted Task
- * decomposes into 1..8 Subtasks, which is also what bounds Phase 2 fan-out (all
- * dependency-ready Subtasks run concurrently, with no other concurrency cap).
+ * Whole-Task budget on durable chunk steps, checked **between** rounds (see
+ * {@link MAX_TURN_ROUNDS}). Without it, a Task that delegated in every round
+ * could multiply {@link MAX_CHUNKS_PER_BRANCH} by the round count and approach
+ * the per-instance step ceiling. Once a Task has spent this much execution, the
+ * main agent is offered no control tools and must answer from what it has.
+ */
+export const MAX_CHUNKS_PER_TASK = 120;
+
+/**
+ * Upper bound on main-agent rounds per parent Task. Each round is one inference
+ * that either answers the user (terminal) or delegates a wave of Subtasks; the
+ * last round is offered no control tools at all, so it must answer.
  *
- * Enforced at both ends: the decomposition schema constrains the model's output,
+ * Bounds the Workflow's round loop the way {@link MAX_SUBTASKS} bounds a single
+ * round's fan-out.
+ */
+export const MAX_TURN_ROUNDS = 8;
+
+/**
+ * Upper bound on Subtasks per **round** — a Core Invariant: a delegating round
+ * emits 1..8 Subtasks, which is also what bounds its fan-out (all
+ * dependency-ready Subtasks run concurrently, with no other concurrency cap). A
+ * Task that delegates in every round can therefore hold up to
+ * `MAX_TURN_ROUNDS * MAX_SUBTASKS` rows.
+ *
+ * Enforced at both ends: the delegation schema constrains the model's output,
  * and the data layer re-checks it as the durable guard.
  */
 export const MAX_SUBTASKS = 8;

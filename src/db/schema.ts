@@ -44,6 +44,9 @@ export const subtasks = sqliteTable(
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
     taskId: text("task_id").notNull(),
+    /** Main-agent round that delegated this Subtask (0-based). */
+    round: integer("round").notNull(),
+    /** Position within the parent Task, increasing across every round. */
     ordinal: integer("ordinal").notNull(),
     type: text("type").notNull(),
     /** Resolved Recipe key, written only at execution start. */
@@ -65,6 +68,7 @@ export const subtasks = sqliteTable(
   },
   (table) => [
     uniqueIndex("idx_subtasks_task_ordinal").on(table.taskId, table.ordinal),
+    index("idx_subtasks_task_round").on(table.taskId, table.round),
     index("idx_subtasks_status").on(table.status),
     index("idx_subtasks_created_at").on(table.createdAt)
   ]

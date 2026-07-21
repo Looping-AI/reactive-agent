@@ -72,6 +72,19 @@ describe("resolveDecomposition — reference snapshotting", () => {
     const { drafts } = resolveDecomposition(proposal({}), CATALOG);
     expect(drafts[0].references).toEqual([]);
   });
+
+  it("accepts a call that omits referenceIndexes entirely", () => {
+    // The field is optional because this one schema also describes the calls
+    // reconstructed from durable rows in later rounds, whose references were
+    // resolved to snapshots and no longer have indices.
+    const call = proposal({});
+    delete call.subtasks[0].referenceIndexes;
+
+    expect(decompositionProposalSchema.safeParse(call).success).toBe(true);
+    expect(resolveDecomposition(call, CATALOG).drafts[0].references).toEqual(
+      []
+    );
+  });
 });
 
 describe("resolveDecomposition — dependency graph", () => {

@@ -153,7 +153,7 @@ export type RecipeExecutionResult =
   | { status: "failed"; error: string; modelId: string | null };
 
 /**
- * One Subtask as the decomposition model emits it. The model selects references
+ * One Subtask as the delegating model emits it. The model selects references
  * by **catalog index only** — it never emits reference text, and application code
  * snapshots the catalog entry's exact role+text onto the Subtask (see
  * `agent/subtasks/decomposition.ts`). `dependsOn` uses draft-local keys, resolved
@@ -163,17 +163,21 @@ export interface SubtaskProposal {
   localKey: string;
   type: string;
   prompt: string;
-  /** 1-based indices into the ephemeral decomposition-time reference catalog. */
-  referenceIndexes: number[];
+  /**
+   * 1-based indices into the ephemeral, per-round reference catalog. Optional:
+   * omitted when the subtask needs no verbatim history, and always absent from a
+   * *reconstructed* historical call, whose references were resolved rounds ago.
+   */
+  referenceIndexes?: number[];
   /** Draft-local keys of prerequisite proposals. */
   dependsOn: string[];
 }
 
 /**
- * The decomposition model's complete structured output (Phase 1): the first
- * user-visible reply plus one through eight Subtask proposals. Validated against
- * the ephemeral catalog before anything is persisted; invalid output fails the
- * attempt (and, with both models exhausted, the parent Task) rather than being
+ * The model's complete `delegate` call: the acknowledgment the user sees while
+ * the work runs, plus one through eight Subtask proposals. Validated against the
+ * round's ephemeral catalog before anything is persisted; invalid output fails
+ * the attempt (and, with both models exhausted, the round) rather than being
  * silently repaired.
  */
 export interface DecompositionProposal {
@@ -182,26 +186,31 @@ export interface DecompositionProposal {
 }
 
 /**
- * Terminal outcome of Phase 1 (RPC-safe). `failed` means both models produced
- * unusable output and the parent Task must fail — no Subtask is ever synthesized.
- * `canceled` means the caller cancelled during the phase: no rows were persisted
- * and no reply was published. Transient platform faults are not results: they
- * throw so the enclosing Workflow step can retry (mirrors
- * {@link RecipeExecutionResult}).
+ * Terminal outcome of one main-agent round (RPC-safe).
+ *
+ * `replied` is the terminal answer — the round chose to answer the user rather
+ * than delegate, and the Workflow delivers it. `delegated` means the round's
+ * Subtask rows are durable and Phase 2 should run them, after which another round
+ * begins. `failed` means both models produced unusable output; no Subtask is ever
+ * synthesized to cover for it. `canceled` means the caller cancelled during the
+ * round: nothing was persisted and nothing was published. Transient platform
+ * faults are not results: they throw so the enclosing Workflow step can retry
+ * (mirrors {@link RecipeExecutionResult}).
  */
-export type DecomposeTaskResult =
-  | { status: "completed"; reply: string; subtasks: Subtask[] }
+export type TurnTaskResult =
+  | { status: "replied"; reply: string }
+  | { status: "delegated"; reply: string; subtasks: Subtask[] }
   | { status: "failed"; error: string }
   | { status: "canceled" };
 
 /**
- * One branch's outcome as composition (Phase 3) sees it — a plain, RPC-safe
- * subset of the durable {@link Subtask} row, loaded in stable ordinal order.
- * Completed, failed, and skipped branches are all included so the composed reply
+ * One branch's outcome as a later round sees it — a plain, RPC-safe subset of the
+ * durable {@link Subtask} row, loaded across **every** round in stable ordinal
+ * order. Completed, failed, and skipped branches are all included so the reply
  * can use available successes and disclose relevant failures.
  *
- * Carries `prompt` and `dependsOn` — not for composing, but for reconstructing
- * the `delegate` call that produced these branches (see
+ * Carries `round`, `prompt` and `dependsOn` — not for composing, but for
+ * reconstructing the per-round `delegate` call that produced these branches (see
  * `agent/subtasks/delegate.ts`). Unlike {@link SubtaskNode}, this projection is
  * built inside the DO and returns only a reply, so the 1 MiB Workflow-step cap
  * that keeps the scheduler's view narrow does not apply. `references` still stays
@@ -209,6 +218,7 @@ export type DecomposeTaskResult =
  */
 export interface CompositionBranch {
   subtaskId: SubtaskId;
+  round: number;
   ordinal: number;
   type: string;
   prompt: string;
@@ -217,17 +227,6 @@ export interface CompositionBranch {
   resultParts: SubtaskResultPart[] | null;
   error: string | null;
 }
-
-/**
- * Terminal outcome of Phase 3 (RPC-safe). `failed` means no branch succeeded —
- * composition inference is never invoked in that case. `canceled` means the
- * caller cancelled before or during the phase, so the composed reply is never
- * published. Transient platform faults throw for the Workflow step to retry.
- */
-export type ComposeTaskResult =
-  | { status: "completed"; reply: string }
-  | { status: "failed"; error: string }
-  | { status: "canceled" };
 
 /**
  * The `scan:<n>` wave projection (RPC-safe): either the caller cancelled, or the
@@ -256,10 +255,13 @@ export interface SubtaskNode {
   dependsOn: SubtaskId[];
 }
 
-/** Durable state owned by the main agent for one decomposed unit of work. */
+/** Durable state owned by the main agent for one delegated unit of work. */
 export interface Subtask {
   id: SubtaskId;
   taskId: string;
+  /** The main-agent round that delegated this Subtask (0-based). */
+  round: number;
+  /** Position within the parent Task, increasing across every round. */
   ordinal: number;
   type: string;
   recipeId: string | null;

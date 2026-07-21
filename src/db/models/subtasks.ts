@@ -1,4 +1,4 @@
-import { and, eq, inArray, lt } from "drizzle-orm";
+import { and, eq, inArray, lt, max } from "drizzle-orm";
 import { z } from "zod";
 import { subtasks } from "@/db/schema";
 import { MAX_SUBTASKS } from "@/config";
@@ -42,6 +42,7 @@ export function makeSubtasks(db: DB) {
   const rowToSubtask = (row: SubtaskRow): Subtask => ({
     id: row.id,
     taskId: row.taskId,
+    round: row.round,
     ordinal: row.ordinal,
     type: row.type,
     recipeId: row.recipeId,
@@ -73,6 +74,16 @@ export function makeSubtasks(db: DB) {
       .all()
       .map(rowToSubtask);
 
+  /** Rides `idx_subtasks_task_round` — no full-Task scan to reach one round. */
+  const listRound = (taskId: string, round: number): Subtask[] =>
+    db
+      .select()
+      .from(subtasks)
+      .where(and(eq(subtasks.taskId, taskId), eq(subtasks.round, round)))
+      .orderBy(subtasks.ordinal)
+      .all()
+      .map(rowToSubtask);
+
   /** Guarded status update: applies only from a `from` status, returns whether it did. */
   const transition = (
     id: SubtaskId,
@@ -92,20 +103,31 @@ export function makeSubtasks(db: DB) {
 
   return {
     /**
-     * Create a whole decomposition atomically: the entire check-validate-insert
-     * sequence runs in one synchronous `db.transaction`, so a failure anywhere
-     * rolls back every statement — no truncated subtask set, no nodes left with
-     * unwritten dependency edges. Idempotent on `taskId`: if this Task already
-     * has Subtasks, returns them unchanged (a Workflow-step retry must not
-     * duplicate work); the unique `(task_id, ordinal)` index is the schema-level
-     * backstop. Enforces the 1..8 bound, unique local keys, and resolvable
-     * non-self dependency edges, then resolves draft-local dependency keys to
-     * the SQLite-assigned {@link SubtaskId}s. Full cycle/edge DAG validation
-     * lives in the decomposition operation (C1); this is the storage guard.
+     * Create one **round's** decomposition atomically: the entire
+     * check-validate-insert sequence runs in one synchronous `db.transaction`, so
+     * a failure anywhere rolls back every statement — no truncated subtask set, no
+     * nodes left with unwritten dependency edges. Idempotent on
+     * `(taskId, round)`: if this round already has Subtasks, returns them
+     * unchanged (a Workflow-step retry must not duplicate work); the unique
+     * `(task_id, ordinal)` index is the schema-level backstop. Enforces the 1..8
+     * per-round bound, unique local keys, and resolvable non-self dependency
+     * edges, then resolves draft-local dependency keys to the SQLite-assigned
+     * {@link SubtaskId}s. Full cycle/edge DAG validation lives in the turn
+     * operation; this is the storage guard.
+     *
+     * `ordinal` continues across rounds (it is the Task-wide position, and what
+     * the unique index is built on), so a later round's rows sort after the
+     * earlier ones in {@link list}. Dependency edges never cross a round: each
+     * round's DAG is self-contained, and the drafts handed here only carry keys
+     * from their own round.
      */
-    createDecomposition(taskId: string, drafts: SubtaskDraft[]): Subtask[] {
+    createDecomposition(
+      taskId: string,
+      round: number,
+      drafts: SubtaskDraft[]
+    ): Subtask[] {
       return db.transaction(() => {
-        const existing = list(taskId);
+        const existing = listRound(taskId, round);
         if (existing.length > 0) return existing;
 
         if (drafts.length < 1 || drafts.length > MAX_SUBTASKS) {
@@ -146,13 +168,25 @@ export function makeSubtasks(db: DB) {
         const now = Date.now();
         const keyToId = new Map<string, SubtaskId>();
 
-        // Pass 1: insert nodes (deps empty for now) to assign ids.
-        drafts.forEach((d, ordinal) => {
+        // Pass 1: insert nodes (deps empty for now) to assign ids. Ordinals
+        // continue above every earlier round's rows — from the current maximum,
+        // not a row count, so a gap left by {@link cleanup} deleting part of a
+        // Task cannot hand a later round an ordinal that is already taken. Both
+        // read the `(task_id, ordinal)` index; only this one stays monotonic.
+        const highest =
+          db
+            .select({ max: max(subtasks.ordinal) })
+            .from(subtasks)
+            .where(eq(subtasks.taskId, taskId))
+            .get()?.max ?? null;
+        const firstOrdinal = highest === null ? 0 : highest + 1;
+        drafts.forEach((d, offset) => {
           const { id } = db
             .insert(subtasks)
             .values({
               taskId,
-              ordinal,
+              round,
+              ordinal: firstOrdinal + offset,
               type: d.type,
               recipeId: null,
               recipeVersion: null,
@@ -181,7 +215,7 @@ export function makeSubtasks(db: DB) {
             .run();
         }
 
-        return list(taskId);
+        return listRound(taskId, round);
       });
     },
 
@@ -191,9 +225,18 @@ export function makeSubtasks(db: DB) {
       return row ? rowToSubtask(row) : null;
     },
 
-    /** List a Task's Subtasks in ordinal order. */
+    /** List every round's Subtasks for a Task, in ordinal order. */
     list(taskId: string): Subtask[] {
       return list(taskId);
+    },
+
+    /**
+     * List one round's Subtasks, in ordinal order — the scheduler's view. Phase 2
+     * drives a single round's DAG at a time, so it must not see a sibling round's
+     * rows; composition, by contrast, reads {@link list} across all rounds.
+     */
+    listRound(taskId: string, round: number): Subtask[] {
+      return listRound(taskId, round);
     },
 
     /**

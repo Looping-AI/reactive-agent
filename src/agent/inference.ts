@@ -4,10 +4,9 @@ import type { FinishReason, StepResult, ToolSet } from "ai";
  * Shared Workers-AI plumbing for the agent's inference operations — the pieces
  * every model call needs regardless of *which* operation it belongs to.
  *
- * The operations themselves are deliberately separate, not layered on a common
- * loop: the main agent's Session-coupled phases live in
- * {@link file://./decompose.ts decompose.ts} and {@link file://./compose.ts
- * compose.ts}, and the Session-less subagent loop in
+ * The two loops themselves are deliberately separate, not layered on a common
+ * one: the main agent's Session-coupled round lives in
+ * {@link file://./turn.ts turn.ts}, and the Session-less subagent loop in
  * {@link file://../subagent/run.ts run.ts}. They share error classification and
  * progress streaming; their control flow has nothing in common worth abstracting.
  */
