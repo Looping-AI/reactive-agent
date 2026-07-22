@@ -7,6 +7,7 @@
 //   verify                     GET /accounts/{id}/tokens/verify
 //   logs   [flags]             historical Worker logs (Observability telemetry)
 //   wf     [name [instance]]   Workflows: list defs / list instances / one instance
+//   ai     [flags | <logId>]   AI Gateway calls: digest, or one call's prompt + reply
 //   fields [--worker <name>]   discover available log fields for a dataset
 //
 // logs flags:
@@ -28,6 +29,8 @@
 //   node scripts/cf.mjs logs --worker looping-reactive-agent --grep executeChunk
 //   node scripts/cf.mjs wf handle-task
 //   node scripts/cf.mjs wf handle-task handle-27to4pc4w7eo0psa59o
+//   node scripts/cf.mjs ai --since 2h
+//   node scripts/cf.mjs ai 01KY4PSY6T1HBA7A2V22NKCFZC
 //   node scripts/cf.mjs GET workflows -q per_page=50
 import fs from "node:fs";
 
@@ -50,6 +53,9 @@ const USAGE = `cf.mjs — Cloudflare API proxy (credentials from ${ENV_FILE})
   wf                                     list workflow definitions
   wf <name>                              list recent instances of a workflow
   wf <name> <instanceId> [--json]        one instance, per-step pass/fail
+  ai [--since 2h] [--model <m>]          AI Gateway calls, as a digest
+     [--limit 20] [--json|--raw]
+  ai <logId> [--full] [--max N]          one call: prompt + reply (bodies)
   fields [--worker <name>]               list available log fields
   [METHOD] <path> [-d <json|@file>]      raw passthrough (path is account-relative
        [-q <k=v>]... [--raw]             unless it starts with "/")`;
@@ -338,6 +344,161 @@ async function cmdFields(args) {
     out(typeof k === "string" ? k : `${k.key ?? k.name}  (${k.type ?? "?"})`);
 }
 
+const AI_GW_DEFAULT = "default";
+
+function truncate(s, max) {
+  s = String(s ?? "");
+  if (!Number.isFinite(max) || s.length <= max) return s;
+  return `${s.slice(0, max)}\n  …[+${s.length - max} chars — use --full]`;
+}
+
+// Best-effort readable text for one chat message (string / multimodal / tool calls).
+function messageText(msg) {
+  if (typeof msg.content === "string" && msg.content.length) return msg.content;
+  if (Array.isArray(msg.content))
+    return msg.content.map((p) => p.text ?? `[${p.type ?? "part"}]`).join("\n");
+  if (msg.tool_calls)
+    return `tool_calls: ${JSON.stringify(msg.tool_calls, null, 2)}`;
+  return JSON.stringify(msg.content ?? msg);
+}
+
+async function cmdAi(args) {
+  const { flags, pos } = parseFlags(args, {
+    bool: ["--json", "--raw", "--full"],
+    value: ["--since", "--model", "--limit", "--gateway", "--max"]
+  });
+  const gw = flags.gateway ?? AI_GW_DEFAULT;
+  if (pos[0]) return cmdAiDetail(gw, pos[0], flags);
+
+  const limit = Number(flags.limit ?? 20);
+  const { res, text } = await request(
+    "GET",
+    acct(`ai-gateway/gateways/${gw}/logs`),
+    {
+      query: [
+        ["per_page", String(limit)],
+        ["order_by", "created_at"],
+        ["order_by_direction", "desc"]
+      ]
+    }
+  );
+  ensureOk(res, text);
+  if (flags.json || flags.raw) return void printBody(text, { raw: flags.raw });
+
+  const json = parseJson(text);
+  const rawCount = json?.result?.length ?? 0;
+  const total = json?.result_info?.total_count;
+  let logs = json?.result ?? [];
+  if (flags.since) {
+    const cutoff = Date.now() - parseSince(flags.since);
+    logs = logs.filter((l) => Date.parse(l.created_at) >= cutoff);
+  }
+  if (flags.model) {
+    const needle = String(flags.model).toLowerCase();
+    logs = logs.filter((l) => (l.model ?? "").toLowerCase().includes(needle));
+  }
+  if (logs.length === 0) return void out("no AI Gateway calls match");
+
+  const byModel = {};
+  let cost = 0;
+  for (const l of logs) {
+    byModel[l.model ?? "?"] = (byModel[l.model ?? "?"] ?? 0) + 1;
+    cost += l.cost ?? 0;
+  }
+  const times = logs.map((l) => Date.parse(l.created_at));
+  const modelStr = Object.entries(byModel)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k} (${v})`)
+    .join(", ");
+  out(
+    `${logs.length} calls${flags.since ? ` in last ${flags.since}` : ""} · $${cost.toFixed(5)} · ${modelStr}`
+  );
+  out(
+    `${hhmmss(Math.min(...times))} → ${hhmmss(Math.max(...times))}${total != null ? `  ·  ${total} stored` : ""}`
+  );
+  out("");
+  for (const l of logs) {
+    const io = `${l.tokens_in ?? 0}→${l.tokens_out ?? 0}`.padEnd(11);
+    const c = `$${(l.cost ?? 0).toFixed(5)}`.padEnd(9);
+    const st = l.success ? (l.cached ? "cached" : "ok") : "FAIL";
+    out(
+      `${hhmmss(Date.parse(l.created_at))}  ${l.id}  ${(l.model ?? "?").padEnd(24)} ${io} ${c} ${`${l.duration ?? "?"}ms`.padEnd(8)} ${st}`
+    );
+  }
+  if (rawCount >= limit)
+    out(
+      `\n⚠ hit page limit ${limit} — raise --limit or narrow --since/--model`
+    );
+}
+
+async function cmdAiDetail(gw, id, flags) {
+  const base = acct(`ai-gateway/gateways/${gw}/logs/${id}`);
+  const meta = await request("GET", base);
+  ensureOk(meta.res, meta.text);
+  const reqR = await request("GET", `${base}/request`);
+  const resR = await request("GET", `${base}/response`);
+
+  if (flags.raw) {
+    out(reqR.text);
+    out("\n———\n");
+    out(resR.text);
+    return;
+  }
+  if (flags.json) {
+    out(
+      JSON.stringify(
+        {
+          meta: parseJson(meta.text)?.result ?? parseJson(meta.text),
+          request: parseJson(reqR.text),
+          response: parseJson(resR.text)
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  const max = flags.full ? Infinity : Number(flags.max ?? 1500);
+  const m = parseJson(meta.text)?.result ?? {};
+  const reqBody = parseJson(reqR.text) ?? {};
+  const resBody = parseJson(resR.text) ?? {};
+  const rule = "─".repeat(60);
+  const st = m.success ? (m.cached ? "cached" : "ok") : "FAIL";
+  out(
+    `${m.created_at ?? "?"} · ${m.model ?? "?"} (${m.provider ?? "?"}) · ${m.tokens_in ?? 0}→${m.tokens_out ?? 0} tok · $${(m.cost ?? 0).toFixed(5)} · ${m.duration ?? "?"}ms · ${st}`
+  );
+
+  out(rule);
+  const msgs = reqBody.messages;
+  if (Array.isArray(msgs)) {
+    out(`▶ REQUEST — ${msgs.length} message${msgs.length === 1 ? "" : "s"}`);
+    for (const msg of msgs) {
+      out(`\n[${msg.role}]`);
+      out(truncate(messageText(msg), max));
+    }
+  } else {
+    out("▶ REQUEST");
+    out(truncate(JSON.stringify(reqBody, null, 2), max));
+  }
+
+  out(`\n${rule}`);
+  const choice = resBody.choices?.[0];
+  const reply = choice?.message;
+  if (reply) {
+    out(`◀ REPLY — finish: ${choice.finish_reason ?? "?"}`);
+    out("");
+    out(truncate(messageText(reply), max));
+    if (reply.reasoning_content) {
+      out("\n  reasoning:");
+      out(`  ${truncate(reply.reasoning_content, max).replace(/\n/g, "\n  ")}`);
+    }
+  } else {
+    out("◀ REPLY");
+    out(truncate(JSON.stringify(resBody, null, 2), max));
+  }
+}
+
 async function cmdRaw(args) {
   let method = "GET";
   if (METHODS.has(args[0]?.toUpperCase())) method = args.shift().toUpperCase();
@@ -381,6 +542,8 @@ if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
   await cmdLogs(argv.slice(1));
 } else if (cmd === "wf") {
   await cmdWf(argv.slice(1));
+} else if (cmd === "ai") {
+  await cmdAi(argv.slice(1));
 } else if (cmd === "fields") {
   await cmdFields(argv.slice(1));
 } else {

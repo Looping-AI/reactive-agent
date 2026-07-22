@@ -33,7 +33,7 @@ npx drizzle-kit generate  # generate a new migration after editing src/db/schema
 
 ## Reading production logs
 
-Read the **deployed** Worker's logs (and all sibling Workers in the account) through `scripts/cf.mjs`, a credential proxy: it reads `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` from `.env.local` (gitignored; see [.env.local.example](.env.local.example)) and calls the Cloudflare API, so the token never reaches the terminal or an agent's context. Token scopes needed: **Workers Observability: Read** (logs) and **Workers Scripts: Read** (workflow state — there is no standalone "Workflows" scope).
+Read the **deployed** Worker's logs (and all sibling Workers in the account) through `scripts/cf.mjs`, a credential proxy: it reads `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` from `.env.local` (gitignored; see [.env.local.example](.env.local.example)) and calls the Cloudflare API, so the token never reaches the terminal or an agent's context. Token scopes needed: **Workers Observability: Read** (logs), **Workers Scripts: Read** (workflow state — there is no standalone "Workflows" scope), and **AI Gateway: Read** (model call bodies).
 
 ```sh
 node scripts/cf.mjs verify                                   # or: npm run cf -- verify
@@ -41,10 +41,13 @@ node scripts/cf.mjs logs --since 2h --level error            # digest of recent 
 node scripts/cf.mjs logs --worker looping-reactive-agent --grep executeChunk
 node scripts/cf.mjs wf handle-task                           # list workflow instances
 node scripts/cf.mjs wf handle-task <instanceId>              # per-step pass/fail
+node scripts/cf.mjs ai --since 2h                            # recent model calls (tokens, cost)
+node scripts/cf.mjs ai <logId>                               # one call: the prompt + the reply
 node scripts/cf.mjs --help                                   # all subcommands + flags
 ```
 
 - `logs` prints a compact digest (`--json` / `--raw` for the full payload) and spans **all** Workers in the account (`looping-gateway`, `looping-proactive-agent`, …), not just this one — hence "logs sometimes live elsewhere."
+- `ai` reads the AI Gateway (`default`) log: the list form is a digest (model · tokens · cost · timing), and `ai <logId>` prints what the agent actually sent the model and got back (system + messages, then the reply with `reasoning_content`). Note the AI Gateway `metadata` is currently `null`, so tie a model call back to a Task by **timestamp** against `logs`/`wf`, not a shared id.
 - **Gotcha — workflow "errors" are usually noise.** A telemetry event with `outcome: exception` on a Workflow is the runtime _suspending between steps by throwing_, not a failure. Confirm with `wf <name> <instanceId>` and read the instance's `status` / `error` before trusting it. Likewise the `RecipeSubagent.executeChunk` exceptions are usually the recoverable first leg of the fingerprint-mismatch retry in [executeChunkInChild](src/reactive-agent/index.ts) — a real failure only on a second mismatch.
 - An uncaught exception's **stack is not carried in telemetry** (only the console log label), so an `error`-level event with no detail is expected — pivot to `wf` / instance state for the real cause.
 
