@@ -171,8 +171,7 @@ async function cmdLogs(args) {
       "--service",
       "--level",
       "--grep",
-      "--limit",
-      "--dataset"
+      "--limit"
     ]
   });
   const sinceLabel = flags.since ?? "1h";
