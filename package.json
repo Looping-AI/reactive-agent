@@ -8,6 +8,7 @@
     "dev": "wrangler dev",
     "types": "wrangler types",
     "keygen": "node scripts/generate-keys.mjs",
+    "cf": "node scripts/cf.mjs",
     "format": "prettier --write .",
     "lint": "eslint .",
     "check": "wrangler types --check && prettier --check . && eslint . && tsc && tsc -p test/tsconfig.json",
