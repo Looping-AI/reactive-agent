@@ -41,6 +41,15 @@ export async function embedTexts(texts: string[]): Promise<number[][]> {
   return embeddings;
 }
 
+/**
+ * Custom metadata attached to the AI Gateway log for every call this pair makes.
+ * The gateway's own `metadata` is otherwise `null`, so a model call can only be
+ * tied back to its Task by timestamp; stamping `{ taskId, round }` (a turn) or
+ * `{ taskId, subtaskId }` (a chunk) makes `cf ai` correlation exact. Values are
+ * limited to the gateway's accepted scalar set.
+ */
+export type GatewayMetadata = Record<string, number | string | boolean>;
+
 export interface ModelOverrides {
   model?: LanguageModel; // test override for the primary
   fallbackModel?: LanguageModel; // test override for the fallback
@@ -54,6 +63,17 @@ export interface ModelOverrides {
    * `CHAT_FALLBACK_MODEL_ID`.
    */
   fallbackModelId?: string;
+  /** AI Gateway log metadata for correlation — see {@link GatewayMetadata}. */
+  metadata?: GatewayMetadata;
+}
+
+/**
+ * Per-model Workers-AI settings: pin the gateway id (so per-call metadata does
+ * not drop the gateway route) and attach correlation metadata when supplied.
+ * Returns `undefined` when there is no metadata so the provider default applies.
+ */
+function chatSettings(metadata?: GatewayMetadata) {
+  return metadata ? { gateway: { id: AI_GATEWAY_ID, metadata } } : undefined;
 }
 
 /** The primary/fallback models (lazily memoized) plus their ids for logging. */
@@ -74,11 +94,15 @@ export function createModelPair(overrides: ModelOverrides = {}): ModelPair {
   const fallbackId = overrides.fallbackModelId ?? CHAT_FALLBACK_MODEL_ID;
   let primary: LanguageModel | undefined;
   let fallback: LanguageModel | undefined;
+  const settings = chatSettings(overrides.metadata);
   return {
-    primary: () => (primary ??= overrides.model ?? workersai()(primaryId)),
+    primary: () =>
+      (primary ??= overrides.model ?? workersai()(primaryId, settings)),
     fallback: () =>
       (fallback ??=
-        overrides.fallbackModel ?? overrides.model ?? workersai()(fallbackId)),
+        overrides.fallbackModel ??
+        overrides.model ??
+        workersai()(fallbackId, settings)),
     primaryId: () => primaryId,
     fallbackId: () => fallbackId
   };

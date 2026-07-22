@@ -1,4 +1,4 @@
-// Cloudflare API proxy. Reads credentials from .env.local so the token never
+// Cloudflare API proxy. Reads credentials from .cf.env so the token never
 // appears in the terminal, in shell history, or in an agent's context — the
 // script holds it in memory, prints only the API response, and redacts the
 // token from any output as a safety net.
@@ -34,7 +34,7 @@
 //   node scripts/cf.mjs GET workflows -q per_page=50
 import fs from "node:fs";
 
-const ENV_FILE = ".env.local";
+const ENV_FILE = ".cf.env";
 const BASE = "https://api.cloudflare.com/client/v4";
 const DATASET = "cloudflare-workers";
 const METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]);
@@ -64,7 +64,7 @@ try {
   process.loadEnvFile(ENV_FILE);
 } catch {
   die(
-    `could not read ${ENV_FILE}. Create it with CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID (see .env.local.example).`
+    `could not read ${ENV_FILE}. Create it with CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID (see .cf.env.example).`
   );
 }
 

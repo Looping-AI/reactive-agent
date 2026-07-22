@@ -197,7 +197,9 @@ export class RecipeSubagent extends Agent<Env> {
       this.modelsOverride ??
       createModelPair({
         primaryModelId: recipe.primaryModelId,
-        fallbackModelId: recipe.fallbackModelId
+        fallbackModelId: recipe.fallbackModelId,
+        // AI Gateway correlation: tie this child's model calls to its Subtask.
+        metadata: { taskId: request.taskId, subtaskId: request.subtaskId }
       });
     const workspace = makeWorkspaceHandle(this.workspace());
     const progress: ProgressEvent[] = [];

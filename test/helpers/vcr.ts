@@ -1,7 +1,28 @@
 import { MockAgent, SnapshotAgent, type Dispatcher } from "undici";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { VCR_CONTROL_ORIGIN, CASSETTE_NAME_RE } from "./vcr-shared";
+
+/**
+ * undici stamps every cassette entry with two volatile fields we never want
+ * committed: `callCount` — which its recorder *mutates on every replay* (to walk
+ * sequential responses) — and `timestamp`, the record-time clock. Neither is
+ * needed for playback (`callCount` defaults to 0 on load; `timestamp` is unused),
+ * so we delete them from a freshly recorded cassette. Removing them is also what
+ * stops a plain `npm test` from dirtying cassettes: with no persisted `callCount`
+ * there is nothing for a replay to bump — and {@link VcrAgent.close} no longer
+ * writes in playback anyway.
+ */
+function stripVolatileFields(file: string): void {
+  const entries = JSON.parse(readFileSync(file, "utf8")) as {
+    snapshot: { callCount?: number; timestamp?: string };
+  }[];
+  for (const { snapshot } of entries) {
+    delete snapshot.callCount;
+    delete snapshot.timestamp;
+  }
+  writeFileSync(file, JSON.stringify(entries, null, 2));
+}
 
 function originHost(origin: string | URL | undefined): string | null {
   if (!origin) return null;
@@ -165,12 +186,28 @@ export class VcrAgent extends MockAgent {
   }
 
   /**
-   * Closes every cassette's `SnapshotAgent` (saves it, stops its recorder's
-   * auto-flush timer, closes its real sockets), then this agent. See
-   * {@link closeVcr} for why calling this is required in record mode.
+   * Closes every cassette's `SnapshotAgent`, then this agent.
+   *
+   * Record mode: `SnapshotAgent.close()` saves each cassette, stops its
+   * recorder's auto-flush timer, and closes its real sockets — all required (see
+   * {@link closeVcr}). We then {@link stripVolatileFields} from each saved file
+   * so the committed cassette carries no `callCount`/`timestamp`.
+   *
+   * Playback mode: undici's `SnapshotAgent.close()` *unconditionally* re-saves
+   * the cassette, writing back the `callCount` its recorder mutates on every
+   * replay — the side effect that dirtied cassettes on a plain `npm test`. There
+   * is nothing to save and no real socket in playback, so we skip that save
+   * entirely and only stop each recorder's timers.
    */
   async close(): Promise<void> {
-    await Promise.all([...this.#agents.values()].map((a) => a.close()));
+    if (this.#record) {
+      await Promise.all([...this.#agents.values()].map((a) => a.close()));
+      for (const name of this.#agents.keys()) {
+        stripVolatileFields(path.join(this.#snapshotsDir, name));
+      }
+    } else {
+      for (const a of this.#agents.values()) a.getRecorder().destroy();
+    }
     await super.close();
   }
 }
@@ -192,8 +229,9 @@ const VCR_KEY = "__VCR_AGENT__";
  * the real `SnapshotAgent` keeps sockets open — both keep the process alive
  * after tests finish and trip Vitest's "close timed out" at teardown. Calling
  * this (from a Vitest `globalSetup` teardown, which runs before Vite closes its
- * own server) stops them. A no-op if no agent was created, and safe in playback
- * (no real sockets, nothing pending to save).
+ * own server) stops them. A no-op if no agent was created, and in playback only
+ * stops recorder timers — {@link VcrAgent.close} deliberately does not re-save
+ * the cassette there (see its doc).
  */
 export async function closeVcr(): Promise<void> {
   const g = globalThis as Record<string, unknown>;

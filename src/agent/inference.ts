@@ -46,14 +46,24 @@ function isIntermediateStep(step: { finishReason: FinishReason }): boolean {
  * calls); the final step is skipped because its text is the operation's return
  * value. A fresh handler per attempt resets the 0-based `stepIndex` counter so a
  * primary→fallback re-run reuses the same indices and the gateway dedupes.
+ *
+ * `terminalToolNames` are the loop's **halting** control tools (e.g. the main
+ * agent's `delegate`): a step that calls one still has `finishReason:"tool-calls"`,
+ * but it is the round's *final* step, and its accompanying text is the round's
+ * acknowledgment — which the caller publishes separately as a milestone. Streaming
+ * it here too would double-post the same text under a second messageId, so those
+ * steps are skipped. Default `[]` (the subagent loop has no control tools).
  */
 export function buildIntermediateContentHandler(
-  onContent: OnContent
+  onContent: OnContent,
+  terminalToolNames: string[] = []
 ): (step: StepResult<ToolSet>) => Promise<void> {
   let stepIndex = 0;
   return async (step) => {
     const i = stepIndex++;
     if (!isIntermediateStep(step)) return;
+    if (step.toolCalls.some((c) => terminalToolNames.includes(c.toolName)))
+      return;
     const content = step.text.trim();
     if (content) await onContent(content, i);
   };

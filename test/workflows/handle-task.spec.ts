@@ -125,6 +125,8 @@ interface AgentFake {
   failed: { id: number; error: string }[];
   canceledPending: number;
   saved?: Task;
+  /** Set once the post-delivery child sweep ran. */
+  swept?: boolean;
   /** One entry per round that actually ran an inference, in order. */
   turns: { round: number; allowControl: boolean; decision: string }[];
 }
@@ -281,6 +283,12 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
       }
       agent.canceledPending = n;
       return n;
+    }),
+
+    // Post-delivery child sweep. Records that it ran so the ordering assertion
+    // can pin it between `complete` and `notify`.
+    sweepTaskChildren: vi.fn(async () => {
+      agent.swept = true;
     })
   } as unknown as DurableObjectStub<ReactiveAgent>;
 
@@ -353,6 +361,7 @@ describe("HandleTaskWorkflow — the round loop", () => {
       "scan:0:1",
       "turn:1",
       "complete",
+      "sweep",
       "notify"
     ]);
     expect(agent.saved?.status.state).toBe("completed");
@@ -389,7 +398,7 @@ describe("HandleTaskWorkflow — the round loop", () => {
 
     await runHandleTask(params(), step);
 
-    expect(names).toEqual(["working", "turn:0", "complete", "notify"]);
+    expect(names).toEqual(["working", "turn:0", "complete", "sweep", "notify"]);
     expect(agent.executed).toEqual([]);
     expect(agent.turns).toEqual([
       { round: 0, allowControl: true, decision: "replied" }
@@ -421,6 +430,7 @@ describe("HandleTaskWorkflow — the round loop", () => {
       "scan:1:1",
       "turn:2",
       "complete",
+      "sweep",
       "notify"
     ]);
     expect(agent.saved?.status.state).toBe("completed");
@@ -596,6 +606,7 @@ describe("HandleTaskWorkflow — DAG execution", () => {
       "scan:0:3",
       "turn:1",
       "complete",
+      "sweep",
       "notify"
     ]);
   });
@@ -719,7 +730,7 @@ describe("HandleTaskWorkflow — failure delivery", () => {
     await runHandleTask(params(), step);
 
     // No DAG, no second round — straight to failed delivery.
-    expect(names).toEqual(["working", "turn:0", "complete", "notify"]);
+    expect(names).toEqual(["working", "turn:0", "complete", "sweep", "notify"]);
     expect(agent.turns).toHaveLength(1);
 
     const body = bodyOf(captured);
@@ -892,6 +903,7 @@ describe("HandleTaskWorkflow — replay", () => {
       "scan:0:2",
       "turn:1",
       "complete",
+      "sweep",
       "notify"
     ]);
   });

@@ -11,7 +11,12 @@ import {
   signCallbackJwt
 } from "@/a2a/notify";
 import { AgentDB } from "@/db/db";
-import { createModelPair, embedTexts, type ModelPair } from "@/agent/model";
+import {
+  createModelPair,
+  embedTexts,
+  type GatewayMetadata,
+  type ModelPair
+} from "@/agent/model";
 import { callerContext, soulPrompt } from "@/agent/prompt";
 import { buildTools } from "@/agent/tools";
 import { archiveMessages } from "@/agent/recall";
@@ -136,8 +141,16 @@ export class ReactiveAgent extends Agent<Env> {
     this.db.subtasks.cleanup();
   }
 
-  private modelPair(): ModelPair {
-    return this.modelsOverride ?? (this.models ??= createModelPair());
+  /**
+   * The main agent's primary/fallback pair. With `metadata` it builds a fresh
+   * pair carrying that AI Gateway correlation tag (so `cf ai` ties the call to
+   * its Task/round); without it — the Session's own compaction model — it reuses
+   * a memoized default. A test `modelsOverride` always wins.
+   */
+  private modelPair(metadata?: GatewayMetadata): ModelPair {
+    if (this.modelsOverride) return this.modelsOverride;
+    if (!metadata) return (this.models ??= createModelPair());
+    return createModelPair({ metadata });
   }
 
   /**
@@ -353,7 +366,7 @@ export class ReactiveAgent extends Agent<Env> {
       allowControl,
       systemSuffix: callerContext(identity),
       tools: await this.mainAgentTools(session, identity),
-      models: this.modelPair(),
+      models: this.modelPair({ taskId, round }),
       branches: this.compositionBranches(taskId),
       onContent: push ? this.streamWorking(push, round) : undefined
     });
@@ -493,7 +506,11 @@ export class ReactiveAgent extends Agent<Env> {
    * - A terminal row short-circuits: the result is already durable.
    * - A **fresh** execution deletes any stale child first.
    * - An **ambiguous retry** (row already `running`) must *not* delete the child.
-   * - The child is deleted **only after** its terminal result is copied here.
+   * - A **successful** chunk does *not* delete its child here — deletion is
+   *   deferred to a single post-delivery {@link sweepTaskChildren}, so a facet is
+   *   never aborted in the same tick its RPC returned (telemetry would mis-record
+   *   that as a failure). Invariant #7's ordering still holds: the result is copied
+   *   into the parent before any delete, which now happens strictly later.
    *
    * Throws on a transient fault (the step retries and the child resumes from its
    * checkpoint) and on scheduler-invariant violations — both are bugs, not
@@ -552,13 +569,40 @@ export class ReactiveAgent extends Agent<Env> {
       return { done: true, status: current.status, progress: outcome.progress };
     }
 
-    // Only now is the result durable in the parent — the child is free to go.
-    await this.deleteSubAgent(RecipeSubagent, name);
+    // The result is durable in the parent now, but the child is **not** deleted
+    // here. `deleteSubAgent` aborts the facet, and aborting it in the same tick
+    // this `executeChunk` RPC returned stamps that already-successful invocation
+    // `outcome:exception` in telemetry — a false-positive error on every
+    // completed Subtask. The parent sweeps all of a Task's children once, after
+    // delivery, when every `execute` step has unwound — see {@link sweepTaskChildren}.
     return {
       done: true,
       status: this.requireSubtask(id).status,
       progress: outcome.progress
     };
+  }
+
+  /**
+   * Delete every managed child this Task created — called **once**, from the
+   * Workflow's delivery step, after the Task is terminal.
+   *
+   * Per-Subtask deletion is deferred to here rather than run right after each
+   * successful chunk ({@link executeSubtaskChunk}) because `deleteSubAgent` aborts
+   * the facet: aborting a child in the same tick its `executeChunk` RPC returned
+   * records that already-successful invocation as `outcome:exception`, which is
+   * pure false-positive error noise (one per completed Subtask). By delivery every
+   * `execute` step has unwound, so these deletes hit **idle** facets and record
+   * nothing. Best-effort and idempotent — a name with no live facet is a silent
+   * no-op — so a Workflow replay of the sweep step is safe.
+   *
+   * Cancellation paths do their own child cleanup ({@link cancelPendingSubtasks},
+   * the cancel branches in {@link executeSubtaskChunk}/{@link prepareChunk}), so a
+   * canceled Task that never reaches delivery does not leak.
+   */
+  async sweepTaskChildren(taskId: string): Promise<void> {
+    for (const subtask of this.db.subtasks.list(taskId)) {
+      await this.deleteChildQuietly(subagentName(taskId, subtask.id));
+    }
   }
 
   /**

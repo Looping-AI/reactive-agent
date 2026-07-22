@@ -79,6 +79,10 @@ web_modules/
 .env.production.local
 .env.local
 
+# Cloudflare API credentials for scripts/cf.mjs (kept out of wrangler's dotenv
+# auto-load path so it never overrides deploy auth)
+.cf.env
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache

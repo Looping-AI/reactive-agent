@@ -732,6 +732,30 @@ describe("runTurn — delegating", () => {
     );
     expect(streamed).toEqual([{ text: "checking something", index: 0 }]);
   });
+
+  it("does not stream the delegate step's own text (it is the milestone ack)", async () => {
+    // Regression: the model narrated its acknowledgment as visible text in the
+    // same step it called `delegate`. That step is `finishReason:"tool-calls"`,
+    // so it used to be streamed as intermediate content *and* re-posted as the
+    // round's `ack:<round>` milestone — the gateway saw two ids and double-posted.
+    const streamed: Array<{ text: string; index: number }> = [];
+    const { outcome } = await run(
+      mockModel({
+        text: "Round 2 done! Now launching Round 3.",
+        toolCall: {
+          toolName: DELEGATE_TOOL_NAME,
+          input: proposal({ reply: "Round 2 done! Now launching Round 3." })
+        }
+      }),
+      {
+        onContent: (text, index) => {
+          streamed.push({ text, index });
+        }
+      }
+    );
+    expect(outcome.status).toBe("delegated");
+    expect(streamed).toEqual([]);
+  });
 });
 
 describe("runTurn — the final round", () => {
