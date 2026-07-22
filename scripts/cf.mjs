@@ -100,8 +100,7 @@ function parseFlags(args, { bool = [], value = [] } = {}) {
       const v = args[++i];
       if (v === undefined) die(`missing value for ${a}`);
       flags[key] = v;
-    }
-    else if (a.startsWith("-")) die(`unknown flag: ${a}`);
+    } else if (a.startsWith("-")) die(`unknown flag: ${a}`);
     else pos.push(a);
   }
   return { flags, pos };
@@ -169,14 +168,7 @@ async function telemetryQuery({ from, to, filters, limit }) {
 async function cmdLogs(args) {
   const { flags } = parseFlags(args, {
     bool: ["--json", "--raw"],
-    value: [
-      "--since",
-      "--worker",
-      "--service",
-      "--level",
-      "--grep",
-      "--limit"
-    ]
+    value: ["--since", "--worker", "--service", "--level", "--grep", "--limit"]
   });
   const sinceLabel = flags.since ?? "1h";
   const to = Date.now();
