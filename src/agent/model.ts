@@ -48,10 +48,7 @@ export async function embedTexts(texts: string[]): Promise<number[][]> {
  * `{ taskId, subtaskId }` (a chunk) makes `cf ai` correlation exact. Values are
  * limited to the gateway's accepted scalar set.
  */
-export type GatewayMetadata = Record<
-  string,
-  number | string | boolean | null | bigint
->;
+export type GatewayMetadata = Record<string, number | string | boolean>;
 
 export interface ModelOverrides {
   model?: LanguageModel; // test override for the primary
