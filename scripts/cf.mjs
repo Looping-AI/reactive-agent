@@ -96,7 +96,11 @@ function parseFlags(args, { bool = [], value = [] } = {}) {
     const a = args[i];
     const key = a.replace(/^--?/, "");
     if (bool.includes(a)) flags[key] = true;
-    else if (value.includes(a)) flags[key] = args[++i];
+    else if (value.includes(a)) {
+      const v = args[++i];
+      if (v === undefined) die(`missing value for ${a}`);
+      flags[key] = v;
+    }
     else if (a.startsWith("-")) die(`unknown flag: ${a}`);
     else pos.push(a);
   }
