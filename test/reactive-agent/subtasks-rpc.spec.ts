@@ -458,7 +458,7 @@ describe("executeSubtaskChunk — happy path and lifecycle ordering", () => {
     });
   });
 
-  it("deletes the child only after the result is durable", async () => {
+  it("resets any stale child before running, and defers the post-success delete", async () => {
     await runInDurableObject(freshStub("exec-order"), async (instance) => {
       const { rows, db } = seed(instance, [draft()]);
       const { executeSpy, deleteSubAgent } = stubChild(
@@ -469,13 +469,41 @@ describe("executeSubtaskChunk — happy path and lifecycle ordering", () => {
 
       await instance.executeSubtaskChunk(rows[0].id, 0);
 
-      // Fresh execution resets stale state first, then persists, then deletes.
+      // A fresh execution resets any stale child first — exactly one delete, and
+      // it happens before the child runs.
+      expect(deleteSubAgent).toHaveBeenCalledTimes(1);
       expect(deleteSubAgent.mock.invocationCallOrder[0]).toBeLessThan(
         executeSpy.mock.invocationCallOrder[0]
       );
-      expect(complete.mock.invocationCallOrder[0]).toBeLessThan(
-        deleteSubAgent.mock.invocationCallOrder[1]
-      );
+      // The result is recorded, but the child is NOT deleted again here: the
+      // post-success delete is deferred to sweepTaskChildren so a facet is never
+      // aborted in the same tick its executeChunk RPC returned.
+      expect(complete).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("sweepTaskChildren deletes one child per subtask, by name", async () => {
+    await runInDurableObject(freshStub("exec-sweep"), async (instance) => {
+      const { rows } = seed(instance, [
+        draft({ localKey: "a" }),
+        draft({ localKey: "b" })
+      ]);
+      const { deleteSubAgent } = stubChild(instance, async () => OK);
+
+      await instance.executeSubtaskChunk(rows[0].id, 0);
+      await instance.executeSubtaskChunk(rows[1].id, 0);
+      // Only the two fresh-claim stale-resets so far — no post-success deletes.
+      const beforeSweep = deleteSubAgent.mock.calls.length;
+
+      await instance.sweepTaskChildren(TASK_ID);
+
+      const sweptNames = deleteSubAgent.mock.calls
+        .slice(beforeSweep)
+        .map((c) => c[1]);
+      expect(sweptNames).toEqual([
+        subagentName(TASK_ID, rows[0].id),
+        subagentName(TASK_ID, rows[1].id)
+      ]);
     });
   });
 
@@ -576,10 +604,11 @@ describe("executeSubtaskChunk — retry and recovery", () => {
       await instance.executeSubtaskChunk(rows[0].id, 0);
 
       // The child may hold the cached terminal result — deleting it pre-execution
-      // would throw that away and force a re-inference.
-      expect(deleteSubAgent.mock.invocationCallOrder[0]).toBeGreaterThan(
-        executeSpy.mock.invocationCallOrder[0]
-      );
+      // would throw that away and force a re-inference. An ambiguous retry claims
+      // no fresh row, so no stale-reset delete fires; and the post-success delete
+      // is deferred to sweepTaskChildren — so nothing is deleted here at all.
+      expect(executeSpy).toHaveBeenCalledOnce();
+      expect(deleteSubAgent).not.toHaveBeenCalled();
     });
   });
 
@@ -976,7 +1005,7 @@ describe("failSubtask", () => {
 });
 
 describe("executeSubtaskChunk — real facet integration", () => {
-  it("records a terminal failure and leaves no child behind", async () => {
+  it("records a terminal failure and sweeps the child at task end", async () => {
     await runInDurableObject(freshStub("exec-real"), async (instance) => {
       const { rows } = seed(instance, [draft()]);
 
@@ -987,7 +1016,17 @@ describe("executeSubtaskChunk — real facet integration", () => {
 
       expect(done.status).toBe("failed");
       expect(done.error).toContain("recipe exhausted");
-      // The child was deleted only after the result was durably copied here.
+
+      // The child is NOT deleted right after the chunk: deleting it in the same
+      // tick its executeChunk RPC returned would abort a facet whose event is
+      // still open, which telemetry mis-records as a failure. It lingers until
+      // the post-delivery sweep.
+      expect(
+        instance.hasSubAgent(RecipeSubagent, subagentName(TASK_ID, rows[0].id))
+      ).toBe(true);
+
+      // The sweep, running when no executeChunk RPC is open, wipes it cleanly.
+      await instance.sweepTaskChildren(TASK_ID);
       expect(instance.listSubAgents(RecipeSubagent)).toEqual([]);
       expect(
         instance.hasSubAgent(RecipeSubagent, subagentName(TASK_ID, rows[0].id))

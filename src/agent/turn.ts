@@ -420,7 +420,7 @@ async function attempt(
       // per-model backoff (it would only add latency and duplicate the fallback).
       maxRetries: 0,
       onStepFinish: args.onContent
-        ? buildIntermediateContentHandler(args.onContent)
+        ? buildIntermediateContentHandler(args.onContent, [DELEGATE_TOOL_NAME])
         : undefined
     });
 
@@ -505,6 +505,7 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
       errors.push(outcome.error);
       diagnostics.push(`${slot} (${modelId}): ${String(outcome.error)}`);
       console.warn("[turn] model attempt failed", {
+        taskId,
         round,
         model: modelId,
         error: String(outcome.error)
@@ -536,6 +537,7 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
       errors.push(error);
       diagnostics.push(`${slot} (${modelId}): ${String(error)}`);
       console.warn("[turn] invalid delegation", {
+        taskId,
         round,
         model: modelId,
         error: String(error)

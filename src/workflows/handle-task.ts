@@ -372,6 +372,15 @@ async function deliver(
   });
   if (!task) return;
 
+  // Sweep this Task's managed children now that it is terminal and every `execute`
+  // step has unwound. Deleting them here — rather than right after each successful
+  // chunk — keeps `deleteSubAgent`'s facet-abort from landing on a still-open
+  // `executeChunk` RPC, which telemetry mis-records as a failure. Best-effort and
+  // idempotent (see {@link stub.sweepTaskChildren}), so it is safe on replay.
+  await step.do("sweep", async () => {
+    await stub.sweepTaskChildren(p.taskId);
+  });
+
   // Notify the gateway: a card-key-signed callback POST. Retried by the step on a
   // non-2xx; the terminal messageId is deterministic and the gateway is
   // idempotent/single-use, so retries are safe. If it ultimately fails, the
