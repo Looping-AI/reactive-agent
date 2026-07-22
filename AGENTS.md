@@ -31,6 +31,19 @@ npx drizzle-kit generate  # generate a new migration after editing src/db/schema
 
 **Types come from a committed, generated [worker-configuration.d.ts](worker-configuration.d.ts)** — `wrangler types` produces full _runtime_ types tailored to `wrangler.jsonc`'s compat date / flags / bindings. This file (plus `@types/node`, because `nodejs_compat` is on) is the source of the ambient Workers globals (`Ai`, `DurableObjectNamespace`, `ExportedHandler`, `Request`, …); it replaced `@cloudflare/workers-types`. It's **committed to git** and referenced from `tsconfig.json` / `test/tsconfig.json` `types`. `npm run check` leads with `wrangler types --check` as a drift guard, so after any `wrangler.jsonc` binding change or a wrangler/workerd bump (incl. dependabot's cloudflare group), run `npm run types` and **commit the regenerated file** or the gate fails.
 
+## Tailing production logs
+
+Trigger phrase **"start logs tailing please"** → live-tail the deployed Worker and help fix any errors/warnings seen:
+
+```sh
+npx wrangler tail looping-reactive-agent --format pretty   # add --status error to focus; --format json to parse
+```
+
+- Uses the existing `wrangler login` (`workers_tail:read`) — **no extra credentials**.
+- **Live only**: shows new events, not errors already logged — reproduce the failing call (or wait for traffic) while tailing. The auth'd A2A JSON-RPC `POST` needs a gateway-signed JWT (can't be faked locally); the two `.well-known` `GET`s (`/jwks.json`, `/agent-card.json`) are unauth'd health checks.
+- **Historical** logs need a scoped `CLOUDFLARE_API_TOKEN` (Account → Workers Observability → Read) or the Observability MCP server — wrangler's OAuth has **no** logs-read scope, so re-auth won't help.
+- Then: group the errors, map each to its source in `src/`, and propose/apply fixes.
+
 ## Layout
 
 | Path                                                             | Role                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
