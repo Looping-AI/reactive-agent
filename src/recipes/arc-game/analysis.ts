@@ -363,6 +363,12 @@ export function renderGrid(grid: number[][]): string {
  * A localized view: a `radius`-cell square around (centerRow, centerCol), with
  * **absolute** row and column labels. The labels are what make the view usable —
  * an unlabeled block cannot be mapped back to a coordinate to click.
+ *
+ * The window is **clipped** on every side, never padded, which is what makes the
+ * header's `cols` anchor true: character `i` of a body line is column
+ * `firstCol + i`. Padding off-grid columns with spaces instead would shift that
+ * mapping by up to `radius` near the left edge, and unlike {@link renderGrid}
+ * this view carries no column ruler — the header is the only thing to count from.
  */
 export function renderRegion(
   grid: number[][],
@@ -378,26 +384,23 @@ export function renderRegion(
   const gutter = String(lastRow).length;
   const window: number[][] = [];
   const body: string[] = [];
+  // Widest extent actually drawn, so the header says where the window ends as
+  // well as where it starts. Each row is clipped on its own in case a frame
+  // arrives ragged: that shortens a line, it never shifts one.
+  let lastCol = firstCol;
   for (let r = firstRow; r <= lastRow; r++) {
-    let line = "";
-    const cells: number[] = [];
-    for (let c = centerCol - radius; c <= centerCol + radius; c++) {
-      // Off-grid columns render as a space, so the window keeps its shape and the
-      // labels stay truthful about which column each character is.
-      if (c < 0 || c >= grid[r].length) {
-        line += " ";
-      } else {
-        line += colorChar(grid[r][c]);
-        cells.push(grid[r][c]);
-      }
-    }
+    const end = Math.min(grid[r].length - 1, centerCol + radius);
+    const cells = grid[r].slice(firstCol, end + 1);
     window.push(cells);
-    body.push(`${String(r).padStart(gutter)} | ${line}`);
+    body.push(
+      `${String(r).padStart(gutter)} | ${cells.map(colorChar).join("")}`
+    );
+    lastCol = Math.max(lastCol, end);
   }
 
   return [
     renderLegend(window),
-    `rows ${firstRow}-${lastRow}, cols from ${firstCol} ` +
+    `rows ${firstRow}-${lastRow}, cols ${firstCol}-${lastCol} ` +
       `(centered on row ${centerRow}, col ${centerCol})`,
     ...body
   ].join("\n");

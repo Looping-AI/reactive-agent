@@ -343,14 +343,29 @@ describe("renderGrid", () => {
 
 describe("renderRegion", () => {
   it("labels absolute rows and columns, clipping at the edges", () => {
-    // Center (row 0, col 0), radius 1 → rows 0..1, cols -1..1. Column -1 is off
-    // the grid (a space); the labels are absolute, so a cell here can be clicked.
+    // Center (row 0, col 0), radius 1 → the window wants cols -1..1 and rows
+    // -1..1, and is clipped to the board on both. Nothing is padded: the first
+    // character of each line is column 0, exactly as the header says.
     expect(renderRegion(GRID, 0, 0, 1)).toBe(
       [
         "colors: 0=white 1=off-white 2=neutral-light",
-        "rows 0-1, cols from 0 (centered on row 0, col 0)",
-        "0 |  01",
-        "1 |  02"
+        "rows 0-1, cols 0-1 (centered on row 0, col 0)",
+        "0 | 01",
+        "1 | 02"
+      ].join("\n")
+    );
+  });
+
+  it("anchors the first character at the labeled column, not at the center", () => {
+    // The bottom-right corner: clipped on the far side, and starting at col 1.
+    // A leading pad here would make the header's `cols 1-2` a lie and send a
+    // click one column off.
+    expect(renderRegion(GRID, 2, 2, 1)).toBe(
+      [
+        "colors: 0=white 1=off-white 2=neutral-light 3=neutral",
+        "rows 1-2, cols 1-2 (centered on row 2, col 2)",
+        "1 | 21",
+        "2 | 30"
       ].join("\n")
     );
   });
@@ -361,7 +376,7 @@ describe("renderRegion", () => {
     );
     const lines = renderRegion(grid, 40, 30, 2).split("\n");
     expect(lines[1]).toBe(
-      "rows 38-42, cols from 28 (centered on row 40, col 30)"
+      "rows 38-42, cols 28-32 (centered on row 40, col 30)"
     );
     expect(lines.slice(2).map((l) => l.split(" | ")[0])).toEqual([
       "38",
