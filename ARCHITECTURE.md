@@ -567,7 +567,11 @@ traffic. They are characteristics, not known bugs; none is a correctness hole.
    workspace before sending an action and clears it after. A crash in that window
    may leave a move that was sent but not recorded; on resume the tool annotates
    the anomaly ("may have been interrupted") rather than reconciling. This is an
-   accepted residual — at most one possibly-duplicated move per crash. Separately,
+   accepted residual — at most one possibly-duplicated move per crash. One
+   `arc_act` call may now carry a **sequence** of up to 8 actions, and that bound
+   still holds: a batch is not atomic, the intent is written and cleared per step,
+   so a crash mid-sequence exposes exactly the same one-move window as a crash
+   mid-action, with the steps before it already recorded. Separately,
    nothing auto-closes a scorecard any more: the main agent opens and closes them,
    so a card can be left open if it never gets around to closing one. That is
    deliberate (a subagent must not end a card it does not own, and one card spans

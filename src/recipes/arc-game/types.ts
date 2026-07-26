@@ -138,7 +138,7 @@ export interface PlaySummary {
 /**
  * Durable play session, persisted to the workspace at {@link ARC_SESSION_PATH}.
  * The single grid we render/diff is the LAST grid of the frame array (the current
- * board); we keep the previous one for change detection.
+ * board).
  *
  * One session file spans the whole execution, not one play: reaching WIN or
  * GAME_OVER no longer ends anything, so `arc_reset_game` may be called again to
@@ -163,8 +163,16 @@ export interface ArcSession {
   plays: PlaySummary[];
   /** Levels at which we have emitted a level-up progress note (per play). */
   levelsReported: number[];
-  lastFrame: number[][] | null;
-  prevFrame: number[][] | null;
+  /**
+   * The current board as bare hex rows (`serializeGrid`), not `number[][]`.
+   *
+   * The workspace pretty-prints its JSON, so a nested numeric array serializes to
+   * one integer per line — ~38 KB for a 64×64 board. Since the session is written
+   * twice per action (write-ahead intent, then the recorded result) and one
+   * `arc_act` call may now carry several actions, that adds up to hundreds of KB of
+   * SQLite per tool call. Hex rows are ~4 KB.
+   */
+  lastGridHex: string | null;
   /** Write-ahead intent: set before an action is sent, cleared after it returns. */
   pendingAction: { action: number; x?: number; y?: number } | null;
 }

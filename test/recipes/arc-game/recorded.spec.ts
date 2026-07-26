@@ -24,6 +24,7 @@ import { env } from "cloudflare:workers";
 import { buildArcGameTools } from "@/recipes/arc-game/tools";
 import { buildArcScorecardTools } from "@/recipes/arc-game/scorecard-tools";
 import { makeArcClient } from "@/recipes/arc-game/client";
+import { parseGrid } from "@/recipes/arc-game/analysis";
 import type { ArcSession } from "@/recipes/arc-game/types";
 import { ctx, callTool, memStore } from "./helpers";
 import { setupRecording } from "../../helpers/vcr-spec";
@@ -90,11 +91,15 @@ describe("arc (recorded real API)", () => {
       expect(session?.availableActions.length).toBeGreaterThan(0);
       expect(typeof session?.state).toBe("string");
 
-      // lastFrame is a 2-D grid of numbers (the parsed ARC frame).
-      const grid = session?.lastFrame;
-      expect(Array.isArray(grid)).toBe(true);
-      expect(Array.isArray(grid?.[0])).toBe(true);
-      expect(typeof grid?.[0]?.[0]).toBe("number");
+      // The board is stored as hex rows; parsing it back must yield the real
+      // ARC frame's 64×64 grid of color indices.
+      expect(typeof session?.lastGridHex).toBe("string");
+      const grid = parseGrid(session?.lastGridHex ?? "");
+      expect(grid).toHaveLength(64);
+      expect(grid[0]).toHaveLength(64);
+      expect(
+        grid.flat().every((c) => Number.isInteger(c) && c >= 0 && c < 16)
+      ).toBe(true);
 
       // 4. The main agent closes the card and gets the aggregate.
       const closed = await callTool(parent.arc_close_scorecard, {

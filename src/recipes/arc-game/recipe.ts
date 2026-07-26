@@ -16,7 +16,9 @@ export const ARC_GAME_TYPE = "arc-game";
  * - `chunkSoftMs` ends a chunk early on wall-clock, keeping every step short.
  * - `historyWindow` is small: the model keeps only recent turns in context and
  *   persists durable state (rules, plans) to the workspace instead (see the
- *   memory discipline in {@link ARC_GAME_SOUL}).
+ *   memory discipline in {@link ARC_GAME_SOUL}). Note it counts *assistant
+ *   messages* — one per tool call, not one per game action — so a play spends it
+ *   several times faster than the number suggests.
  * - `reportMetrics` appends the turns/model-calls/wall-clock footer the user
  *   asked to see.
  *
@@ -41,7 +43,10 @@ export const ARC_GAME_RECIPE: ResolvedRecipe = {
     turnsPerChunk: 25,
     chunkSoftMs: 4 * 60_000
   },
-  historyWindow: 12,
+  // Counts assistant messages (tool calls), so an inspect + act + note cycle spends
+  // three or four of these per game action; 12 left the model unable to see more
+  // than a couple of moves back, which it answered by re-inspecting.
+  historyWindow: 24,
   reportMetrics: true
 };
 
