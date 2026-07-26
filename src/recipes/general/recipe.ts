@@ -14,7 +14,7 @@ export const GENERAL_TYPE = "general";
 
 /**
  * The general-purpose Recipe: the execution configuration for work that needs no
- * domain of its own, and the fallback for a Subtask type code no longer knows.
+ * domain of its own.
  *
  * Model ids and limits come from {@link file://../../config.ts} so it always
  * reflects the current configuration — there is no DB seed to go stale. It

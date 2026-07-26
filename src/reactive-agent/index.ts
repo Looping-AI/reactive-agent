@@ -663,20 +663,22 @@ export class ReactiveAgent extends Agent<Env> {
     }
 
     const dependencyResults = this.loadDependencyResults(subtask);
-    const recipe = resolveRecipeForType(subtask.type);
 
+    let recipe: ResolvedRecipe | undefined;
     let validated;
     try {
+      recipe = resolveRecipeForType(subtask.type);
       validated = validateRecipe(recipe);
     } catch (err) {
-      // A disabled or soul-less Recipe is a configuration bug, not a transient
-      // fault. Record it as a branch failure so the DAG's skip semantics apply to
-      // its dependents.
-      const message = `recipe ${recipe.key} unusable: ${String(err)}`;
-      this.db.subtasks.start(id, {
-        recipeId: recipe.key,
-        recipeVersion: recipe.version
-      });
+      // An unknown/retired type or a disabled/soul-less Recipe is a
+      // configuration bug, not a transient fault. Record it as a branch failure
+      // so the DAG's skip semantics apply to its dependents.
+      const recipeId = recipe?.key ?? subtask.type;
+      const recipeVersion = recipe?.version ?? 0;
+      const message = recipe
+        ? `recipe ${recipeId} unusable: ${String(err)}`
+        : `unknown subtask type "${subtask.type}": ${String(err)}`;
+      this.db.subtasks.start(id, { recipeId, recipeVersion });
       this.db.subtasks.fail(id, message);
       return { kind: "terminal", subtask: this.requireSubtask(id) };
     }

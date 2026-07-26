@@ -1,4 +1,4 @@
-import { FALLBACK_TYPE_SPEC, SUBTASK_TYPE_SPECS } from "@/recipes";
+import { SUBTASK_TYPE_SPECS } from "@/recipes";
 import type {
   ResolvedRecipe,
   SubtaskParams,
@@ -39,12 +39,15 @@ export function subtaskTypeSpec(type: string): SubtaskTypeSpec | null {
 }
 
 /**
- * Resolve a Subtask type to the Recipe it runs under. Unknown types fall back to
- * the {@link FALLBACK_TYPE_SPEC} recipe: the enum keeps them out of new delegations,
- * but rows persisted before a type was renamed or retired must still execute.
+ * Resolve a Subtask type to the Recipe it runs under. Throws
+ * {@link SubtaskParamsError} for an unknown or retired type — the delegate
+ * enum prevents the model from emitting one, so any unknown type reaching
+ * execution is a configuration bug and should fail terminally.
  */
 export function resolveRecipeForType(type: string): ResolvedRecipe {
-  return (subtaskTypeSpec(type) ?? FALLBACK_TYPE_SPEC).recipe;
+  const spec = subtaskTypeSpec(type);
+  if (!spec) throw new SubtaskParamsError(`unknown subtask type: ${type}`);
+  return spec.recipe;
 }
 
 /** A Subtask whose params do not satisfy its type's contract. */

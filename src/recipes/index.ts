@@ -15,11 +15,3 @@ export const SUBTASK_TYPE_SPECS: readonly SubtaskTypeSpec[] = [
   GENERAL_SPEC,
   ARC_GAME_SPEC
 ];
-
-/**
- * The type a Subtask falls back to when code no longer knows the one on its row.
- * The delegate enum keeps unknown types out of *new* delegations, but a row
- * persisted before a type was renamed or retired must still be executable, and
- * the general recipe is the only one that can run work it knows nothing about.
- */
-export const FALLBACK_TYPE_SPEC: SubtaskTypeSpec = GENERAL_SPEC;
