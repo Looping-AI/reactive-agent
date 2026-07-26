@@ -39,10 +39,16 @@ describe("the type set", () => {
     expect(resolveRecipeForType(ARC_GAME_TYPE)).toBe(ARC_GAME_RECIPE);
   });
 
-  it("falls back to the general Recipe for a type it no longer knows", () => {
-    // The enum keeps unknown types out of new delegations, but rows persisted
-    // before a type was renamed or retired must still be executable.
-    expect(resolveRecipeForType("retired-type")).toBe(GENERAL_RECIPE);
+  it("refuses to resolve a type it no longer knows", () => {
+    // The enum keeps unknown types out of new delegations, so a type reaching
+    // execution that we cannot resolve is a configuration bug: fail terminally
+    // rather than silently running it under some other domain's Recipe.
+    expect(() => resolveRecipeForType("retired-type")).toThrow(
+      SubtaskParamsError
+    );
+    expect(() => resolveRecipeForType("retired-type")).toThrow(
+      /unknown subtask type/
+    );
   });
 
   it("shows the model each type and how to obtain its params", () => {

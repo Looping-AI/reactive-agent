@@ -76,6 +76,7 @@ describe("soulPrompt", () => {
     expect(p).toContain("arc_close_scorecard");
     // The two rules no code path can enforce.
     expect(p).toContain("two different scorecards");
-    expect(p).toContain("once every play on it has finished");
+    expect(p).toContain("Reuse the same scorecard");
+    expect(p).toContain("do not close prematurely");
   });
 });
