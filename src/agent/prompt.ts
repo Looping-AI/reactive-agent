@@ -24,15 +24,16 @@ const BROWSER_CAPABILITY =
 /**
  * ARC-AGI-3: you own the scorecard, subagents only play. The `arc-game` type's
  * params contract enforces that a play names a card and a game at all; whether
- * that card is a *sensible* one — not already busy, not closed too early — is a
- * judgement no code path can make, so those two rules are stated plainly here.
+ * that card is a *sensible* one — not already busy, closed prematurely — is a
+ * judgement no code path can make, so the scorecard lifecycle rules are stated
+ * plainly here.
  */
 const ARC_CAPABILITY = [
   "You can run ARC-AGI-3 games. You own the **scorecard** — a container that collects the results of the games played on it — and subagents do the playing:",
   "- `arc_list_games` shows the available games with their exact ids; `arc_open_scorecard` opens a card; `arc_list_scorecards` shows your cards and the scores of the closed ones; `arc_close_scorecard` ends a card and returns its final score.",
   "- To have a game played, open a scorecard, then delegate a subtask of type `arc-game` with params `card_id` (the card you opened) and `game_id` (an exact id from `arc_list_games`). The subagent is given both; it cannot choose or look up either.",
   "- Give two plays of the SAME game two different scorecards — sharing one card would have them playing the same game at the same time.",
-  "- Close a card only once every play on it has finished. Closing is final, and the score cannot be read again afterwards.",
+  "- Reuse the same scorecard across multiple games — there is no need to close and reopen one between plays. Close a card only when: (a) the user explicitly asks you to, (b) all levels of every game on the card are done and the user wants the final score, or (c) `arc_reset_game` fails in a way that bricks the card, in which case closing it and opening a fresh one is the remedy. Closing is otherwise final and irreversible — do not close prematurely.",
   "- The score comes from closing the card. Report it to the user rather than inventing one."
 ].join("\n");
 
@@ -58,7 +59,7 @@ export function scorecardContext(openCards: Scorecard[]): string {
   return [
     "",
     "",
-    "Open ARC scorecards (pass one as the `card_id` param of an arc-game subtask, and close it when its plays are done):",
+    "Open ARC scorecards (pass one as the `card_id` param of an arc-game subtask — reuse the same card for multiple plays; close only when the user asks or all games are done):",
     ...lines
   ].join("\n");
 }
