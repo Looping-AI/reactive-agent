@@ -7,6 +7,7 @@ import * as schema from "@/db/schema";
 import dbMigrations from "@/db/migrations";
 import { makeTasks } from "@/db/models/tasks";
 import { makeSubtasks } from "@/db/models/subtasks";
+import { makeScorecards } from "@/db/models/scorecards";
 
 export type DB = DrizzleSqliteDODatabase<typeof schema>;
 
@@ -28,6 +29,7 @@ export class AgentDB {
   private readonly _ready: Promise<void>;
   private _tasks?: ReturnType<typeof makeTasks>;
   private _subtasks?: ReturnType<typeof makeSubtasks>;
+  private _scorecards?: ReturnType<typeof makeScorecards>;
 
   constructor(storage: DurableObjectStorage) {
     this.db = drizzle(storage, { schema });
@@ -44,5 +46,9 @@ export class AgentDB {
 
   get subtasks() {
     return (this._subtasks ??= makeSubtasks(this.db));
+  }
+
+  get scorecards() {
+    return (this._scorecards ??= makeScorecards(this.db));
   }
 }

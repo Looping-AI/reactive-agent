@@ -4,6 +4,35 @@ import type { RecallDeps, ToolFamilyContext } from "@/agent/tools";
 import type { RecallIndex } from "@/agent/recall";
 import type { WorkspaceHandle } from "@/subagent/workspace";
 import type { QuickActionBinding } from "agents/browser";
+import type { ArcScorecardDeps } from "@/recipes/arc-game/scorecard-tools";
+import type { ArcClient } from "@/recipes/arc-game/client";
+import type { SubtaskParams } from "@/recipes/types";
+
+/**
+ * ARC deps whose store and client both throw: registration assertions never run
+ * a handler, and a throw makes an accidental call obvious.
+ */
+function arcScorecardDeps(): ArcScorecardDeps {
+  const unused = () => {
+    throw new Error("not called in registration tests");
+  };
+  return {
+    store: {
+      open: unused,
+      get: unused,
+      listOpen: unused,
+      listRecent: unused,
+      close: unused
+    },
+    client: {
+      listGames: unused,
+      openScorecard: unused,
+      closeScorecard: unused,
+      reset: unused,
+      act: unused
+    } as unknown as ArcClient
+  };
+}
 
 /** Recall deps backed by a fake index returning one canned match. */
 function recallDeps(hasArchive: boolean): RecallDeps {
@@ -66,17 +95,17 @@ describe("buildTools", () => {
   });
 
   it("omits recall until this caller has compacted at least once", () => {
-    const tools = buildTools(recallDeps(false));
+    const tools = buildTools({ recall: recallDeps(false) });
     expect(Object.keys(tools)).toEqual([]);
   });
 
   it("adds the recall tool once an archive exists", () => {
-    const tools = buildTools(recallDeps(true));
+    const tools = buildTools({ recall: recallDeps(true) });
     expect(Object.keys(tools).sort()).toEqual(["recall"]);
   });
 
   it("adds the browser tools when a Browser Rendering binding is present", () => {
-    const tools = buildTools(undefined, browserStub);
+    const tools = buildTools({ browser: browserStub });
     expect(Object.keys(tools).sort()).toEqual([
       "browser_extract",
       "browser_links",
@@ -85,9 +114,34 @@ describe("buildTools", () => {
     ]);
   });
 
-  it("adds both browser and recall tools together", () => {
-    const tools = buildTools(recallDeps(true), browserStub);
+  it("adds the scorecard lifecycle tools when an ARC store is supplied", () => {
+    const tools = buildTools({ arcScorecard: arcScorecardDeps() });
     expect(Object.keys(tools).sort()).toEqual([
+      "arc_close_scorecard",
+      "arc_list_games",
+      "arc_list_scorecards",
+      "arc_open_scorecard"
+    ]);
+  });
+
+  it("never gives the main agent the tools that play a game", () => {
+    const tools = buildTools({ arcScorecard: arcScorecardDeps() });
+    expect(tools.arc_reset_game).toBeUndefined();
+    expect(tools.arc_act).toBeUndefined();
+    expect(tools.arc_inspect).toBeUndefined();
+  });
+
+  it("adds every family's tools together", () => {
+    const tools = buildTools({
+      recall: recallDeps(true),
+      browser: browserStub,
+      arcScorecard: arcScorecardDeps()
+    });
+    expect(Object.keys(tools).sort()).toEqual([
+      "arc_close_scorecard",
+      "arc_list_games",
+      "arc_list_scorecards",
+      "arc_open_scorecard",
       "browser_extract",
       "browser_links",
       "browser_markdown",
@@ -109,11 +163,16 @@ const fakeWorkspace: WorkspaceHandle = {
 };
 
 /** Minimal tool-family context; only the fields a given family reads matter. */
-function ctx(over: { browser?: QuickActionBinding } = {}): ToolFamilyContext {
+function ctx(
+  over: { browser?: QuickActionBinding; params?: SubtaskParams } = {}
+): ToolFamilyContext {
   return {
     env: { BROWSER: over.browser, ARC_API_KEY: "test-key" } as unknown as Env,
     workspace: fakeWorkspace,
-    emitProgress: () => {}
+    emitProgress: () => {},
+    // The `arc-game` type declares both of these; the family is gated on them.
+    params: over.params ?? { card_id: "card-1", game_id: "ls20-abc" },
+    runtime: {}
   };
 }
 
@@ -157,14 +216,41 @@ describe("buildRecipeTools", () => {
     ]);
   });
 
-  it("builds the arc-game tools with an abort hook", () => {
+  it("builds the arc-game play tools, and no scorecard tools", () => {
     const built = buildRecipeTools(["arc-game"], ctx());
     expect(Object.keys(built.tools).sort()).toEqual([
       "arc_act",
       "arc_inspect",
-      "arc_start_game"
+      "arc_reset_game"
     ]);
-    expect(typeof built.abort).toBe("function");
+  });
+
+  it("gives a subagent no way to open or close a scorecard", () => {
+    const { tools } = buildRecipeTools(["arc-game"], ctx());
+    expect(tools.arc_open_scorecard).toBeUndefined();
+    expect(tools.arc_close_scorecard).toBeUndefined();
+    expect(tools.arc_list_scorecards).toBeUndefined();
+    expect(tools.arc_list_games).toBeUndefined();
+  });
+
+  it("withholds the play tools when the type's params are missing", () => {
+    // A play with no card and no game cannot succeed; offering the tools anyway
+    // would let a subagent burn its whole turn budget discovering that.
+    const { tools } = buildRecipeTools(["arc-game"], ctx({ params: {} }));
+    expect(Object.keys(tools)).toEqual([]);
+  });
+
+  it("withholds them when only one of the two params is present", () => {
+    const { tools } = buildRecipeTools(
+      ["arc-game"],
+      ctx({ params: { card_id: "card-1" } })
+    );
+    expect(Object.keys(tools)).toEqual([]);
+  });
+
+  it("supplies no abort hook — no family holds external state today", () => {
+    const built = buildRecipeTools(["arc-game", "workspace"], ctx());
+    expect(built.abort).toBeUndefined();
   });
 
   it("builds an empty toolset with no abort for no families", () => {

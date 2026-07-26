@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
 import type { GatewayIdentity } from "@/a2a/verify";
+import type { Scorecard } from "@/recipes/arc-game/types";
 
 /**
  * The agent's soul — its frozen identity + operating rules. Kept as an array of
@@ -20,13 +21,46 @@ export const SOUL: string[] = [
 const BROWSER_CAPABILITY =
   "You can read live web pages with the `browser_*` tools — use `browser_markdown` to read a page and `browser_extract` to pull out specific fields.";
 
+/**
+ * ARC-AGI-3: you own the scorecard, subagents only play. The `arc-game` type's
+ * params contract enforces that a play names a card and a game at all; whether
+ * that card is a *sensible* one — not already busy, not closed too early — is a
+ * judgement no code path can make, so those two rules are stated plainly here.
+ */
+const ARC_CAPABILITY = [
+  "You can run ARC-AGI-3 games. You own the **scorecard** — a container that collects the results of the games played on it — and subagents do the playing:",
+  "- `arc_list_games` shows the available games with their exact ids; `arc_open_scorecard` opens a card; `arc_list_scorecards` shows your cards and the scores of the closed ones; `arc_close_scorecard` ends a card and returns its final score.",
+  "- To have a game played, open a scorecard, then delegate a subtask of type `arc-game` with params `card_id` (the card you opened) and `game_id` (an exact id from `arc_list_games`). The subagent is given both; it cannot choose or look up either.",
+  "- Give two plays of the SAME game two different scorecards — sharing one card would have them playing the same game at the same time.",
+  "- Close a card only once every play on it has finished. Closing is final, and the score cannot be read again afterwards.",
+  "- The score comes from closing the card. Report it to the user rather than inventing one."
+].join("\n");
+
 /** The frozen soul as a single system-prompt string. */
 export function soulPrompt(): string {
   const lines = [...SOUL];
   if (env.BROWSER) {
     lines.push(BROWSER_CAPABILITY);
   }
+  lines.push(ARC_CAPABILITY);
   return lines.join("\n");
+}
+
+/**
+ * Per-request system-prompt suffix listing the scorecards still open, so the
+ * model chooses a card from what it can already see instead of having to call
+ * `arc_list_scorecards` first. Empty when none are open — an agent that has never
+ * played a game should not carry ARC bookkeeping in every prompt.
+ */
+export function scorecardContext(openCards: Scorecard[]): string {
+  if (openCards.length === 0) return "";
+  const lines = openCards.map((card) => `- ${card.cardId}`);
+  return [
+    "",
+    "",
+    "Open ARC scorecards (pass one as the `card_id` param of an arc-game subtask, and close it when its plays are done):",
+    ...lines
+  ].join("\n");
 }
 
 /**

@@ -9,7 +9,7 @@ import {
   roundAckMessageId,
   sessionText
 } from "@/agent/history";
-import { DEFAULT_RECIPE } from "@/agent/subtasks/registry";
+import { GENERAL_RECIPE } from "@/recipes/general/recipe";
 import { DELEGATE_TOOL_NAME } from "@/agent/subtasks/delegate";
 import type { AgentDB } from "@/db/db";
 import type {
@@ -44,7 +44,7 @@ function delegates(subtasks?: unknown[]): MockStep {
         subtasks: subtasks ?? [
           {
             localKey: "research",
-            type: "research",
+            type: "general",
             prompt: "Research the thing",
             referenceIndexes: [1],
             dependsOn: []
@@ -69,10 +69,11 @@ async function scanNodes(instance: ReactiveAgent, round = 0, taskId = TASK_ID) {
 function draft(over: Partial<SubtaskDraft> = {}): SubtaskDraft {
   return {
     localKey: "a",
-    type: "research",
+    type: "general",
     prompt: "do the thing",
     references: [],
     dependsOn: [],
+    params: {},
     ...over
   };
 }
@@ -183,7 +184,7 @@ describe("runTaskTurn — delegating", () => {
       if (result.status !== "delegated") return;
       expect(result.reply).toBe("On it.");
       expect(result.subtasks).toHaveLength(1);
-      expect(result.subtasks[0].type).toBe("research");
+      expect(result.subtasks[0].type).toBe("general");
       expect(result.subtasks[0].status).toBe("pending");
       expect(result.subtasks[0].round).toBe(0);
       // The model selected index 1 — the inbound turn, snapshotted verbatim.
@@ -261,14 +262,14 @@ describe("runTaskTurn — delegating", () => {
           delegates([
             {
               localKey: "research",
-              type: "research",
+              type: "general",
               prompt: "research",
               referenceIndexes: [1],
               dependsOn: []
             },
             {
               localKey: "draft",
-              type: "draft",
+              type: "general",
               prompt: "draft it",
               referenceIndexes: [],
               dependsOn: ["research"]
@@ -289,7 +290,7 @@ describe("runTaskTurn — delegating", () => {
       instance.modelsOverride = pairOf(
         mockModel(
           delegates([
-            { localKey: "more", type: "research", prompt: "dig", dependsOn: [] }
+            { localKey: "more", type: "general", prompt: "dig", dependsOn: [] }
           ])
         )
       );
@@ -437,8 +438,8 @@ describe("executeSubtaskChunk — happy path and lifecycle ordering", () => {
       stubChild(instance, async () => OK);
 
       const done = await exec(instance, rows[0].id);
-      expect(done.recipeId).toBe(DEFAULT_RECIPE.key);
-      expect(done.recipeVersion).toBe(DEFAULT_RECIPE.version);
+      expect(done.recipeId).toBe(GENERAL_RECIPE.key);
+      expect(done.recipeVersion).toBe(GENERAL_RECIPE.version);
     });
   });
 
@@ -453,7 +454,7 @@ describe("executeSubtaskChunk — happy path and lifecycle ordering", () => {
       const request = executeSpy.mock.calls[0][0];
       expect(request.prompt).toBe("do the thing");
       expect(request.references).toEqual(references);
-      expect(request.recipe.key).toBe(DEFAULT_RECIPE.key);
+      expect(request.recipe.key).toBe(GENERAL_RECIPE.key);
       expect(request.dependencyResults).toEqual([]);
     });
   });
@@ -510,8 +511,8 @@ describe("executeSubtaskChunk — happy path and lifecycle ordering", () => {
   it("passes completed dependency results in ordinal order", async () => {
     await runInDurableObject(freshStub("exec-deps"), async (instance) => {
       const { rows, db } = seed(instance, [
-        draft({ localKey: "a", type: "research" }),
-        draft({ localKey: "b", type: "research" }),
+        draft({ localKey: "a", type: "general" }),
+        draft({ localKey: "b", type: "general" }),
         draft({ localKey: "c", dependsOn: ["a", "b"] })
       ]);
       for (const i of [0, 1]) {

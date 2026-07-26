@@ -25,6 +25,7 @@ const resultPartSchema = z.object({
 const referencesSchema = z.array(referenceSchema);
 const resultPartsSchema = z.array(resultPartSchema);
 const dependsOnSchema = z.array(z.number().int());
+const paramsSchema = z.record(z.string(), z.string());
 
 type SubtaskRow = typeof subtasks.$inferSelect;
 
@@ -52,6 +53,7 @@ export function makeSubtasks(db: DB) {
       JSON.parse(row.referencesJson)
     ) as SubtaskReference[],
     dependsOn: dependsOnSchema.parse(JSON.parse(row.dependsOnJson)),
+    params: paramsSchema.parse(JSON.parse(row.paramsJson)),
     status: row.status as SubtaskStatus,
     resultParts:
       row.resultPartsJson === null
@@ -193,6 +195,7 @@ export function makeSubtasks(db: DB) {
               prompt: d.prompt,
               referencesJson: JSON.stringify(d.references),
               dependsOnJson: "[]",
+              paramsJson: JSON.stringify(d.params ?? {}),
               status: "pending" satisfies SubtaskStatus,
               resultPartsJson: null,
               error: null,

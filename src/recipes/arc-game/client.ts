@@ -2,7 +2,8 @@ import {
   ARC_BASE_URL,
   type CookieJar,
   type FrameResponse,
-  type GameInfo
+  type GameInfo,
+  type ScorecardSummary
 } from "./types";
 
 /**
@@ -28,7 +29,11 @@ export interface ArcClient {
   openScorecard(
     cookies: CookieJar
   ): Promise<{ cardId: string; cookies: CookieJar }>;
-  closeScorecard(cardId: string, cookies: CookieJar): Promise<void>;
+  /** Closes the card and returns its terminal aggregate — the only time the API reports it. */
+  closeScorecard(
+    cardId: string,
+    cookies: CookieJar
+  ): Promise<{ summary: ScorecardSummary; cookies: CookieJar }>;
   reset(
     input: { gameId: string; cardId: string; guid?: string },
     cookies: CookieJar
@@ -154,11 +159,12 @@ export function makeArcClient(
     },
 
     async closeScorecard(cardId, cookies) {
-      await request<unknown>(
+      const { data, cookies: next } = await request<ScorecardSummary>(
         "/api/scorecard/close",
         { method: "POST", body: { card_id: cardId } },
         cookies
       );
+      return { summary: data, cookies: next };
     },
 
     async reset(input, cookies) {

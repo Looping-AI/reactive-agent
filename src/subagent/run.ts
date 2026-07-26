@@ -6,9 +6,9 @@ import type {
   ProgressEvent,
   RecipeChunkResult,
   RecipeExecutionRequest,
-  RecipeExecutionResult,
-  RecipeLimits
+  RecipeExecutionResult
 } from "@/agent/subtasks/types";
+import type { RecipeLimits } from "@/recipes/types";
 import { renderSubagentPrompt } from "./prompt";
 
 /**
@@ -387,7 +387,7 @@ export interface RecipeRunDeps {
 
 /**
  * Run one recipe execution to a terminal result, driving {@link runResumableChunk}
- * chunk by chunk in memory. The default recipe finishes in a single chunk
+ * chunk by chunk in memory. The general recipe finishes in a single chunk
  * (`maxTurns === turnsPerChunk`); a long recipe loops until done. Used by tests
  * and any caller wanting the whole outcome; the facet drives chunks durably
  * instead, for crash-safety across the Workflow.

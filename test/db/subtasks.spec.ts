@@ -23,6 +23,7 @@ const draft = (
   prompt: `do ${over.localKey}`,
   references: [],
   dependsOn: [],
+  params: {},
   ...over
 });
 

@@ -1,7 +1,5 @@
-import type {
-  RecipeExecutionRequest,
-  ResolvedRecipe
-} from "@/agent/subtasks/types";
+import type { RecipeExecutionRequest } from "@/agent/subtasks/types";
+import type { ResolvedRecipe } from "@/recipes/types";
 
 /**
  * Canonical JSON of the fields that define an execution's identity, rebuilt as
@@ -30,6 +28,7 @@ export function canonicalRequest(request: RecipeExecutionRequest): string {
   const canonical: RecipeExecutionRequest = {
     taskId: request.taskId,
     subtaskId: request.subtaskId,
+    type: request.type,
     recipe,
     prompt: request.prompt,
     references: request.references.map((ref) => ({
@@ -43,7 +42,13 @@ export function canonicalRequest(request: RecipeExecutionRequest): string {
         kind: part.kind,
         text: part.text
       }))
-    }))
+    })),
+    // Params ARE identity: the same prompt against a different scorecard is
+    // different work, and must not replay a cached result. Key order is fixed by
+    // sorting, so an equivalent params object always canonicalizes identically.
+    params: Object.fromEntries(
+      Object.entries(request.params).sort(([a], [b]) => (a < b ? -1 : 1))
+    )
   };
   return JSON.stringify(canonical);
 }

@@ -106,12 +106,15 @@ accept (see **Async task delivery** below). The DO backs a **Session** with
   a system suffix. The prompt is aware of the gateway's `<turn>` provenance wrapper
   (parsed, never authored — see [`src/agent/history.ts`](src/agent/history.ts)).
 - **Tools** ([`src/agent/tools.ts`](src/agent/tools.ts)): the main agent's work
-  tools are the `browser_*` Quick Actions and the `recall` episodic-memory search,
-  layered over the Session's own `set_context`/`load_context` — assembled per
-  caller by `mainAgentTools`, and handed to **every** round. `recall` closes over
-  the verified instance namespace, and the browser binding is closed over too, so
-  neither can be spoofed from model input. Subagents get a disjoint set built by `buildRecipeTools` from their
-  Recipe's tool families — today `browser` (Browser Rendering Quick Actions).
+  tools are the `browser_*` Quick Actions, the `recall` episodic-memory search, and
+  the ARC scorecard lifecycle (`arc_list_games`, `arc_list_scorecards`,
+  `arc_open_scorecard`, `arc_close_scorecard`), layered over the Session's own
+  `set_context`/`load_context` — assembled per caller by `mainAgentTools`, and
+  handed to **every** round. `recall` closes over the verified instance namespace,
+  and the browser binding is closed over too, so neither can be spoofed from model
+  input. Subagents get a **disjoint** set built by `buildRecipeTools` from their
+  Recipe's tool families — `browser`, `workspace`, and `arc-game` (playing a game:
+  reset/act/inspect, never opening or closing a scorecard).
   Per-call **authorization** policy for domain tools is still a later phase.
 
 ## The round loop
@@ -157,7 +160,7 @@ would replay the first round's answer into the second.
 One `generateText` call with two layers of tools, and the difference between them
 is the design:
 
-- **Work tools** — `recall`, `browser_*`, and the Session's own `set_context` —
+- **Work tools** — `recall`, `browser_*`, `arc_*`, and the Session's own `set_context` —
   carry an `execute` and run _inside_ the round's loop, bounded by `MAX_STEPS`.
   They never end a round. **Every** round gets them, including the one that writes
   the final reply: looking something up before answering is ordinary work, not a
@@ -260,22 +263,62 @@ reach a subagent. Compaction summaries are excluded from the catalog (the SDK's
 `compaction_` message-id prefix) — readable as context, structurally uncitable as
 evidence.
 
+### Subtask types and their params
+
+A **type** is the semantic contract of a unit of work: what it means, and what it
+must be given to be doable at all. A **Recipe** is a different thing — the
+execution _configuration_ a type runs under — and several types may share one.
+Keeping them apart is why the params contract lives on the type.
+
+The type set is **closed**, and each domain declares its own entry
+(`recipes/<domain>/recipe.ts`) into the manifest at
+[`src/recipes/index.ts`](src/recipes/index.ts).
+[`src/agent/subtasks/subtask-types.ts`](src/agent/subtasks/subtask-types.ts) consumes
+that list — lookup, the enum, param validation, the rendered catalogue — and names no
+domain, so adding one is a new folder plus a line in the manifest, with no edit inside
+`agent/`. `delegate`'s schema types the set as a `z.enum`, so an invented type is
+rejected by the tool schema itself rather than silently resolving to the general
+Recipe, and the model is shown each type with the params it requires.
+
+A type may **require params** — the ids it cannot work without. `arc-game` requires
+`card_id` and `game_id`, so a play that names neither is refused at delegation
+instead of discovering several turns in that it has nothing to play. Params are
+validated for _shape_ when the call is resolved, persisted on the row
+(`params_json`), re-checked defensively in `executeChunk`, and gate the tool family
+itself: no card and no game, no `arc-game` tools.
+
+Params split by who can know them:
+
+- **Declared** — ids the model chose, part of the execution's identity and
+  therefore **fingerprinted**. The same prompt against a different scorecard is
+  different work and must not replay a cached result.
+- **Resolved** (`SubtaskRuntime`) — what the model can never supply, derived by the
+  parent _from_ the declared params at execution start. Today that is the ARC
+  cookie jar: the API pins a scorecard to the session that opened it, so a play is
+  only possible with the jar stored on our own row. It travels as a separate
+  `executeChunk` argument, like the chunk number, and is deliberately **not**
+  fingerprinted — session state that changes under us must not make a retry look
+  like a different request.
+
 ### Recipes
 
 A Recipe configures one isolated subagent invocation: enabled state, version,
-primary/fallback model ids, soul text, and tool families. The `default` Recipe is
-a **code constant** (`DEFAULT_RECIPE` in
-[`src/agent/subtasks/registry.ts`](src/agent/subtasks/registry.ts), sourcing model ids
-from [`src/config.ts`](src/config.ts)) — not a database row, so it cannot go stale
-against the configured models and needs no migration seed.
+primary/fallback model ids, soul text, and tool families. It declares no params and
+knows nothing about the types it serves. Every Recipe is a **code constant** under
+[`src/recipes/<domain>/recipe.ts`](src/recipes/) — the general-purpose one is
+`GENERAL_RECIPE` in [`src/recipes/general/recipe.ts`](src/recipes/general/recipe.ts),
+sourcing model ids from [`src/config.ts`](src/config.ts) — not a database row, so it
+cannot go stale against the configured models and needs no migration seed.
 
-Decomposition assigns only a semantic Subtask `type`; it never names a Recipe.
-`resolveRecipeForType` maps type → Recipe (always `default` today) and is the seam
-a future Recipe admin surface extends. `validateRecipe` is the capability
+`resolveRecipeForType` maps type → Recipe (falling back to the manifest's
+`FALLBACK_TYPE_SPEC` for a retired type still on a durable row) and is the seam a future
+Recipe admin surface extends. `validateRecipe`
+([`src/recipes/validation.ts`](src/recipes/validation.ts)) is the capability
 boundary: the model allowlist is exactly the two config ids (a non-allowlisted id
 is substituted with its slot's config default, independently per slot), unknown
-tool families are dropped, a blank soul falls back to `STATELESS_SUBAGENT_SOUL`,
-and a disabled Recipe throws. `recall` and the Session `set_context` tool are
+tool families are dropped, and a Recipe that is disabled or carries no soul
+throws. A soul is required, never defaulted: substituting a generic one would run
+the work under an identity nobody declared. `recall` and the Session `set_context` tool are
 **structurally impossible** for a subagent — they are never in the family map.
 Recipe data never supplies arbitrary bindings, tools, or secrets. The resolved
 Recipe id and version are recorded on the row after the fact, at execution start.
@@ -292,13 +335,13 @@ no recall, and no access to parent history beyond the supplied references.
 single-shot default Subtask to a thousand-turn game — runs the same agentic loop
 (`runResumableChunk`, [`src/subagent/run.ts`](src/subagent/run.ts)), customized
 only by the recipe's `limits` (`maxTurns`/`turnsPerChunk`/`chunkSoftMs`) and
-`historyWindow`. `executeChunk(request, chunk)` advances one chunk: up to
+`historyWindow`. `executeChunk(request, chunk, runtime)` advances one chunk: up to
 `turnsPerChunk` model turns (or `chunkSoftMs`, or until a tool emits progress),
 checkpointing rolling state to a `run_state` row after every turn, then returning
 either a terminal result or a `done: false` yield. The Workflow runs each chunk as
 its own retryable `step.do` (`execute:<id>`, then `execute:<id>:chunk:<n>`) and
 loops until done — so no step approaches the platform step timeout, and a crash
-loses at most the in-flight turn. The default recipe sets
+loses at most the in-flight turn. The general recipe sets
 `maxTurns === turnsPerChunk`, so it finishes on chunk 0, byte-identical to the
 pre-resumable pipeline. Domain behavior lives entirely in **tool families**; a
 long recipe keeps only a small rolling context window and persists durable state
@@ -524,8 +567,14 @@ traffic. They are characteristics, not known bugs; none is a correctness hole.
    workspace before sending an action and clears it after. A crash in that window
    may leave a move that was sent but not recorded; on resume the tool annotates
    the anomaly ("may have been interrupted") rather than reconciling. This is an
-   accepted residual — at most one possibly-duplicated move per crash. Similarly, a
-   branch that hard-fails with the child unreachable may leave a scorecard unclosed.
+   accepted residual — at most one possibly-duplicated move per crash. Separately,
+   nothing auto-closes a scorecard any more: the main agent opens and closes them,
+   so a card can be left open if it never gets around to closing one. That is
+   deliberate (a subagent must not end a card it does not own, and one card spans
+   many plays), and an open card stays discoverable — it is a row in `scorecards`,
+   listed by `arc_list_scorecards` and injected into every round's context. Two
+   rules code cannot enforce are stated in the soul instead: give concurrent plays
+   of the same game different cards, and do not close a card while its plays run.
 4. **Mid-flight cancellation depends on RPC delivery during a model `fetch`.**
    `markCanceled` reaches a `RecipeSubagent` with `abortRun` while that facet is
    inside `executeChunk`, which only works because the facet is awaiting a
@@ -564,14 +613,17 @@ traffic. They are characteristics, not known bugs; none is a correctness hole.
 | [`src/agent/subtasks/types.ts`](src/agent/subtasks/types.ts)                 | RPC-safe Subtask contracts (`Subtask`, `SubtaskReference`, `RecipeExecutionRequest`, `SubtaskNode`, …).                                                                                                             |
 | [`src/agent/subtasks/catalog.ts`](src/agent/subtasks/catalog.ts)             | `buildReferenceCatalog` — the ephemeral 1..N numbering of eligible history turns (compaction summaries excluded).                                                                                                   |
 | [`src/agent/subtasks/decomposition.ts`](src/agent/subtasks/decomposition.ts) | `decompositionProposalSchema` + `resolveDecomposition` — index-only reference resolution and DAG validation.                                                                                                        |
-| [`src/agent/subtasks/registry.ts`](src/agent/subtasks/registry.ts)           | `DEFAULT_RECIPE` (code-owned), `resolveRecipeForType`, `validateRecipe` — the model/tool capability boundary.                                                                                                       |
 | [`src/agent/subtasks/scheduler.ts`](src/agent/subtasks/scheduler.ts)         | `selectWave` — pure DAG wave selection (ready / done / stuck).                                                                                                                                                      |
 | [`src/subagent/index.ts`](src/subagent/index.ts)                             | `RecipeSubagent` — the managed facet; `executeChunk(request, chunk)` + `abortRun` (interrupt in flight) + `abortExecution` (release external state) + the fingerprint-keyed terminal cache and rolling `run_state`. |
 | [`src/subagent/run.ts`](src/subagent/run.ts)                                 | `runResumableChunk` — the one durable-chunk runner (agentic loop, per-turn checkpoint, budget-exhaustion summary, abort-yields-nothing); `runRecipeExecution` runs it to completion.                                |
 | [`src/subagent/workspace.ts`](src/subagent/workspace.ts)                     | `WorkspaceHandle` over `@cloudflare/shell`'s `Workspace` (facet SQLite) — the recipe's durable file store; the sole shell import surface, with size/count caps.                                                     |
 | [`src/subagent/prompt.ts`](src/subagent/prompt.ts)                           | `renderSubagentPrompt` — soul as system; sectioned user message keeping references and dependency output distinct.                                                                                                  |
 | [`src/subagent/fingerprint.ts`](src/subagent/fingerprint.ts)                 | Deterministic SHA-256 request fingerprint keying the child's retry cache and run state.                                                                                                                             |
-| [`src/recipes/arc-game/`](src/recipes/arc-game/)                             | First recipe domain: `recipe.ts` · `soul.ts` · `client.ts` (ARC-AGI-3 REST + cookie jar) · `analysis.ts` (pure grid helpers) · `tools.ts` (`arc-game` family).                                                      |
+| [`src/recipes/index.ts`](src/recipes/index.ts)                               | The Subtask type manifest: `SUBTASK_TYPE_SPECS` + `FALLBACK_TYPE_SPEC` — the only module that knows which domains exist.                                                                                            |
+| [`src/recipes/types.ts`](src/recipes/types.ts)                               | Recipe-side contracts owned by `recipes/` and consumed by `agent/`: `ResolvedRecipe`, `RecipeLimits`, `SubtaskParams`, `SubtaskTypeSpec`.                                                                           |
+| [`src/recipes/validation.ts`](src/recipes/validation.ts)                     | `validateRecipe` + the model/tool-family allowlists — the capability boundary every Recipe passes through; imports no domain.                                                                                       |
+| [`src/recipes/general/`](src/recipes/general/)                               | The general recipe domain: `recipe.ts` (`GENERAL_TYPE`, `GENERAL_RECIPE`, `GENERAL_SPEC`) · `soul.ts` (`GENERAL_SUBAGENT_SOUL`) — the recipe for work with no domain of its own.                                    |
+| [`src/recipes/arc-game/`](src/recipes/arc-game/)                             | First domain recipe: `recipe.ts` (`ARC_GAME_RECIPE` + `ARC_GAME_SPEC`) · `soul.ts` · `client.ts` (ARC-AGI-3 REST + cookie jar) · `analysis.ts` (pure grid helpers) · `tools.ts` (`arc-game` family).                |
 | [`src/db/schema.ts`](src/db/schema.ts)                                       | Drizzle tables: `notify_tasks` + `subtasks` (indexes declared inline — see **Durable state**).                                                                                                                      |
 | [`src/db/db.ts`](src/db/db.ts)                                               | `AgentDB` — one drizzle handle over the DO's SQLite + `db.tasks` / `db.subtasks`; runs `migrate()` on construction.                                                                                                 |
 | [`src/db/models/tasks.ts`](src/db/models/tasks.ts)                           | `notify_tasks` query methods (`begin`/`get`/`save`/`markWorking`/`cancel`/`cleanup`).                                                                                                                               |

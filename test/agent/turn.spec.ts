@@ -51,7 +51,7 @@ function proposal(
     subtasks: [
       {
         localKey: "research",
-        type: "research",
+        type: "general",
         prompt: "Research the thing",
         referenceIndexes: [1],
         dependsOn: []
@@ -73,9 +73,10 @@ function branch(over: Partial<CompositionBranch> = {}): CompositionBranch {
     subtaskId: 1,
     round: 0,
     ordinal: 0,
-    type: "research",
+    type: "general",
     prompt: "find the thing",
     dependsOn: [],
+    params: {},
     status: "completed",
     resultParts: [{ kind: "text", text: "the finding" }],
     error: null,
@@ -380,12 +381,19 @@ describe("renderTurnMessages — reuniting delegate calls with their results", (
       branch({ subtaskId: 9, prompt: "find beta", dependsOn: [7] })
     ]).messages;
     expect(callInput(messages).subtasks).toEqual([
-      { localKey: "s7", type: "research", prompt: "find alpha", dependsOn: [] },
+      {
+        localKey: "s7",
+        type: "general",
+        prompt: "find alpha",
+        dependsOn: [],
+        params: {}
+      },
       {
         localKey: "s9",
-        type: "research",
+        type: "general",
         prompt: "find beta",
-        dependsOn: ["s7"]
+        dependsOn: ["s7"],
+        params: {}
       }
     ]);
     expect(callOutput(messages).map((o) => o.subtaskId)).toEqual([7, 9]);
@@ -416,12 +424,12 @@ describe("renderTurnMessages — reuniting delegate calls with their results", (
     expect(callOutput(messages)).toEqual([
       {
         subtaskId: 1,
-        type: "research",
+        type: "general",
         status: "completed",
         output: "the finding"
       },
-      { subtaskId: 2, type: "research", status: "failed", output: null },
-      { subtaskId: 3, type: "research", status: "skipped", output: null }
+      { subtaskId: 2, type: "general", status: "failed", output: null },
+      { subtaskId: 3, type: "general", status: "skipped", output: null }
     ]);
   });
 
@@ -609,7 +617,9 @@ describe("runTurn — delegating", () => {
       // delegation cites nothing.
       mockModel(
         delegates({
-          subtasks: [{ localKey: "a", type: "t", prompt: "p", dependsOn: [] }]
+          subtasks: [
+            { localKey: "a", type: "general", prompt: "p", dependsOn: [] }
+          ]
         })
       ),
       { round: 2, branches: [branch()] }
@@ -623,7 +633,9 @@ describe("runTurn — delegating", () => {
     const { outcome } = await run(
       mockModel(
         delegates({
-          subtasks: [{ localKey: "a", type: "t", prompt: "p", dependsOn: [] }]
+          subtasks: [
+            { localKey: "a", type: "general", prompt: "p", dependsOn: [] }
+          ]
         })
       )
     );
@@ -812,14 +824,14 @@ describe("runTurn — invalid model output", () => {
       subtasks: [
         {
           localKey: "a",
-          type: "t",
+          type: "general",
           prompt: "p",
           referenceIndexes: [],
           dependsOn: ["b"]
         },
         {
           localKey: "b",
-          type: "t",
+          type: "general",
           prompt: "p",
           referenceIndexes: [],
           dependsOn: ["a"]
@@ -840,7 +852,7 @@ describe("runTurn — invalid model output", () => {
       subtasks: [
         {
           localKey: "a",
-          type: "t",
+          type: "general",
           prompt: "p",
           referenceIndexes: [99],
           dependsOn: []

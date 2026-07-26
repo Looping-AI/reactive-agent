@@ -15,7 +15,7 @@ import type {
   RecipeExecutionRequest,
   RecipeExecutionResult
 } from "@/agent/subtasks/types";
-import { DEFAULT_RECIPE } from "@/agent/subtasks/registry";
+import { GENERAL_RECIPE } from "@/recipes/general/recipe";
 import { CHAT_MODEL_ID, CHAT_FALLBACK_MODEL_ID } from "@/config";
 import { mockModel } from "../agent/mock-model";
 import { makeRequest } from "./fixtures";
@@ -170,6 +170,30 @@ describe("RecipeSubagent.executeChunk", () => {
     });
   });
 
+  it("fails a subtask missing its type's params, with zero model calls", async () => {
+    await runInDurableObject(freshChild("missing-params"), async (child) => {
+      const pair = countingPair(
+        () => mockModel({ text: "never" }),
+        () => mockModel({ text: "never" })
+      );
+      child.modelsOverride = pair;
+
+      // An arc-game play with no scorecard and no game cannot succeed; the
+      // contract is re-checked here for the same reason the recipe is.
+      const request = makeRequest({ type: "arc-game", params: {} });
+      const result = await terminal(child, request);
+      expect(result).toEqual({
+        status: "failed",
+        error: expect.stringContaining("invalid params") as string,
+        modelId: null
+      });
+      expect(pair.attempts()).toBe(0);
+
+      // Deterministic, so cached like any terminal outcome.
+      expect(await terminal(child, request)).toEqual(result);
+    });
+  });
+
   it("fails a disabled recipe terminally with zero model calls (defensive re-validation)", async () => {
     await runInDurableObject(freshChild("disabled"), async (child) => {
       const pair = countingPair(
@@ -179,7 +203,7 @@ describe("RecipeSubagent.executeChunk", () => {
       child.modelsOverride = pair;
 
       const request = makeRequest({
-        recipe: { ...DEFAULT_RECIPE, enabled: false }
+        recipe: { ...GENERAL_RECIPE, enabled: false }
       });
       const result = await terminal(child, request);
       expect(result).toEqual({
@@ -203,7 +227,7 @@ describe("RecipeSubagent.executeChunk", () => {
         child,
         makeRequest({
           recipe: {
-            ...DEFAULT_RECIPE,
+            ...GENERAL_RECIPE,
             primaryModelId: "@cf/evil/injected",
             fallbackModelId: "@cf/evil/injected-2"
           }
