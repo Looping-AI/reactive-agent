@@ -4,11 +4,17 @@ import type { ToolFamilyContext, RecipeToolSet } from "@/agent/tools";
 import { makeArcClient } from "./client";
 import {
   colorHistogram,
-  connectedComponents,
+  colorName,
+  describeBox,
+  describeCell,
   diffGrids,
   lastGrid,
-  renderGridHex,
-  renderRegion
+  parseGrid,
+  renderGrid,
+  renderRegion,
+  renderShapes,
+  serializeGrid,
+  type GridDiff
 } from "./analysis";
 import {
   ARC_SESSION_PATH,
@@ -48,6 +54,9 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
     workspace.readJson<ArcSession>(ARC_SESSION_PATH);
   const save = (s: ArcSession): Promise<void> =>
     workspace.writeJson(ARC_SESSION_PATH, s);
+  /** The stored board as a grid, or null when no frame has been recorded yet. */
+  const board = (s: ArcSession): number[][] | null =>
+    s.lastGridHex === null ? null : parseGrid(s.lastGridHex);
 
   const tools = {
     arc_reset_game: tool({
@@ -75,37 +84,47 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
 
     arc_act: tool({
       description:
-        "Take one action in the current game. Only use an action listed in the latest available_actions. Returns a compact outcome (cells changed, new level, new state, new available_actions).",
+        "Take one or more actions in the current game, in order. Only use actions listed in the latest available_actions. Returns one diff per step — what each individual action changed — then the new level, state and available_actions. Batch only a movement you are confident about: every step is a real action counted against the game's baseline, so a wrong batch wastes score. While forming a hypothesis, send a single step.",
       inputSchema: z.object({
-        action: z
-          .number()
-          .int()
+        steps: z
+          .array(
+            z.object({
+              action: z
+                .number()
+                .int()
+                .min(1)
+                .max(7)
+                .describe(
+                  "1=up 2=down 3=left 4=right 5=interact 6=click(x,y) 7=undo"
+                ),
+              x: z
+                .number()
+                .int()
+                .min(0)
+                .max(63)
+                .optional()
+                .describe("column, action 6 only"),
+              y: z
+                .number()
+                .int()
+                .min(0)
+                .max(63)
+                .optional()
+                .describe("row, action 6 only")
+            })
+          )
           .min(1)
-          .max(7)
+          .max(MAX_STEPS)
           .describe(
-            "1=up 2=down 3=left 4=right 5=interact 6=click(x,y) 7=undo"
+            `the actions to take in order, 1–${MAX_STEPS}; each is sent separately and reported separately`
           ),
-        x: z
-          .number()
-          .int()
-          .min(0)
-          .max(63)
-          .optional()
-          .describe("column, action 6 only"),
-        y: z
-          .number()
-          .int()
-          .min(0)
-          .max(63)
-          .optional()
-          .describe("row, action 6 only"),
         note: z
           .string()
           .max(2000)
           .optional()
-          .describe("brief reasoning for this move")
+          .describe("brief reasoning for this move or sequence")
       }),
-      execute: async ({ action, x, y, note }) => {
+      execute: async ({ steps, note }) => {
         const session = await load();
         if (!session) return "No game in progress. Call arc_reset_game first.";
         if (session.state === "WIN" || session.state === "GAME_OVER") {
@@ -123,71 +142,121 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
           session.pendingAction = null;
         }
 
-        if (!session.availableActions.includes(action)) {
-          return (
-            `Action ${action} is not available. Available now: ${session.availableActions.join(", ")}.` +
-            recovery
+        // Detail per step is budgeted across the sequence, so a long batch cannot
+        // flood the context: a single step shows plenty, eight show a little each.
+        const cellCap = Math.max(3, Math.floor(24 / steps.length));
+        const trace: string[] = [];
+        let sent = 0;
+        let stopped: string | null = null;
+
+        for (const [index, step] of steps.entries()) {
+          const { action, x, y } = step;
+
+          // Guard before sending: these are requests the API would reject or that
+          // cannot mean anything, so spending an action on them is pure waste.
+          if (!session.availableActions.includes(action)) {
+            stopped =
+              `${actionName(action)} is not available ` +
+              `(available: ${session.availableActions.join(", ") || "none"})`;
+          } else if (action === 6 && (x === undefined || y === undefined)) {
+            stopped = "click (action 6) requires x and y (0–63)";
+          }
+          if (stopped) {
+            trace.push(remaining(steps.length, index, stopped));
+            break;
+          }
+
+          // Write-ahead intent, then send, then record — the crash window is
+          // between, and it stays per-step so a crash mid-sequence is recoverable
+          // exactly as a crash mid-action always was.
+          session.pendingAction = { action, x, y };
+          await save(session);
+
+          const { frame, cookies } = await client.act(
+            { action, gameId: session.gameId, guid: session.guid, x, y, note },
+            session.cookies
           );
+
+          // Diff against the board as it was immediately BEFORE this step, so each
+          // line attributes its change to the one action that caused it. That
+          // attribution is what makes batching safe: without it the model would see
+          // that the board changed but not which action changed it.
+          const before = board(session);
+          const next = lastGrid(frame.frame);
+          const diff = diffGrids(before, next, cellCap);
+          const prevLevel = session.levelsCompleted;
+
+          session.cookies = cookies;
+          session.guid = frame.guid;
+          session.state = frame.state;
+          session.levelsCompleted = frame.levels_completed;
+          session.availableActions = frame.available_actions;
+          if (frame.win_levels) session.winLevels = frame.win_levels;
+          session.lastGridHex = serializeGrid(next);
+          session.actionsSent++;
+          session.pendingAction = null;
+          sent++;
+
+          if (
+            frame.levels_completed > prevLevel &&
+            !session.levelsReported.includes(frame.levels_completed)
+          ) {
+            session.levelsReported.push(frame.levels_completed);
+            emitProgress({
+              // Keyed per play: the same level reached on a later attempt is a
+              // genuinely new note, and the gateway dedupes on this key.
+              key: `arc:${session.gameId}:play${session.playIndex}:level:${frame.levels_completed}`,
+              text:
+                `ARC ${session.gameId}: reached level ${frame.levels_completed}` +
+                `${session.winLevels ? `/${session.winLevels}` : ""} ` +
+                `(${session.actionsSent} actions` +
+                `${session.playIndex > 0 ? `, play ${session.playIndex + 1}` : ""}).`
+            });
+          }
+
+          await save(session);
+          trace.push(
+            `${index + 1}. ${actionName(action, x, y)} → ${renderDiff(diff)}`
+          );
+
+          // The play ended mid-sequence: anything after this would act on a
+          // finished game.
+          if (session.state === "WIN" || session.state === "GAME_OVER") {
+            if (index + 1 < steps.length) {
+              trace.push(
+                remaining(
+                  steps.length,
+                  index + 1,
+                  `state became ${session.state}`
+                )
+              );
+            }
+            break;
+          }
         }
-        if (action === 6 && (x === undefined || y === undefined)) {
-          return "Action 6 (click) requires x and y (0–63)." + recovery;
-        }
-
-        // Write-ahead intent, then send, then record — the crash window is between.
-        session.pendingAction = { action, x, y };
-        await save(session);
-
-        const { frame, cookies } = await client.act(
-          { action, gameId: session.gameId, guid: session.guid, x, y, note },
-          session.cookies
-        );
-
-        const before = session.lastFrame;
-        const next = lastGrid(frame.frame);
-        const diff = diffGrids(before, next);
-        const prevLevel = session.levelsCompleted;
-
-        session.cookies = cookies;
-        session.guid = frame.guid;
-        session.state = frame.state;
-        session.levelsCompleted = frame.levels_completed;
-        session.availableActions = frame.available_actions;
-        if (frame.win_levels) session.winLevels = frame.win_levels;
-        session.prevFrame = before;
-        session.lastFrame = next;
-        session.actionsSent++;
-        session.pendingAction = null;
-
-        if (
-          frame.levels_completed > prevLevel &&
-          !session.levelsReported.includes(frame.levels_completed)
-        ) {
-          session.levelsReported.push(frame.levels_completed);
-          emitProgress({
-            // Keyed per play: the same level reached on a later attempt is a
-            // genuinely new note, and the gateway dedupes on this key.
-            key: `arc:${session.gameId}:play${session.playIndex}:level:${frame.levels_completed}`,
-            text:
-              `ARC ${session.gameId}: reached level ${frame.levels_completed}` +
-              `${session.winLevels ? `/${session.winLevels}` : ""} ` +
-              `(${session.actionsSent} actions` +
-              `${session.playIndex > 0 ? `, play ${session.playIndex + 1}` : ""}).`
-          });
-        }
-
-        await save(session);
 
         const terminal =
           session.state === "WIN" || session.state === "GAME_OVER"
-            ? " | this play is over — call arc_reset_game to play again, or write your final report"
+            ? "\nThis play is over — call arc_reset_game to play again, or write your final report."
             : "";
-        return renderOutcome(session, diff) + terminal + recovery;
+        const header =
+          steps.length === 1
+            ? ""
+            : `${steps.length} steps requested, ${sent} sent.\n`;
+        return (
+          header +
+          trace.join("\n") +
+          "\n" +
+          stateLine(session) +
+          terminal +
+          recovery
+        );
       }
     }),
 
     arc_inspect: tool({
       description:
-        "Look at the current board without taking a game action. Views: 'grid' (full 64×64 hex), 'region' (a square around x,y), 'histogram' (color counts), 'shapes' (connected-component summary).",
+        "Look at the current board without taking a game action. Views: 'shapes' (every colored region with its row/column box — usually what you want, and far cheaper than the grid), 'region' (a labeled square around x,y), 'histogram' (how many cells of each color), 'grid' (the whole 64×64 board, one character per cell with a legend).",
       inputSchema: z.object({
         view: z.enum(["grid", "region", "histogram", "shapes"]),
         x: z.number().int().min(0).max(63).optional(),
@@ -196,26 +265,21 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
       }),
       execute: async ({ view, x, y, radius }) => {
         const session = await load();
-        if (!session || !session.lastFrame) return "No game in progress.";
-        const grid = session.lastFrame;
+        const grid = session === null ? null : board(session);
+        if (grid === null) return "No game in progress.";
         switch (view) {
           case "grid":
-            return renderGridHex(grid);
+            return renderGrid(grid);
           case "region":
             if (x === undefined || y === undefined)
               return "region view needs x and y.";
             return renderRegion(grid, y, x, radius);
           case "histogram":
             return colorHistogram(grid)
-              .map((h) => `color ${h.color}: ${h.count} cells`)
+              .map((h) => `${colorName(h.color)}: ${h.count} cells`)
               .join("\n");
           case "shapes":
-            return connectedComponents(grid)
-              .map(
-                (s) =>
-                  `color ${s.color}: ${s.components} shape(s), largest ${s.largest} cells`
-              )
-              .join("\n");
+            return renderShapes(grid);
         }
       }
     })
@@ -263,42 +327,73 @@ function nextSession(
     playIndex: plays.length,
     plays,
     levelsReported: [],
-    lastFrame: lastGrid(frame.frame),
-    prevFrame: null,
+    lastGridHex: serializeGrid(lastGrid(frame.frame)),
     pendingAction: null
   };
 }
 
-/** The compact per-action outcome the model reasons over (never the raw grid). */
-function renderOutcome(
-  session: ArcSession,
-  diff: ReturnType<typeof diffGrids>
-): string {
-  const changed =
-    diff.changed < 0
-      ? "first frame"
-      : diff.changed === 0
-        ? "no cells changed"
-        : `${diff.changed} cells changed` +
-          (diff.cells.length > 0
-            ? ` (e.g. ${diff.cells
-                .slice(0, 6)
-                .map((c) => `(${c.row},${c.col}) ${c.from}->${c.to}`)
-                .join(", ")})`
-            : "");
+/** Human names for the seven actions, so results read as moves not opcodes. */
+const ACTION_NAMES: Record<number, string> = {
+  1: "up",
+  2: "down",
+  3: "left",
+  4: "right",
+  5: "interact",
+  6: "click",
+  7: "undo"
+};
+
+/** How many actions one `arc_act` call may carry. */
+const MAX_STEPS = 8;
+
+function actionName(action: number, x?: number, y?: number): string {
+  const name = ACTION_NAMES[action] ?? `action ${action}`;
+  return action === 6 && x !== undefined && y !== undefined
+    ? `${name}(${x},${y})`
+    : name;
+}
+
+/** "5-8. not sent: <why>" — an aborted tail, named so it is never assumed to have run. */
+function remaining(total: number, from: number, why: string): string {
+  const label = from + 1 === total ? `${total}.` : `${from + 1}-${total}.`;
+  return `${label} not sent: ${why}`;
+}
+
+/**
+ * What one action did: how much changed, where, and which colors — the causal
+ * signal the model refines its hypothesis from.
+ */
+function renderDiff(diff: GridDiff): string {
+  if (diff.changed < 0) return "first frame";
+  // A no-op is information, not an absence of it: it usually means blocked.
+  if (diff.changed === 0) return "0 cells changed (no effect)";
+  const where = diff.box === null ? "" : `, ${describeBox(diff.box)}`;
+  const examples =
+    diff.cells.length === 0
+      ? ""
+      : ` (${diff.cells.length < diff.changed ? "e.g. " : ""}` +
+        `${diff.cells.map(describeCell).join(", ")})`;
+  return `${diff.changed} cells changed${where}${examples}`;
+}
+
+/** Level / state / legal-actions — the board-independent status, one line. */
+function stateLine(session: ArcSession): string {
   return [
-    changed,
     `level ${session.levelsCompleted}${session.winLevels ? `/${session.winLevels}` : ""}`,
     `state ${session.state}`,
     `available actions: ${session.availableActions.join(", ") || "none"}`
   ].join(" | ");
 }
 
-/** Full state summary used on start / re-entry. */
+/**
+ * Full summary used on start / re-entry, including where every shape is. Orienting
+ * the model here is what lets a reset cost one turn instead of two: the old text
+ * told it to call `arc_inspect` next, which guaranteed a second turn before it
+ * could act.
+ */
 function describeState(session: ArcSession, prefix: string): string {
-  return (
-    `${prefix} ` +
-    renderOutcome(session, { changed: -1, cells: [] }) +
-    `. Call arc_inspect to see the board.`
-  );
+  const grid =
+    session.lastGridHex === null ? null : parseGrid(session.lastGridHex);
+  const shapes = grid === null ? "" : `\nBoard:\n${renderShapes(grid)}`;
+  return `${prefix} ${stateLine(session)}${shapes}`;
 }
