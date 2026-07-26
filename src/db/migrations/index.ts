@@ -36,6 +36,18 @@ const dbMigrations: MigrationConfig = {
         when: 1784631097834,
         tag: "0002_add_subtask_round",
         breakpoints: true
+      },
+      {
+        idx: 3,
+        when: 1785018590369,
+        tag: "0003_lovely_invisible_woman",
+        breakpoints: true
+      },
+      {
+        idx: 4,
+        when: 1785022003643,
+        tag: "0004_free_jean_grey",
+        breakpoints: true
       }
     ]
   },
@@ -100,7 +112,19 @@ ALTER TABLE \`__new_subtasks\` RENAME TO \`subtasks\`;--> statement-breakpoint
 CREATE UNIQUE INDEX \`idx_subtasks_task_ordinal\` ON \`subtasks\` (\`task_id\`,\`ordinal\`);--> statement-breakpoint
 CREATE INDEX \`idx_subtasks_task_round\` ON \`subtasks\` (\`task_id\`,\`round\`);--> statement-breakpoint
 CREATE INDEX \`idx_subtasks_status\` ON \`subtasks\` (\`status\`);--> statement-breakpoint
-CREATE INDEX \`idx_subtasks_created_at\` ON \`subtasks\` (\`created_at\`);`
+CREATE INDEX \`idx_subtasks_created_at\` ON \`subtasks\` (\`created_at\`);`,
+    m0003: `CREATE TABLE \`scorecards\` (
+\t\`card_id\` text PRIMARY KEY NOT NULL,
+\t\`status\` text DEFAULT 'open' NOT NULL,
+\t\`opened_at\` integer NOT NULL,
+\t\`closed_at\` integer,
+\t\`summary_json\` text
+);
+--> statement-breakpoint
+CREATE INDEX \`idx_scorecards_opened_at\` ON \`scorecards\` (\`opened_at\`);`,
+    // Both nullable-with-default, so SQLite adds them in place — no table rebuild.
+    m0004: `ALTER TABLE \`scorecards\` ADD \`cookies_json\` text DEFAULT '{}' NOT NULL;--> statement-breakpoint
+ALTER TABLE \`subtasks\` ADD \`params_json\` text DEFAULT '{}' NOT NULL;`
   }
 };
 

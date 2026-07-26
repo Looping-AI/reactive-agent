@@ -1,82 +1,22 @@
 /**
- * Unit tests for the code-owned default Recipe (src/agent/subtasks/registry.ts).
- *
- * The default lives in code, not the DB, so it always reflects config.ts — these
- * tests guard against drift and confirm resolution is code-only for now.
+ * Unit tests for the Recipe capability boundary (src/recipes/validation.ts):
+ * the models and tool families any Recipe may select, and how a malformed one is
+ * made safe. The Recipes themselves live under `src/recipes/` and are tested
+ * there.
  */
 import { describe, it, expect } from "vitest";
-import {
-  DEFAULT_RECIPE,
-  RecipeValidationError,
-  STATELESS_SUBAGENT_SOUL,
-  resolveRecipeForType,
-  validateRecipe
-} from "@/agent/subtasks/registry";
-import type { ResolvedRecipe } from "@/agent/subtasks/types";
+import { RecipeValidationError, validateRecipe } from "@/recipes/validation";
+import { GENERAL_RECIPE } from "@/recipes/general/recipe";
+import type { ResolvedRecipe } from "@/recipes/types";
 import {
   CHAT_MODEL_ID,
   CHAT_FALLBACK_MODEL_ID,
-  DEFAULT_MAX_TURNS,
-  MAX_CHUNKS_PER_BRANCH,
-  MAX_STEPS
+  DEFAULT_MAX_TURNS
 } from "@/config";
-
-describe("DEFAULT_RECIPE", () => {
-  it("mirrors the config model ids (no stale DB seed)", () => {
-    expect(DEFAULT_RECIPE.primaryModelId).toBe(CHAT_MODEL_ID);
-    expect(DEFAULT_RECIPE.fallbackModelId).toBe(CHAT_FALLBACK_MODEL_ID);
-  });
-
-  it("is the enabled 'default' recipe with the browser tool family", () => {
-    expect(DEFAULT_RECIPE.key).toBe("default");
-    expect(DEFAULT_RECIPE.version).toBe(1);
-    expect(DEFAULT_RECIPE.enabled).toBe(true);
-    expect(DEFAULT_RECIPE.toolFamilies).toEqual(["browser"]);
-    expect(DEFAULT_RECIPE.soul).toBe(STATELESS_SUBAGENT_SOUL);
-  });
-
-  it("completes in a single chunk (maxTurns === turnsPerChunk) and reports no metrics", () => {
-    expect(DEFAULT_RECIPE.limits.maxTurns).toBe(
-      DEFAULT_RECIPE.limits.turnsPerChunk
-    );
-    expect(DEFAULT_RECIPE.limits.maxTurns).toBe(MAX_STEPS);
-    expect(DEFAULT_RECIPE.historyWindow).toBeGreaterThanOrEqual(
-      DEFAULT_RECIPE.limits.maxTurns
-    );
-    expect(DEFAULT_RECIPE.reportMetrics).toBe(false);
-  });
-});
-
-describe("resolveRecipeForType", () => {
-  it("returns the code default for an unmapped semantic type", () => {
-    expect(resolveRecipeForType("general")).toBe(DEFAULT_RECIPE);
-    expect(resolveRecipeForType("research")).toBe(DEFAULT_RECIPE);
-  });
-
-  it("routes the arc-game type to the long-running ARC recipe", () => {
-    const recipe = resolveRecipeForType("arc-game");
-    expect(recipe.key).toBe("arc-game");
-    // A long recipe: many turns spanning multiple chunks, and it reports metrics.
-    expect(recipe.limits.maxTurns).toBeGreaterThan(recipe.limits.turnsPerChunk);
-    expect(recipe.reportMetrics).toBe(true);
-    expect(recipe.toolFamilies).toEqual(["workspace", "arc-game"]);
-  });
-
-  it("keeps the longest recipe inside the Workflow's per-branch chunk cap", () => {
-    // `MAX_CHUNKS_PER_BRANCH` is what stops a branch approaching the Workflows
-    // per-instance step ceiling, and the Workflow *fails* a branch that hits it.
-    // So a recipe's nominal chunk count must stay well under the cap — with room
-    // for the progress events that end a chunk early. Raising `maxTurns` without
-    // raising the cap would silently start killing long games mid-run.
-    const { maxTurns, turnsPerChunk } = resolveRecipeForType("arc-game").limits;
-    const nominalChunks = Math.ceil(maxTurns / turnsPerChunk);
-    expect(nominalChunks).toBeLessThanOrEqual(MAX_CHUNKS_PER_BRANCH / 2);
-  });
-});
 
 describe("validateRecipe", () => {
   const custom = (overrides: Partial<ResolvedRecipe>): ResolvedRecipe => ({
-    ...DEFAULT_RECIPE,
+    ...GENERAL_RECIPE,
     key: "custom",
     ...overrides
   });
@@ -125,9 +65,21 @@ describe("validateRecipe", () => {
     expect(validated.toolFamilies).toEqual(["browser"]);
   });
 
-  it("substitutes the stateless soul for a blank soul", () => {
-    const validated = validateRecipe(custom({ soul: "   \n " }));
-    expect(validated.soul).toBe(STATELESS_SUBAGENT_SOUL);
+  it("rejects a blank soul rather than substituting a generic one", () => {
+    // A Recipe must declare its own identity: running the work under a soul
+    // nobody chose would answer plausibly as something other than the Recipe.
+    expect(() => validateRecipe(custom({ soul: "   \n " }))).toThrow(
+      RecipeValidationError
+    );
+    expect(() => validateRecipe(custom({ soul: "" }))).toThrow(/has no soul/);
+  });
+
+  it("passes a present soul through verbatim, whitespace and all", () => {
+    // The soul becomes the system prompt unmodified; validation only decides
+    // whether there is one.
+    expect(validateRecipe(custom({ soul: "  Be brief.\n" })).soul).toBe(
+      "  Be brief.\n"
+    );
   });
 
   it("throws RecipeValidationError for a disabled recipe", () => {

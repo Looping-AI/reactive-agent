@@ -1,3 +1,5 @@
+import type { ResolvedRecipe, SubtaskParams } from "@/recipes/types";
+
 export type SubtaskStatus =
   "pending" | "running" | "completed" | "failed" | "skipped" | "canceled";
 
@@ -38,47 +40,22 @@ export interface SubtaskDraft {
   references: SubtaskReference[];
   /** Draft-local keys of prerequisite drafts. */
   dependsOn: string[];
+  /** The type's required inputs, already validated for shape. */
+  params: SubtaskParams;
 }
 
 /**
- * Execution budget for one Recipe, enforced by the resumable runner (not the
- * Workflow). The runner drives the model/tool loop in durable **chunks**: it runs
- * up to `turnsPerChunk` turns (or `chunkSoftMs` wall-clock, whichever first) per
- * Workflow step, checkpoints, and yields for a fresh step — so a long run never
- * exceeds the platform's per-step timeout. `maxTurns` is the whole-execution
- * ceiling across every chunk. The default recipe sets `maxTurns === turnsPerChunk`
- * so it always finishes in one chunk.
+ * Session state the parent resolved *from* a Subtask's params at execution
+ * start — the part of an execution's context the model can never supply.
+ *
+ * Deliberately outside {@link RecipeExecutionRequest}: it is not part of an
+ * execution's identity and it can change under us, so fingerprinting it would
+ * make a retry look like a different request. It travels as a separate argument,
+ * the same discipline as the chunk number.
  */
-export interface RecipeLimits {
-  /** Whole-execution ceiling on model turns (one turn = one tool-loop step). */
-  maxTurns: number;
-  /** Turns to run within a single durable chunk before yielding a fresh step. */
-  turnsPerChunk: number;
-  /** Soft wall-clock budget (ms) per chunk; ends a chunk early to stay under the step timeout. */
-  chunkSoftMs: number;
-}
-
-/**
- * A fully-resolved Recipe configuration handed to a subagent invocation. Today
- * these are code-owned constants (see `agent/subtasks/registry.ts` and
- * `recipes/<domain>/recipe.ts`); caller-local DB rows mapping into this shape are
- * deferred until a Recipe admin surface exists. Model ids, tool families, and
- * limits remain code-validated downstream (`validateRecipe`).
- */
-export interface ResolvedRecipe {
-  key: string;
-  version: number;
-  primaryModelId: string;
-  fallbackModelId: string;
-  soul: string;
-  toolFamilies: string[];
-  enabled: boolean;
-  /** Turn/chunk/time budget the resumable runner enforces. */
-  limits: RecipeLimits;
-  /** Most-recent turns kept verbatim in the rolling model context; older turns are pruned. */
-  historyWindow: number;
-  /** Append a runtime metrics footer (turns, model calls, wall-clock) to the final result. */
-  reportMetrics: boolean;
+export interface SubtaskRuntime {
+  /** Cookies an external API pinned to the resource named in `params`. */
+  cookies?: Record<string, string>;
 }
 
 /**
@@ -135,10 +112,22 @@ export interface DependencyResult {
 export interface RecipeExecutionRequest {
   taskId: string;
   subtaskId: SubtaskId;
+  /**
+   * The Subtask's semantic type — what the work *is*, and what owns the params
+   * contract. Distinct from `recipe.key`, which names the execution
+   * configuration it runs under: several types may share one Recipe.
+   */
+  type: string;
   recipe: ResolvedRecipe;
   prompt: string;
   references: SubtaskReference[];
   dependencyResults: DependencyResult[];
+  /**
+   * The Subtask's validated params. Part of the execution's identity — two plays
+   * of one game on different scorecards are different work — so this IS
+   * fingerprinted, unlike the {@link SubtaskRuntime} resolved from it.
+   */
+  params: SubtaskParams;
 }
 
 /**
@@ -171,6 +160,8 @@ export interface SubtaskProposal {
   referenceIndexes?: number[];
   /** Draft-local keys of prerequisite proposals. */
   dependsOn: string[];
+  /** The type's required inputs; omitted for a type that takes none. */
+  params?: SubtaskParams;
 }
 
 /**
@@ -223,6 +214,7 @@ export interface CompositionBranch {
   type: string;
   prompt: string;
   dependsOn: SubtaskId[];
+  params: SubtaskParams;
   status: SubtaskStatus;
   resultParts: SubtaskResultPart[] | null;
   error: string | null;
@@ -269,6 +261,8 @@ export interface Subtask {
   prompt: string;
   references: SubtaskReference[];
   dependsOn: SubtaskId[];
+  /** The type's required inputs, validated at delegation time. */
+  params: SubtaskParams;
   status: SubtaskStatus;
   resultParts: SubtaskResultPart[] | null;
   error: string | null;

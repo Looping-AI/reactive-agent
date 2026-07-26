@@ -180,12 +180,20 @@ describe("ReactiveAgent — async task state (real SQLite)", () => {
       const rows = db.subtasks.createDecomposition("t-ab", 0, [
         {
           localKey: "a",
-          type: "r",
+          type: "general",
           prompt: "p",
           references: [],
-          dependsOn: []
+          dependsOn: [],
+          params: {}
         },
-        { localKey: "b", type: "r", prompt: "p", references: [], dependsOn: [] }
+        {
+          localKey: "b",
+          type: "general",
+          prompt: "p",
+          references: [],
+          dependsOn: [],
+          params: {}
+        }
       ]);
       // Only the first is running; the second stays pending.
       db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });

@@ -1,5 +1,6 @@
 import { tool } from "ai";
 import { decompositionProposalSchema } from "./decomposition";
+import { renderSubtaskTypes } from "./subtask-types";
 import type {
   CompositionBranch,
   DecompositionProposal,
@@ -41,7 +42,9 @@ export const DELEGATE_TOOL_NAME = "delegate";
  */
 export const delegateTool = tool({
   description:
-    "Delegate part of the user's request to isolated subagents and acknowledge it. Their results return to you, and you then decide what to do next — answer the user, or delegate again.",
+    "Delegate part of the user's request to isolated subagents and acknowledge it. Their results return to you, and you then decide what to do next — answer the user, or delegate again.\n\n" +
+    "Every subtask must name one of these types, and supply the params that type requires:\n" +
+    renderSubtaskTypes(),
   inputSchema: decompositionProposalSchema
 });
 
@@ -106,7 +109,10 @@ export function delegateCallInput(
       localKey: localKeyForId(branch.subtaskId),
       type: branch.type,
       prompt: branch.prompt,
-      dependsOn: branch.dependsOn.map(localKeyForId)
+      dependsOn: branch.dependsOn.map(localKeyForId),
+      // Reconstructed verbatim from the row: a later round must see the same
+      // params the call really carried, or it cannot reason about what ran.
+      params: branch.params
     }))
   };
 }

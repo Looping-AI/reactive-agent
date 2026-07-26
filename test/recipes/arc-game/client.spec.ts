@@ -54,12 +54,28 @@ describe("makeArcClient", () => {
     expect(calls[1].url).toBe("https://three.arcprize.org/api/scorecard/close");
   });
 
-  it("posts the close body with the card id", async () => {
-    const { fn, calls } = fetchStub([json({ ok: true })]);
-    await makeArcClient("k", { fetchFn: fn }).closeScorecard("card-9", {});
+  it("posts the close body with the card id and returns the aggregate", async () => {
+    const { fn, calls } = fetchStub([
+      json({
+        card_id: "card-9",
+        score: 2.5,
+        total_actions: 41,
+        total_environments: 1,
+        total_environments_completed: 0,
+        total_levels: 6,
+        total_levels_completed: 2,
+        environments: []
+      })
+    ]);
+    const { summary } = await makeArcClient("k", {
+      fetchFn: fn
+    }).closeScorecard("card-9", {});
     expect(JSON.parse(String(calls[0].init.body))).toEqual({
       card_id: "card-9"
     });
+    // Closing is the only time the API reports a card's score.
+    expect(summary.score).toBe(2.5);
+    expect(summary.total_levels_completed).toBe(2);
   });
 
   it("includes x,y only for ACTION6 and wraps the note as a reasoning object", async () => {

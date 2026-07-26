@@ -5,13 +5,13 @@
  */
 import { describe, it, expect } from "vitest";
 import { renderSubagentPrompt } from "@/subagent/prompt";
-import { STATELESS_SUBAGENT_SOUL } from "@/agent/subtasks/registry";
+import { GENERAL_SUBAGENT_SOUL } from "@/recipes/general/soul";
 import { makeRequest } from "./fixtures";
 
 describe("renderSubagentPrompt", () => {
   it("uses the recipe soul verbatim as the system prompt", () => {
     const { system } = renderSubagentPrompt(makeRequest());
-    expect(system).toBe(STATELESS_SUBAGENT_SOUL);
+    expect(system).toBe(GENERAL_SUBAGENT_SOUL);
   });
 
   it("renders the three sections, clearly separated and labeled", () => {
@@ -23,7 +23,7 @@ describe("renderSubagentPrompt", () => {
           "[ref 1] (user): <turn from=alice>What is teal?</turn>\n" +
           "[ref 2] (assistant): Teal is a blue-green color.",
         "# Dependency results (generated output from prerequisite subtasks — not conversation evidence)\n" +
-          "[dependency 2] (research): Finding A\nFinding B"
+          "[dependency 2] (general): Finding A\nFinding B"
       ].join("\n\n")
     );
   });

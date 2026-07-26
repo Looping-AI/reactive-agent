@@ -45,3 +45,17 @@ export function withSubtasks<T>(
     return fn(subtasks);
   });
 }
+
+/**
+ * Run `fn` inside a fresh DO instance with `AgentDB.scorecards` already wired
+ * up. Mirrors {@link withTasks} for the ARC scorecard data layer.
+ */
+export function withScorecards<T>(
+  label: string,
+  fn: (scorecards: AgentDB["scorecards"]) => T
+) {
+  return runInDurableObject(freshStub(label), (instance) => {
+    const { scorecards } = new AgentDB(doStorage(instance));
+    return fn(scorecards);
+  });
+}

@@ -3,17 +3,19 @@ import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
 import { createModelPair, type ModelPair } from "@/agent/model";
 import { buildRecipeTools } from "@/agent/tools";
-import {
-  RecipeValidationError,
-  validateRecipe
-} from "@/agent/subtasks/registry";
+import { RecipeValidationError, validateRecipe } from "@/recipes/validation";
 import type {
   ProgressEvent,
   RecipeChunkResult,
   RecipeExecutionRequest,
   RecipeExecutionResult,
-  SubtaskId
+  SubtaskId,
+  SubtaskRuntime
 } from "@/agent/subtasks/types";
+import {
+  SubtaskParamsError,
+  validateSubtaskParams
+} from "@/agent/subtasks/subtask-types";
 import { renderSubagentPrompt } from "./prompt";
 import { createDurableWorkspace, makeWorkspaceHandle } from "./workspace";
 import { fingerprintRequest } from "./fingerprint";
@@ -143,7 +145,8 @@ export class RecipeSubagent extends Agent<Env> {
    */
   async executeChunk(
     request: RecipeExecutionRequest,
-    _chunk: number
+    _chunk: number,
+    runtime: SubtaskRuntime = {}
   ): Promise<RecipeChunkResult> {
     this.ensureTables();
     const fingerprint = await fingerprintRequest(request);
@@ -161,8 +164,9 @@ export class RecipeSubagent extends Agent<Env> {
       };
     }
 
-    // Validate the recipe up front; a disabled recipe / empty prompt is a
-    // deterministic, cacheable terminal failure with no model call.
+    // Validate the recipe up front; an unusable recipe (disabled, or with no
+    // soul) and an empty prompt are deterministic, cacheable terminal failures
+    // with no model call.
     let recipe;
     try {
       recipe = validateRecipe(request.recipe);
@@ -178,6 +182,19 @@ export class RecipeSubagent extends Agent<Env> {
       return this.cacheTerminal(fingerprint, {
         status: "failed",
         error: "empty subtask prompt",
+        modelId: null
+      });
+    }
+    // Re-check the type's param contract, the same defensive posture as
+    // `validateRecipe`: a play with no scorecard cannot succeed, and failing
+    // here costs no model call and gives the parent a real diagnostic.
+    try {
+      validateSubtaskParams(request.type, request.params);
+    } catch (error) {
+      if (!(error instanceof SubtaskParamsError)) throw error;
+      return this.cacheTerminal(fingerprint, {
+        status: "failed",
+        error: error.message,
         modelId: null
       });
     }
@@ -206,7 +223,9 @@ export class RecipeSubagent extends Agent<Env> {
     const { tools } = buildRecipeTools(recipe.toolFamilies, {
       env: this.env,
       workspace,
-      emitProgress: (event) => progress.push(event)
+      emitProgress: (event) => progress.push(event),
+      params: request.params,
+      runtime
     });
     const { system, prompt } = renderSubagentPrompt({ ...request, recipe });
 
@@ -268,7 +287,9 @@ export class RecipeSubagent extends Agent<Env> {
     const ctx = {
       env: this.env,
       workspace: makeWorkspaceHandle(this.workspace()),
-      emitProgress: () => {}
+      emitProgress: () => {},
+      params: {},
+      runtime: {}
     };
     const { abort } = buildRecipeTools(toolFamilies, ctx);
     if (abort) await abort(ctx);

@@ -1,4 +1,4 @@
-import { DEFAULT_RECIPE } from "@/agent/subtasks/registry";
+import { GENERAL_RECIPE } from "@/recipes/general/recipe";
 import type { RecipeExecutionRequest } from "@/agent/subtasks/types";
 
 /**
@@ -9,7 +9,7 @@ import type { RecipeExecutionRequest } from "@/agent/subtasks/types";
  * This lives here rather than in the shared `test/fixtures.ts` on purpose:
  * `test/fixtures.ts` is statically imported by `vitest.config.ts`, so anything
  * it imports must resolve while Vite bundles the config — before the `@` alias
- * is active. Importing `@/agent/subtasks/registry` from there breaks config load.
+ * is active. Importing `@/recipes/general/recipe` from there breaks config load.
  */
 export function makeRequest(
   overrides: Partial<RecipeExecutionRequest> = {}
@@ -17,7 +17,9 @@ export function makeRequest(
   return {
     taskId: "task-1",
     subtaskId: 1,
-    recipe: DEFAULT_RECIPE,
+    type: "general",
+    recipe: GENERAL_RECIPE,
+    params: {},
     prompt: "Summarize the findings.",
     references: [
       { role: "user", text: "<turn from=alice>What is teal?</turn>" },
@@ -26,7 +28,7 @@ export function makeRequest(
     dependencyResults: [
       {
         subtaskId: 2,
-        type: "research",
+        type: "general",
         resultParts: [
           { kind: "text", text: "Finding A" },
           { kind: "text", text: "Finding B" }

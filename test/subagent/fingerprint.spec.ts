@@ -22,10 +22,12 @@ describe("fingerprintRequest", () => {
     const base = makeRequest();
     const reordered = JSON.parse(
       JSON.stringify({
+        params: base.params,
         dependencyResults: base.dependencyResults,
         references: base.references,
         prompt: base.prompt,
         recipe: base.recipe,
+        type: base.type,
         subtaskId: base.subtaskId,
         taskId: base.taskId
       })
@@ -72,7 +74,7 @@ describe("fingerprintRequest", () => {
         dependencyResults: [
           {
             subtaskId: 2,
-            type: "research",
+            type: "general",
             resultParts: [{ kind: "text", text: "Finding A" }]
           }
         ]

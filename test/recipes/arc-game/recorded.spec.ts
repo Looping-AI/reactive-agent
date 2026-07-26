@@ -1,5 +1,5 @@
 /**
- * Integration coverage for the arc-game tools against the **real** ARC-AGI-3 API,
+ * Integration coverage for the arc tools against the **real** ARC-AGI-3 API,
  * recorded once and replayed on CI (VCR pattern via undici SnapshotAgent — see
  * test/helpers/vcr.ts). `setupRecording()` gives each test its own cassette,
  * auto-named from the file + describe + test names (test/helpers/vcr-spec.ts),
@@ -14,43 +14,78 @@
  *
  * A missing cassette **fails** the test with a "record it" message (never skips),
  * so an unrecorded spec is visible in CI.
+ *
+ * This drives the whole lifecycle across both owners, in the order the agents
+ * really perform it: the main agent lists games and opens a card, a subagent
+ * plays on it, and the main agent closes the card for the score.
  */
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
 import { buildArcGameTools } from "@/recipes/arc-game/tools";
+import { buildArcScorecardTools } from "@/recipes/arc-game/scorecard-tools";
+import { makeArcClient } from "@/recipes/arc-game/client";
 import type { ArcSession } from "@/recipes/arc-game/types";
-import { ctx, callTool } from "./helpers";
+import { ctx, callTool, memStore } from "./helpers";
 import { setupRecording } from "../../helpers/vcr-spec";
 
 setupRecording();
 
 /**
- * The game to exercise. Its prefix must uniquely resolve in the ARC catalog at
+ * The game to exercise. Its prefix must match a game in the ARC catalog at
  * record time; change it to a currently-available game when re-recording.
  */
 const RECORD_GAME = "r11l";
 
-describe("arc-game (recorded real API)", () => {
+/** Pull the exact game id out of a rendered `- <id> (Title) [tags]` listing. */
+function firstIdMatching(listing: string, prefix: string): string {
+  const line = listing
+    .split("\n")
+    .find((l) => l.startsWith(`- ${prefix}`))
+    ?.trim();
+  if (!line) throw new Error(`no game matching ${prefix} in:\n${listing}`);
+  return line.split(" ")[1];
+}
+
+describe("arc (recorded real API)", () => {
   // Real network round-trips (plus the client's own 429 backoff, up to ~8s per
   // retried request) comfortably blow past Vitest's 5s default when actually
   // hitting the live API to record — only matters for `npm run test:record`;
   // playback replays the cassette in milliseconds.
   it(
-    "starts a real game and closes the scorecard on abort",
+    "opens a card, plays a real game on it, and closes it for a score",
     { timeout: 60_000 },
     async () => {
-      const { ctx: c } = ctx(env.ARC_API_KEY);
-      const built = buildArcGameTools(c);
-
-      const out = await callTool(built.tools.arc_start_game, {
-        game: RECORD_GAME
+      const store = memStore();
+      const parent = buildArcScorecardTools({
+        store,
+        client: makeArcClient(env.ARC_API_KEY)
       });
-      expect(out).toContain("Started");
+
+      // 1. The main agent finds the exact game id.
+      const listing = await callTool(parent.arc_list_games, {});
+      const gameId = firstIdMatching(listing, RECORD_GAME);
+
+      // 2. …and opens a scorecard to play it on.
+      const opened = await callTool(parent.arc_open_scorecard, {});
+      expect(opened).toContain("Opened scorecard");
+      const cardId = store.listOpen()[0].cardId;
+      expect(cardId).toBeTruthy();
+
+      // 3. The subagent plays: the ids arrive as its Subtask's params, and the
+      //    session the card is pinned to as the runtime the parent resolved.
+      //    Without that jar the ARC API cannot see the card at all.
+      const { ctx: c } = ctx(env.ARC_API_KEY, {
+        params: { card_id: cardId, game_id: gameId },
+        runtime: { cookies: store.get(cardId)?.cookies ?? {} }
+      });
+      const play = buildArcGameTools(c);
+      const started = await callTool(play.tools.arc_reset_game, {});
+      expect(started).toContain("Started");
 
       const session =
         await c.workspace.readJson<ArcSession>("arc/session.json");
       expect(session).not.toBeNull();
-      expect(session?.cardId).toBeTruthy();
+      expect(session?.cardId).toBe(cardId);
       expect(session?.guid).toBeTruthy();
       expect(session?.availableActions.length).toBeGreaterThan(0);
       expect(typeof session?.state).toBe("string");
@@ -61,10 +96,21 @@ describe("arc-game (recorded real API)", () => {
       expect(Array.isArray(grid?.[0])).toBe(true);
       expect(typeof grid?.[0]?.[0]).toBe("number");
 
-      // abort must close the open scorecard (a real POST /api/scorecard/close).
-      await built.abort?.(c);
-      const closed = await c.workspace.readJson<ArcSession>("arc/session.json");
-      expect(closed?.scorecardClosed).toBe(true);
+      // 4. The main agent closes the card and gets the aggregate.
+      const closed = await callTool(parent.arc_close_scorecard, {
+        card_id: cardId
+      });
+      expect(closed).toContain("closed");
+      expect(closed).toContain("Score");
+
+      const card = store.get(cardId);
+      expect(card?.status).toBe("closed");
+      expect(card?.summary?.card_id).toBe(cardId);
+      // One environment per game played on the card, one run per RESET.
+      expect(card?.summary?.environments.length).toBeGreaterThan(0);
+      expect(card?.summary?.environments[0].runs.length).toBeGreaterThan(0);
+      expect(typeof card?.summary?.score).toBe("number");
+      expect(typeof card?.summary?.total_actions).toBe("number");
     }
   );
 });

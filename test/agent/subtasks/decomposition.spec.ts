@@ -24,7 +24,7 @@ function proposal(
     reply: "On it.",
     subtasks: subtasks.map((s, i) => ({
       localKey: `k${i}`,
-      type: "research",
+      type: "general",
       prompt: "do the thing",
       referenceIndexes: [],
       dependsOn: [],
@@ -181,13 +181,53 @@ describe("resolveDecomposition — dependency graph", () => {
 });
 
 describe("resolveDecomposition — field hygiene", () => {
-  it("trims the reply, type, and prompt", () => {
-    const p = proposal({ type: "  research  ", prompt: "  do it  " });
+  it("trims the reply and prompt", () => {
+    const p = proposal({ prompt: "  do it  " });
     p.reply = "  On it.  ";
     const { reply, drafts } = resolveDecomposition(p, CATALOG);
     expect(reply).toBe("On it.");
-    expect(drafts[0].type).toBe("research");
     expect(drafts[0].prompt).toBe("do it");
+  });
+
+  it("carries a type's params onto the draft", () => {
+    const { drafts } = resolveDecomposition(
+      proposal({
+        type: "arc-game",
+        params: { card_id: "card-1", game_id: "ls20-abc" }
+      }),
+      CATALOG
+    );
+    expect(drafts[0].params).toEqual({
+      card_id: "card-1",
+      game_id: "ls20-abc"
+    });
+  });
+
+  it("defaults to empty params for a type that takes none", () => {
+    const { drafts } = resolveDecomposition(proposal({}), CATALOG);
+    expect(drafts[0].params).toEqual({});
+  });
+
+  it("rejects a subtask missing the params its type requires", () => {
+    // Shape only — that the card exists and is open is a question for durable
+    // rows, answered when the execution starts.
+    expect(() =>
+      resolveDecomposition(proposal({ type: "arc-game" }), CATALOG)
+    ).toThrow(/invalid params/);
+  });
+
+  it("names the offending subtask, since one bad entry fails the attempt", () => {
+    expect(() =>
+      resolveDecomposition(proposal({}, { type: "arc-game" }), CATALOG)
+    ).toThrow(/subtask k1/);
+  });
+
+  it("rejects a type outside the known set", () => {
+    // The enum keeps invented types out of the model's own calls; this is the
+    // guard for anything that reaches resolveDecomposition another way.
+    expect(() =>
+      resolveDecomposition(proposal({ type: "research" }), CATALOG)
+    ).toThrow(/unknown subtask type/);
   });
 });
 

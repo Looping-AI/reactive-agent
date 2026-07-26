@@ -58,6 +58,8 @@ export const subtasks = sqliteTable(
     referencesJson: text("references_json").notNull(),
     /** JSON `SubtaskId[]` — resolved dependency edges. */
     dependsOnJson: text("depends_on_json").notNull(),
+    /** JSON `SubtaskParams` — the type's required inputs, validated at delegation. */
+    paramsJson: text("params_json").notNull().default("{}"),
     status: text("status").notNull(),
     /** JSON `SubtaskResultPart[]` — text-only terminal output; null until complete. */
     resultPartsJson: text("result_parts_json"),
@@ -72,4 +74,41 @@ export const subtasks = sqliteTable(
     index("idx_subtasks_status").on(table.status),
     index("idx_subtasks_created_at").on(table.createdAt)
   ]
+);
+
+/**
+ * ARC-AGI-3 scorecards the main agent has opened.
+ *
+ * The API has no endpoint that lists scorecards, so this table *is* the list —
+ * `arc_list_scorecards` is a pure read of it. One row per `card_id`, inserted by
+ * `arc_open_scorecard` and closed by `arc_close_scorecard`, which persists the
+ * terminal aggregate as `summary_json`.
+ *
+ * Rows are **never deleted** (no `cleanup()`, unlike {@link notifyTasks} and
+ * {@link subtasks}): a closed card cannot be re-read from the API, so the stored
+ * summary is the only lasting record of a score.
+ *
+ * Nothing here binds a card to a Subtask. A scorecard is not owned by one unit of
+ * work — the main agent may hand the same card to several plays — so the card a
+ * subagent uses travels in its prompt, not in a column.
+ */
+export const scorecards = sqliteTable(
+  "scorecards",
+  {
+    /** The ARC-assigned card id (a uuid). */
+    cardId: text("card_id").primaryKey(),
+    status: text("status").notNull().default("open"),
+    /**
+     * JSON cookie jar from `POST /api/scorecard/open`. The ARC API pins a card to
+     * the session that opened it: without these cookies the card is invisible —
+     * RESET reports the game as not found and close 404s — so the jar is part of
+     * the card's identity, not an optimization.
+     */
+    cookiesJson: text("cookies_json").notNull().default("{}"),
+    openedAt: integer("opened_at").notNull(),
+    closedAt: integer("closed_at"),
+    /** JSON `ScorecardSummary` from `POST /api/scorecard/close`; null until closed. */
+    summaryJson: text("summary_json")
+  },
+  (table) => [index("idx_scorecards_opened_at").on(table.openedAt)]
 );

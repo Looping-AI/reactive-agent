@@ -14,14 +14,21 @@ import {
   ARC_SESSION_PATH,
   type ArcSession,
   type FrameResponse,
-  type GameInfo
+  type PlaySummary
 } from "./types";
 
 /**
- * The `arc-game` tool family: start / act / inspect against the ARC-AGI-3 REST
- * API. All durable session state (cookies, guid, card id, frames, metrics) lives
- * in the workspace at {@link ARC_SESSION_PATH}, so the run resumes across chunks
- * and isolate eviction. The API key is closed over from `env`, never model input.
+ * The `arc-game` tool family: reset / act / inspect against the ARC-AGI-3 REST
+ * API. All durable session state (cookies, guid, frames, metrics) lives in the
+ * workspace at {@link ARC_SESSION_PATH}, so the run resumes across chunks and
+ * isolate eviction. The API key is closed over from `env`, never model input.
+ *
+ * This family **plays**; it does not manage scorecards. The card is opened and
+ * closed by the main agent (`arc_open_scorecard` / `arc_close_scorecard`), which
+ * names it in this subtask's prompt — so `card_id` and `game_id` arrive as tool
+ * input, and nothing here ever opens, closes, or chooses a card. That is also why
+ * reaching WIN or GAME_OVER no longer ends anything: the card outlives the play,
+ * and {@link ArcSession.plays} lets the model try again on it.
  *
  * Transient ARC faults surface to the model as tool errors (the SDK captures a
  * throwing tool as an in-band `tool-error` result, not a rejected generation);
@@ -29,8 +36,13 @@ import {
  * turn budget bounds it.
  */
 export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
-  const { workspace, env, emitProgress } = ctx;
+  const { workspace, env, emitProgress, params, runtime } = ctx;
   const client = makeArcClient(env.ARC_API_KEY);
+
+  // The subtask type declares both of these, so they are settled before the
+  // model runs — it cannot pick a different game or play on someone else's card.
+  const gameId = params.game_id;
+  const cardId = params.card_id;
 
   const load = (): Promise<ArcSession | null> =>
     workspace.readJson<ArcSession>(ARC_SESSION_PATH);
@@ -38,43 +50,26 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
     workspace.writeJson(ARC_SESSION_PATH, s);
 
   const tools = {
-    arc_start_game: tool({
+    arc_reset_game: tool({
       description:
-        "Start playing an ARC-AGI-3 game. Call this exactly once, at the very beginning, with the game the user named.",
-      inputSchema: z.object({
-        game: z
-          .string()
-          .describe(
-            "The game id or its prefix, e.g. 'ls20' or 'ls20-016295f7601e'"
-          )
-      }),
-      execute: async ({ game }) => {
-        const existing = await load();
-        if (existing)
-          return describeState(existing, "Game already in progress.");
-
-        let cookies = {};
-        const listed = await client.listGames(cookies);
-        cookies = listed.cookies;
-        const resolved = resolveGame(listed.games, game);
-        if ("error" in resolved) return resolved.error;
-
-        const opened = await client.openScorecard(cookies);
-        cookies = opened.cookies;
-        const reset = await client.reset(
-          { gameId: resolved.game_id, cardId: opened.cardId },
-          cookies
+        "Start playing your assigned game. Call this first. Call it again after a WIN or GAME_OVER to play the same game once more on the same scorecard.",
+      inputSchema: z.object({}),
+      execute: async () => {
+        const previous = await load();
+        // The ARC API pins a scorecard to the session that opened it, so the
+        // first RESET must present the jar the parent stored with the card;
+        // afterwards this session's own jar carries the play forward.
+        const { frame, cookies } = await client.reset(
+          { gameId, cardId },
+          previous?.cookies ?? runtime.cookies ?? {}
         );
-        cookies = reset.cookies;
-
-        const session = initialSession(
-          resolved,
-          opened.cardId,
-          reset.frame,
-          cookies
-        );
+        const session = nextSession(previous, gameId, cardId, frame, cookies);
         await save(session);
-        return describeState(session, `Started ${resolved.game_id}.`);
+        const prefix =
+          session.plays.length === 0
+            ? `Started ${gameId} on scorecard ${cardId}.`
+            : `Restarted ${gameId} (play ${session.playIndex + 1}) on scorecard ${cardId}.`;
+        return describeState(session, prefix);
       }
     }),
 
@@ -112,9 +107,12 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
       }),
       execute: async ({ action, x, y, note }) => {
         const session = await load();
-        if (!session) return "No game in progress. Call arc_start_game first.";
+        if (!session) return "No game in progress. Call arc_reset_game first.";
         if (session.state === "WIN" || session.state === "GAME_OVER") {
-          return `The game is over (state=${session.state}). Write your final report.`;
+          return (
+            `This play is over (state=${session.state}). ` +
+            "Call arc_reset_game to play again on the same scorecard, or write your final report."
+          );
         }
 
         // Reconcile a possibly-interrupted prior action (crash between send and record).
@@ -166,23 +164,24 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
         ) {
           session.levelsReported.push(frame.levels_completed);
           emitProgress({
-            key: `arc:level:${frame.levels_completed}`,
+            // Keyed per play: the same level reached on a later attempt is a
+            // genuinely new note, and the gateway dedupes on this key.
+            key: `arc:${session.gameId}:play${session.playIndex}:level:${frame.levels_completed}`,
             text:
               `ARC ${session.gameId}: reached level ${frame.levels_completed}` +
               `${session.winLevels ? `/${session.winLevels}` : ""} ` +
-              `(${session.actionsSent} actions).`
+              `(${session.actionsSent} actions` +
+              `${session.playIndex > 0 ? `, play ${session.playIndex + 1}` : ""}).`
           });
         }
 
-        if (
-          (session.state === "WIN" || session.state === "GAME_OVER") &&
-          !session.scorecardClosed
-        ) {
-          await closeScorecard(client, session);
-        }
-
         await save(session);
-        return renderOutcome(session, diff) + recovery;
+
+        const terminal =
+          session.state === "WIN" || session.state === "GAME_OVER"
+            ? " | this play is over — call arc_reset_game to play again, or write your final report"
+            : "";
+        return renderOutcome(session, diff) + terminal + recovery;
       }
     }),
 
@@ -222,53 +221,38 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
     })
   };
 
-  const abort = async (c: ToolFamilyContext): Promise<void> => {
-    const session = await c.workspace.readJson<ArcSession>(ARC_SESSION_PATH);
-    if (!session || session.scorecardClosed || !session.cardId) return;
-    await closeScorecard(makeArcClient(c.env.ARC_API_KEY), session);
-    await c.workspace.writeJson(ARC_SESSION_PATH, session);
-  };
-
-  return { tools, abort };
+  // No `abort` hook: the only external state this family used to hold was the
+  // scorecard, and that now belongs to the main agent. A play left unfinished is
+  // simply a run the card records as incomplete.
+  return { tools };
 }
 
-/** Resolve a user-supplied game token to a single game, or a listing message. */
-function resolveGame(
-  games: GameInfo[],
-  query: string
-): GameInfo | { error: string } {
-  const q = query.trim().toLowerCase();
-  const listing = (): string =>
-    "No unique match for that game. Available games:\n" +
-    games
-      .map((g) => `- ${g.game_id}${g.title ? ` (${g.title})` : ""}`)
-      .join("\n") +
-    "\nTell the user which games are available and stop.";
-  if (q === "") return { error: listing() };
-
-  // Tiers, most specific first: exact id, prefix-before-dash, generic prefix.
-  const tiers = [
-    games.filter((g) => g.game_id.toLowerCase() === q),
-    games.filter((g) => g.game_id.toLowerCase().split("-")[0] === q),
-    games.filter((g) => g.game_id.toLowerCase().startsWith(q))
-  ];
-  for (const tier of tiers) {
-    if (tier.length === 1) return tier[0];
-    if (tier.length > 1) return { error: listing() };
-  }
-  return { error: listing() };
-}
-
-function initialSession(
-  game: GameInfo,
+/**
+ * The session after a RESET: a fresh play, with any previous one archived into
+ * `plays` so the final report can account for every attempt. Per-play counters
+ * (`actionsSent`, `levelsReported`) start over; the cookie jar and the history of
+ * plays carry forward.
+ */
+function nextSession(
+  previous: ArcSession | null,
+  gameId: string,
   cardId: string,
   frame: FrameResponse,
   cookies: Record<string, string>
 ): ArcSession {
+  const plays: PlaySummary[] = previous ? [...previous.plays] : [];
+  if (previous) {
+    plays.push({
+      gameId: previous.gameId,
+      guid: previous.guid,
+      state: previous.state,
+      levelsCompleted: previous.levelsCompleted,
+      actionsSent: previous.actionsSent
+    });
+  }
   return {
-    gameId: game.game_id,
-    gameTitle: game.title ?? game.game_id,
     cardId,
+    gameId,
     guid: frame.guid,
     cookies,
     winLevels: frame.win_levels ?? 0,
@@ -276,24 +260,13 @@ function initialSession(
     state: frame.state,
     availableActions: frame.available_actions,
     actionsSent: 0,
+    playIndex: plays.length,
+    plays,
     levelsReported: [],
     lastFrame: lastGrid(frame.frame),
     prevFrame: null,
-    pendingAction: null,
-    scorecardClosed: false
+    pendingAction: null
   };
-}
-
-async function closeScorecard(
-  client: ReturnType<typeof makeArcClient>,
-  session: ArcSession
-): Promise<void> {
-  try {
-    await client.closeScorecard(session.cardId, session.cookies);
-  } catch {
-    // Best-effort: an unclosed scorecard is a documented residual, not a failure.
-  }
-  session.scorecardClosed = true;
 }
 
 /** The compact per-action outcome the model reasons over (never the raw grid). */

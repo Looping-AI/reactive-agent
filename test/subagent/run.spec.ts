@@ -20,7 +20,8 @@ import {
   type ChunkRunState
 } from "@/subagent/run";
 import type { ModelPair } from "@/agent/model";
-import type { ProgressEvent, RecipeLimits } from "@/agent/subtasks/types";
+import type { ProgressEvent } from "@/agent/subtasks/types";
+import type { RecipeLimits } from "@/recipes/types";
 import { mockModel, type MockStep } from "../agent/mock-model";
 import { makeRequest } from "./fixtures";
 

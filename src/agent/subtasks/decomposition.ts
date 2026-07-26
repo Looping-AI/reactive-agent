@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { MAX_SUBTASKS } from "@/config";
 import type { ReferenceCatalogEntry } from "./catalog";
+import {
+  SUBTASK_TYPE_KEYS,
+  SubtaskParamsError,
+  validateSubtaskParams
+} from "./subtask-types";
 import type {
   DecompositionProposal,
   SubtaskDraft,
@@ -48,10 +53,19 @@ const nonBlank = (label: string) =>
 
 const subtaskProposalSchema = z.object({
   localKey: nonBlank("localKey"),
-  type: nonBlank("type"),
+  // A closed enum, not prose: an invented type is rejected by the tool schema
+  // itself rather than silently resolving to the general recipe.
+  type: z.enum(SUBTASK_TYPE_KEYS),
   prompt: nonBlank("prompt"),
   referenceIndexes: z.array(z.number().int().min(1)).optional(),
-  dependsOn: z.array(nonBlank("dependsOn entry"))
+  dependsOn: z.array(nonBlank("dependsOn entry")),
+  /**
+   * The type's required inputs — ids the model quotes from a tool result (e.g.
+   * a scorecard `card_id`). Which keys a type requires is declared in
+   * {@link file://./subtask-types.ts}; this schema only says they are flat
+   * strings, because the per-type contract is what actually validates them.
+   */
+  params: z.record(z.string(), z.string()).optional()
 });
 
 /**
@@ -183,13 +197,28 @@ export function resolveDecomposition(
 
   assertAcyclic(proposal);
 
-  const drafts: SubtaskDraft[] = proposal.subtasks.map((s) => ({
-    localKey: s.localKey,
-    type: s.type.trim(),
-    prompt: s.prompt.trim(),
-    references: resolveReferences(s.localKey, s.referenceIndexes, catalog),
-    dependsOn: [...s.dependsOn]
-  }));
+  const drafts: SubtaskDraft[] = proposal.subtasks.map((s) => {
+    const type = s.type.trim();
+    let params;
+    try {
+      // Shape only. Whether an id names a row that exists — and is still usable —
+      // is a question for durable state, answered when the execution starts.
+      params = validateSubtaskParams(type, s.params);
+    } catch (err) {
+      if (!(err instanceof SubtaskParamsError)) throw err;
+      throw new DecompositionValidationError(
+        `subtask ${s.localKey}: ${err.message}`
+      );
+    }
+    return {
+      localKey: s.localKey,
+      type,
+      prompt: s.prompt.trim(),
+      references: resolveReferences(s.localKey, s.referenceIndexes, catalog),
+      dependsOn: [...s.dependsOn],
+      params
+    };
+  });
 
   return { reply: proposal.reply.trim(), drafts };
 }

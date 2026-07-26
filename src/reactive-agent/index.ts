@@ -17,7 +17,8 @@ import {
   type GatewayMetadata,
   type ModelPair
 } from "@/agent/model";
-import { callerContext, soulPrompt } from "@/agent/prompt";
+import { callerContext, scorecardContext, soulPrompt } from "@/agent/prompt";
+import { makeArcClient } from "@/recipes/arc-game/client";
 import { buildTools } from "@/agent/tools";
 import { archiveMessages } from "@/agent/recall";
 import { runTurn } from "@/agent/turn";
@@ -27,17 +28,16 @@ import {
   sessionText
 } from "@/agent/history";
 import { buildAgentSession, type SessionLike } from "@/agent/session";
-import {
-  resolveRecipeForType,
-  validateRecipe
-} from "@/agent/subtasks/registry";
+import { validateRecipe } from "@/recipes/validation";
+import type { ResolvedRecipe } from "@/recipes/types";
+import { resolveRecipeForType } from "@/agent/subtasks/subtask-types";
 import type {
   CompositionBranch,
   DependencyResult,
   RecipeChunkResult,
   RecipeExecutionRequest,
+  SubtaskRuntime,
   RecipeExecutionResult,
-  ResolvedRecipe,
   Subtask,
   SubtaskChunkOutcome,
   SubtaskId,
@@ -197,15 +197,22 @@ export class ReactiveAgent extends Agent<Env> {
     const hasArchive = (await session.getCompactions()).length > 0;
     return {
       ...(await session.tools()),
-      ...buildTools(
-        {
+      ...buildTools({
+        recall: {
           index: this.env.VECTORIZE,
           namespace: recallNamespace(identity),
           embed: embedTexts,
           hasArchive
         },
-        this.env.BROWSER
-      )
+        browser: this.env.BROWSER,
+        // The ARC scorecard lifecycle is the main agent's: it opens a card,
+        // names it in the prompt of each play it delegates, and closes it for
+        // the score. The playing subagent only ever RESETs and acts.
+        arcScorecard: {
+          store: this.db.scorecards,
+          client: makeArcClient(this.env.ARC_API_KEY)
+        }
+      })
     };
   }
 
@@ -364,7 +371,9 @@ export class ReactiveAgent extends Agent<Env> {
       round,
       text,
       allowControl,
-      systemSuffix: callerContext(identity),
+      systemSuffix:
+        callerContext(identity) +
+        scorecardContext(this.db.scorecards.listOpen()),
       tools: await this.mainAgentTools(session, identity),
       models: this.modelPair({ taskId, round }),
       branches: this.compositionBranches(taskId),
@@ -408,6 +417,7 @@ export class ReactiveAgent extends Agent<Env> {
       type: s.type,
       prompt: s.prompt,
       dependsOn: s.dependsOn,
+      params: s.params,
       status: s.status,
       resultParts: s.resultParts,
       error: s.error
@@ -525,9 +535,14 @@ export class ReactiveAgent extends Agent<Env> {
     if (prepared.kind === "terminal") {
       return { done: true, status: prepared.subtask.status, progress: [] };
     }
-    const { request, recipe, name } = prepared;
+    const { request, recipe, name, runtime } = prepared;
 
-    const outcome = await this.executeChunkInChild(name, request, chunk);
+    const outcome = await this.executeChunkInChild(
+      name,
+      request,
+      chunk,
+      runtime
+    );
 
     // The Task may have been canceled while the chunk ran — checked *before* any
     // progress is published, so a canceled Task emits nothing further. Applies to
@@ -618,6 +633,7 @@ export class ReactiveAgent extends Agent<Env> {
         request: RecipeExecutionRequest;
         recipe: ResolvedRecipe;
         name: string;
+        runtime: SubtaskRuntime;
       }
   > {
     const subtask = this.db.subtasks.get(id);
@@ -647,19 +663,22 @@ export class ReactiveAgent extends Agent<Env> {
     }
 
     const dependencyResults = this.loadDependencyResults(subtask);
-    const recipe = resolveRecipeForType(subtask.type);
 
+    let recipe: ResolvedRecipe | undefined;
     let validated;
     try {
+      recipe = resolveRecipeForType(subtask.type);
       validated = validateRecipe(recipe);
     } catch (err) {
-      // A disabled Recipe is a configuration bug, not a transient fault. Record it
-      // as a branch failure so the DAG's skip semantics apply to its dependents.
-      const message = `recipe ${recipe.key} unusable: ${String(err)}`;
-      this.db.subtasks.start(id, {
-        recipeId: recipe.key,
-        recipeVersion: recipe.version
-      });
+      // An unknown/retired type or a disabled/soul-less Recipe is a
+      // configuration bug, not a transient fault. Record it as a branch failure
+      // so the DAG's skip semantics apply to its dependents.
+      const recipeId = recipe?.key ?? subtask.type;
+      const recipeVersion = recipe?.version ?? 0;
+      const message = recipe
+        ? `recipe ${recipeId} unusable: ${String(err)}`
+        : `unknown subtask type "${subtask.type}": ${String(err)}`;
+      this.db.subtasks.start(id, { recipeId, recipeVersion });
       this.db.subtasks.fail(id, message);
       return { kind: "terminal", subtask: this.requireSubtask(id) };
     }
@@ -685,12 +704,20 @@ export class ReactiveAgent extends Agent<Env> {
     const request: RecipeExecutionRequest = {
       taskId: subtask.taskId,
       subtaskId: id,
+      type: subtask.type,
       recipe: validated,
       prompt: subtask.prompt,
       references: subtask.references,
-      dependencyResults
+      dependencyResults,
+      params: subtask.params
     };
-    return { kind: "ready", request, recipe: validated, name };
+    return {
+      kind: "ready",
+      request,
+      recipe: validated,
+      name,
+      runtime: this.resolveRuntime(subtask)
+    };
   }
 
   /**
@@ -701,11 +728,12 @@ export class ReactiveAgent extends Agent<Env> {
   private async executeChunkInChild(
     name: string,
     request: RecipeExecutionRequest,
-    chunk: number
+    chunk: number,
+    runtime: SubtaskRuntime
   ): Promise<RecipeChunkResult> {
     const child = await this.subAgent(RecipeSubagent, name);
     try {
-      return await child.executeChunk(request, chunk);
+      return await child.executeChunk(request, chunk, runtime);
     } catch (err) {
       if (!String(err).includes(FINGERPRINT_MISMATCH)) throw err;
       console.warn("[reactive-agent] stale subagent state, recreating", {
@@ -713,8 +741,29 @@ export class ReactiveAgent extends Agent<Env> {
       });
       await this.deleteSubAgent(RecipeSubagent, name);
       const fresh = await this.subAgent(RecipeSubagent, name);
-      return await fresh.executeChunk(request, chunk);
+      return await fresh.executeChunk(request, chunk, runtime);
     }
+  }
+
+  /**
+   * Resolve a Subtask's params into the session state its execution needs — the
+   * half of an execution's context the model cannot supply.
+   *
+   * Today that is one thing: an `arc-game` subtask names a scorecard, and the ARC
+   * API pins that card to the session that opened it, so the play is only
+   * possible with the jar stored on our own row. Read once here rather than
+   * refreshed mid-run: the jar is fixed when the card is opened and never
+   * rewritten, so every chunk resolves the same value.
+   *
+   * A card that is unknown or already closed yields no jar; the resulting call
+   * fails against the API with a real diagnostic rather than being silently
+   * retried.
+   */
+  private resolveRuntime(subtask: Subtask): SubtaskRuntime {
+    const cardId = subtask.params.card_id;
+    if (!cardId) return {};
+    const card = this.db.scorecards.get(cardId);
+    return card ? { cookies: card.cookies } : {};
   }
 
   /** The validated tool families for a Subtask type, or none if the recipe is unusable. */
