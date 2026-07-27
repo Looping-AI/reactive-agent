@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { importJWK, flattenedVerify, base64url } from "jose";
+import {
+  AgentCard,
+  type AgentCardSignature,
+  verifyAgentCardSignature
+} from "@a2a-js/sdk";
 import {
   buildBaseCard,
   parsePrivateJwk,
@@ -7,7 +11,6 @@ import {
   signCard,
   A2A_RPC_PATH
 } from "@/a2a/card";
-import { canonicalCardPayload } from "@/a2a/canonical";
 import { TEST_AGENT_PRIVATE_JWK } from "../fixtures";
 
 const ORIGIN = "https://agent.example.com";
@@ -41,9 +44,16 @@ describe("parsePrivateJwk", () => {
 });
 
 describe("buildBaseCard", () => {
-  it("sets url to origin + A2A_RPC_PATH", () => {
+  it("advertises one JSON-RPC interface at origin + A2A_RPC_PATH", () => {
+    // v1.0 replaced the card-level `url`/`preferredTransport`/`protocolVersion`
+    // trio with a `supportedInterfaces` list carrying a version per endpoint.
     const card = buildBaseCard(ORIGIN);
-    expect(card.url).toBe(`${ORIGIN}${A2A_RPC_PATH}`);
+    expect(card.supportedInterfaces).toHaveLength(1);
+    expect(card.supportedInterfaces[0]).toMatchObject({
+      url: `${ORIGIN}${A2A_RPC_PATH}`,
+      protocolBinding: "JSONRPC",
+      protocolVersion: "1.0"
+    });
   });
 
   it("disables streaming and advertises push notifications (async accept + notify)", () => {
@@ -55,8 +65,18 @@ describe("buildBaseCard", () => {
   it("includes required A2A fields", () => {
     const card = buildBaseCard(ORIGIN);
     expect(card.name).toBeTruthy();
-    expect(card.protocolVersion).toBeTruthy();
     expect(card.skills.length).toBeGreaterThan(0);
+  });
+
+  it("advertises the gateway bearer-JWT security scheme", () => {
+    const card = buildBaseCard(ORIGIN);
+    expect(card.securitySchemes.gatewayJwt?.scheme).toEqual({
+      $case: "httpAuthSecurityScheme",
+      value: { description: "", scheme: "bearer", bearerFormat: "JWT" }
+    });
+    expect(card.securityRequirements).toEqual([
+      { schemes: { gatewayJwt: { list: [] } } }
+    ]);
   });
 });
 
@@ -84,38 +104,69 @@ describe("publicCardJwks", () => {
 });
 
 describe("signCard", () => {
+  const signatures = (card: Record<string, unknown>): AgentCardSignature[] =>
+    card.signatures as AgentCardSignature[];
+
   it("returns a card with a signatures array", async () => {
-    const card = buildBaseCard(ORIGIN);
-    const signed = await signCard(card, CARD_CFG);
-    expect(signed.signatures).toHaveLength(1);
-    expect(signed.signatures![0]).toHaveProperty("protected");
-    expect(signed.signatures![0]).toHaveProperty("signature");
+    const signed = await signCard(buildBaseCard(ORIGIN), CARD_CFG);
+    expect(signatures(signed)).toHaveLength(1);
+    expect(signatures(signed)[0]).toHaveProperty("protected");
+    expect(signatures(signed)[0]).toHaveProperty("signature");
   });
 
-  it("signature verifies against the canonical card payload", async () => {
-    const card = buildBaseCard(ORIGIN);
-    const signed = await signCard(card, CARD_CFG);
+  it("pins the signing kid and jku in the protected header", async () => {
+    const signed = await signCard(buildBaseCard(ORIGIN), CARD_CFG);
+    const header = JSON.parse(
+      new TextDecoder().decode(
+        Uint8Array.from(
+          atob(
+            signatures(signed)[0]
+              .protected.replace(/-/g, "+")
+              .replace(/_/g, "/")
+          ),
+          (c) => c.charCodeAt(0)
+        )
+      )
+    ) as { alg: string; kid: string; jku: string };
+    expect(header.alg).toBe("EdDSA");
+    expect(header.kid).toBe(TEST_AGENT_PRIVATE_JWK.kid);
+    expect(header.jku).toBe(CARD_CFG.jku);
+  });
+
+  it("serves the card in wire form, not the in-memory protobuf shape", async () => {
+    // The two differ under v1.0, and only the wire form is valid A2A JSON — the
+    // security scheme oneof must be a named key, never a `{ $case, value }` pair.
+    const signed = await signCard(buildBaseCard(ORIGIN), CARD_CFG);
+    expect(signed.securitySchemes).toEqual({
+      gatewayJwt: {
+        httpAuthSecurityScheme: { scheme: "bearer", bearerFormat: "JWT" }
+      }
+    });
+  });
+
+  it("produces a signature the SDK's own verifier accepts", async () => {
+    // The end-to-end guard on what the gateway actually runs at registration.
+    // It also pins the ordering `signCard` depends on: the verifier canonicalizes
+    // `AgentCard.toJSON(AgentCard.fromJSON(card))`, so signing the in-memory card
+    // instead of the wire card would sign different bytes and fail here.
+    const signed = await signCard(buildBaseCard(ORIGIN), CARD_CFG);
 
     const { d: _d, ...pubJwk } = TEST_AGENT_PRIVATE_JWK;
-    const publicKey = await importJWK(pubJwk, "EdDSA");
+    void _d;
 
-    const sig = signed.signatures![0];
-    // The card stores protected + signature only (no embedded payload).
-    // Reconstruct the full flattened JWS by base64url-encoding the canonical
-    // payload so flattenedVerify can check the signature end-to-end.
-    const payloadBytes = new TextEncoder().encode(
-      canonicalCardPayload(card as unknown as Record<string, unknown>)
-    );
+    const verify = verifyAgentCardSignature(async () => pubJwk);
     await expect(
-      flattenedVerify(
-        {
-          protected: sig.protected,
-          payload: base64url.encode(payloadBytes),
-          signature: sig.signature
-        },
-        publicKey,
-        { algorithms: ["EdDSA"] }
-      )
-    ).resolves.toBeDefined();
+      verify(signed as unknown as AgentCard)
+    ).resolves.toBeUndefined();
+  });
+
+  it("rejects a tampered card", async () => {
+    const signed = await signCard(buildBaseCard(ORIGIN), CARD_CFG);
+    const { d: _d, ...pubJwk } = TEST_AGENT_PRIVATE_JWK;
+    void _d;
+
+    const tampered = { ...signed, name: "Impostor Agent" };
+    const verify = verifyAgentCardSignature(async () => pubJwk);
+    await expect(verify(tampered as unknown as AgentCard)).rejects.toThrow();
   });
 });

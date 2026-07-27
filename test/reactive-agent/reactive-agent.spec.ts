@@ -1,11 +1,14 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { runInDurableObject } from "cloudflare:test";
+import { MockLanguageModelV3 } from "ai/test";
 import type { Schedule } from "agents";
-import type { Task } from "@a2a-js/sdk";
+import { TaskState } from "@a2a-js/sdk";
 import type { ReactiveAgent } from "@/reactive-agent";
 import type { AgentDB } from "@/db/db";
 import { subagentName } from "@/subagent";
 import { sessionText } from "@/agent/history";
+import { createModelPair, type ModelPair } from "@/agent/model";
+import { testAgentMessage, testTask } from "../fixtures";
 import { freshStub } from "../helpers/do";
 
 /**
@@ -17,11 +20,22 @@ import { freshStub } from "../helpers/do";
  * method and reading state directly with `runInDurableObject`. It doesn't care how
  * a caller got here, so no gateway JWT is involved.
  *
- * `env.AI.run()` throws "needs to be run remotely" immediately (no network), and
- * that is not a transient fault, so the round exhausts both models and returns a
- * typed `failed` — the same graceful path production takes when both models
- * produce nothing usable, minus the model.
+ * Both tests below script the model to fail (rather than reaching the real,
+ * absent `env.AI` binding): the round still exhausts both models and returns a
+ * typed `failed`, the same graceful path production takes when both models
+ * produce nothing usable, but without the noisy "Binding AI needs to be run
+ * remotely" exception workerd logs for every real attempt.
  */
+
+/** A pair whose only model always throws — both primary and fallback exhaust. */
+function throwingPair(message: string): ModelPair {
+  const model = new MockLanguageModelV3({
+    doGenerate: async () => {
+      throw new Error(message);
+    }
+  });
+  return createModelPair({ model });
+}
 
 /** The verified caller a real Worker would pass to `runTaskTurn`. */
 const IDENTITY = { key: "test:1:ada", name: "Ada", kind: "custom" };
@@ -33,12 +47,15 @@ describe("ReactiveAgent — Session persistence (real SQLite)", () => {
     const stub = freshStub("session");
     // Round 0 appends the inbound turn first, then infers — so the turn is
     // durable even though the model never answers and no reply is appended.
-    await stub.runTaskTurn({
-      taskId: "t-session",
-      text: "remember: my favorite color is teal",
-      identity: IDENTITY,
-      round: 0,
-      allowControl: true
+    await runInDurableObject(stub, async (instance) => {
+      instance.modelsOverride = throwingPair("model unavailable");
+      await instance.runTaskTurn({
+        taskId: "t-session",
+        text: "remember: my favorite color is teal",
+        identity: IDENTITY,
+        round: 0,
+        allowControl: true
+      });
     });
 
     const history = await runInDurableObject(stub, (instance) =>
@@ -50,27 +67,30 @@ describe("ReactiveAgent — Session persistence (real SQLite)", () => {
   });
 
   it("accepts a push context without posting when the round never succeeds", async () => {
-    // With no AI binding the round fails before any reply exists, so nothing
-    // may be posted — the push context must be harmless. (The streaming path
-    // itself is unit-covered by inference.spec's `onContent` and notify.spec's
+    // The model fails before any reply exists, so nothing may be posted — the
+    // push context must be harmless. (The streaming path itself is
+    // unit-covered by inference.spec's `onContent` and notify.spec's
     // build/sign/post helpers.)
     const fetchSpy = vi.fn(async () => new Response("ok", { status: 200 }));
     vi.stubGlobal("fetch", fetchSpy);
 
     const stub = freshStub("push-ctx");
-    const result = await stub.runTaskTurn({
-      taskId: "t-push",
-      text: "hello",
-      identity: IDENTITY,
-      round: 0,
-      allowControl: true,
-      push: {
+    const result = await runInDurableObject(stub, (instance) => {
+      instance.modelsOverride = throwingPair("model unavailable");
+      return instance.runTaskTurn({
         taskId: "t-push",
-        contextId: "c-push",
-        pushUrl: "https://gateway.test/a2a/notifications",
-        pushToken: "tok",
-        jku: "https://agent.test/.well-known/jwks.json"
-      }
+        text: "hello",
+        identity: IDENTITY,
+        round: 0,
+        allowControl: true,
+        push: {
+          taskId: "t-push",
+          contextId: "c-push",
+          pushUrl: "https://gateway.test/a2a/notifications",
+          pushToken: "tok",
+          jku: "https://agent.test/.well-known/jwks.json"
+        }
+      });
     });
 
     expect(result.status).toBe("failed");
@@ -88,8 +108,7 @@ describe("ReactiveAgent — async task state (real SQLite)", () => {
         contextId: "c-1"
       })
     );
-    expect(first.kind).toBe("task");
-    expect(first.status.state).toBe("submitted");
+    expect(first.status.state).toBe(TaskState.TASK_STATE_SUBMITTED);
     expect(first.id).toBe("t-1");
 
     // A dispatch retry re-sends the same messageId with a fresh SDK taskId — the
@@ -110,28 +129,24 @@ describe("ReactiveAgent — async task state (real SQLite)", () => {
       instance.beginTask({ messageId: "m-2", taskId: "t-9", contextId: "c-2" })
     );
     await runInDurableObject(stub, (instance) =>
-      instance.saveTask({
-        kind: "task",
-        id: "t-9",
-        contextId: "c-2",
-        status: {
-          state: "completed",
-          message: {
-            kind: "message",
-            role: "agent",
-            messageId: "reply-1",
-            parts: [{ kind: "text", text: "done" }],
-            contextId: "c-2"
-          }
-        }
-      })
+      instance.saveTask(
+        testTask(
+          "t-9",
+          "c-2",
+          TaskState.TASK_STATE_COMPLETED,
+          testAgentMessage("reply-1", "done", "c-2")
+        )
+      )
     );
 
     const loaded = await runInDurableObject(stub, (instance) =>
       instance.getTask("t-9")
     );
-    expect(loaded?.status.state).toBe("completed");
-    expect(loaded?.status.message?.parts?.[0]).toMatchObject({ text: "done" });
+    expect(loaded?.status.state).toBe(TaskState.TASK_STATE_COMPLETED);
+    expect(loaded?.status.message?.parts?.[0]?.content).toEqual({
+      $case: "text",
+      value: "done"
+    });
   });
 
   it("cancelTask flips a pending task to canceled", async () => {
@@ -142,11 +157,11 @@ describe("ReactiveAgent — async task state (real SQLite)", () => {
     const canceled = await runInDurableObject(stub, (instance) =>
       instance.cancelTask("t-3")
     );
-    expect(canceled?.status.state).toBe("canceled");
+    expect(canceled?.status.state).toBe(TaskState.TASK_STATE_CANCELED);
     const loaded = await runInDurableObject(stub, (instance) =>
       instance.getTask("t-3")
     );
-    expect(loaded?.status.state).toBe("canceled");
+    expect(loaded?.status.state).toBe(TaskState.TASK_STATE_CANCELED);
   });
 
   // Both cancel entry points converge on `markCanceled`, which is what makes the
@@ -161,12 +176,9 @@ describe("ReactiveAgent — async task state (real SQLite)", () => {
     [
       "saveTask with a canceled state",
       (i: ReactiveAgent, id: string) =>
-        i.saveTask({
-          kind: "task",
-          id,
-          contextId: "c-ab",
-          status: { state: "canceled" }
-        } as Task) as Promise<unknown>
+        i.saveTask(
+          testTask(id, "c-ab", TaskState.TASK_STATE_CANCELED)
+        ) as Promise<unknown>
     ]
   ])("%s aborts running subagents and only those", async (_name, cancel) => {
     const stub = freshStub(`cancel-abort-${_name.replace(/\W+/g, "-")}`);
@@ -211,7 +223,7 @@ describe("ReactiveAgent — async task state (real SQLite)", () => {
       expect(subAgent).toHaveBeenCalledTimes(1);
       expect(subAgent.mock.calls[0][1]).toBe(subagentName("t-ab", rows[0].id));
       await expect(instance.getTask("t-ab")).resolves.toMatchObject({
-        status: { state: "canceled" }
+        status: { state: TaskState.TASK_STATE_CANCELED }
       });
     });
   });

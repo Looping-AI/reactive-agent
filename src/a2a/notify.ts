@@ -1,6 +1,12 @@
 import { SignJWT, importJWK, type JWK } from "jose";
-import type { Task } from "@a2a-js/sdk";
-import type { PlainTask } from "./task";
+import {
+  A2A_CONTENT_TYPE,
+  Role,
+  StreamResponse,
+  TaskState,
+  type Task
+} from "@a2a-js/sdk";
+import type { PlainPart, PlainTask } from "./task";
 
 /**
  * Outbound push-notification (accept + notify) helpers — the "notify" half of the
@@ -35,20 +41,37 @@ export const NOTIFICATION_TOKEN_HEADER = "x-a2a-notification-token";
  */
 const CALLBACK_TOKEN_TTL = "5m";
 
+/** A v1.0 text part: the `content` oneof plus its required siblings. */
+function textPart(text: string): PlainPart {
+  return {
+    content: { $case: "text", value: text },
+    metadata: undefined,
+    filename: "",
+    mediaType: "text/plain"
+  };
+}
+
 /**
  * The `submitted` Task we return synchronously to accept a turn (A2A §7.2). The
- * gateway only requires `kind:"task"` + a non-empty `id`; the actual reply
- * follows later via the callback.
+ * gateway only requires a non-empty `id`; the actual reply follows later via the
+ * callback. (v1.0 dropped the `kind` discriminator — a Task is identified by its
+ * position in the response, or by the `StreamResponse` payload key on the wire.)
  */
 export function buildSubmittedTask(
   taskId: string,
   contextId: string
 ): PlainTask {
   return {
-    kind: "task",
     id: taskId,
     contextId,
-    status: { state: "submitted", timestamp: new Date().toISOString() }
+    status: {
+      state: TaskState.TASK_STATE_SUBMITTED,
+      message: undefined,
+      timestamp: new Date().toISOString()
+    },
+    artifacts: [],
+    history: [],
+    metadata: undefined
   };
 }
 
@@ -62,25 +85,33 @@ export function buildSubmittedTask(
 function buildTaskUpdate(
   taskId: string,
   contextId: string,
-  state: "working" | "completed" | "failed",
+  state:
+    | TaskState.TASK_STATE_WORKING
+    | TaskState.TASK_STATE_COMPLETED
+    | TaskState.TASK_STATE_FAILED,
   text: string,
   messageId: string
 ): PlainTask {
   return {
-    kind: "task",
     id: taskId,
     contextId,
     status: {
       state,
       timestamp: new Date().toISOString(),
       message: {
-        kind: "message",
-        role: "agent",
+        role: Role.ROLE_AGENT,
         messageId,
-        parts: [{ kind: "text", text }],
-        contextId
+        parts: [textPart(text)],
+        contextId,
+        taskId,
+        metadata: undefined,
+        extensions: [],
+        referenceTaskIds: []
       }
-    }
+    },
+    artifacts: [],
+    history: [],
+    metadata: undefined
   };
 }
 
@@ -105,7 +136,7 @@ export function buildWorkingTask(
   return buildTaskUpdate(
     taskId,
     contextId,
-    "working",
+    TaskState.TASK_STATE_WORKING,
     text,
     `${taskId}:${key}`
   );
@@ -125,7 +156,7 @@ export function buildCompletedTask(
   return buildTaskUpdate(
     taskId,
     contextId,
-    "completed",
+    TaskState.TASK_STATE_COMPLETED,
     reply,
     `${taskId}:final`
   );
@@ -155,7 +186,13 @@ export function buildFailedTask(
   contextId: string,
   text: string
 ): PlainTask {
-  return buildTaskUpdate(taskId, contextId, "failed", text, `${taskId}:final`);
+  return buildTaskUpdate(
+    taskId,
+    contextId,
+    TaskState.TASK_STATE_FAILED,
+    text,
+    `${taskId}:final`
+  );
 }
 
 /**
@@ -177,6 +214,26 @@ export async function signCallbackJwt(
 }
 
 /**
+ * The A2A v1.0 push-notification body for a Task snapshot: the Task wrapped in a
+ * `StreamResponse` and encoded with the generated `toJSON`. This mirrors the
+ * SDK's own `V1PushNotificationSerializer`, which is what a v1.0 gateway parses.
+ *
+ * Both halves matter. The wrapper is the v1.0 replacement for the removed `kind`
+ * discriminator — the payload key (`task`) is what tells the receiver which of
+ * the four event shapes this is, so a bare Task is no longer self-describing.
+ * And `toJSON` is not optional: the in-memory protobuf shape is *not* the wire
+ * shape (enums are numbers, oneofs are `{ $case, value }` wrappers), so a plain
+ * `JSON.stringify(task)` would emit `"state": 3` and
+ * `"parts": [{ "content": { "$case": "text", … } }]` — neither of which is valid
+ * A2A JSON.
+ */
+export function notificationBody(task: Task): string {
+  return JSON.stringify(
+    StreamResponse.toJSON({ payload: { $case: "task", value: task } })
+  );
+}
+
+/**
  * POST the terminal Task to the gateway's push-notification webhook. Returns the
  * raw `Response` so the caller (the workflow's `notify` step) can decide whether
  * a non-2xx warrants a retry.
@@ -190,10 +247,11 @@ export async function postNotification(
   return fetch(url, {
     method: "POST",
     headers: {
-      "content-type": "application/json",
+      // v1.0 registered its own media type; v0.3 used `application/json`.
+      "content-type": A2A_CONTENT_TYPE,
       authorization: `Bearer ${jwt}`,
       [NOTIFICATION_TOKEN_HEADER]: token
     },
-    body: JSON.stringify(task)
+    body: notificationBody(task)
   });
 }

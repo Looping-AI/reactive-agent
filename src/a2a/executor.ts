@@ -1,9 +1,10 @@
-import type {
-  AgentExecutor,
-  ExecutionEventBus,
-  RequestContext
+import {
+  AgentEvent,
+  type AgentExecutor,
+  type ExecutionEventBus,
+  type RequestContext
 } from "@a2a-js/sdk/server";
-import type { PushNotificationConfig } from "@a2a-js/sdk";
+import type { TaskPushNotificationConfig } from "@a2a-js/sdk";
 import { env } from "cloudflare:workers";
 import type { GatewayIdentity } from "./verify";
 import type { HandleTaskParams } from "@/workflows/handle-task";
@@ -12,8 +13,12 @@ import { inboundText } from "./inbound";
 
 /** Per-request config the outer Worker extracts from `message/send` and injects. */
 export interface ExecutorConfig {
-  /** The gateway's callback webhook + validation token (required for `message/send`). */
-  pushConfig?: PushNotificationConfig;
+  /**
+   * The gateway's callback webhook + validation token (required for
+   * `SendMessage`). v1.0 flattened the old standalone `PushNotificationConfig`
+   * into `TaskPushNotificationConfig`, so `url`/`token` now sit directly on it.
+   */
+  pushConfig?: TaskPushNotificationConfig;
   /** This agent's card-signing JWKS URL — the callback JWT `jku`. */
   jku: string;
 }
@@ -91,7 +96,9 @@ export class A2AExecutor implements AgentExecutor {
     });
 
     // The accept ack: a `submitted` Task, not a Message. Returned synchronously.
-    eventBus.publish(task);
+    // v1.0 buses take a discriminated `AgentExecutionEvent` rather than a raw
+    // object, now that `kind` is gone from the domain types.
+    eventBus.publish(AgentEvent.task(task));
     eventBus.finished();
   };
 
@@ -133,7 +140,7 @@ export class A2AExecutor implements AgentExecutor {
     eventBus: ExecutionEventBus
   ): Promise<void> => {
     const task = await getAgent(this.identity).cancelTask(taskId);
-    if (task) eventBus.publish(task);
+    if (task) eventBus.publish(AgentEvent.task(task));
     eventBus.finished();
   };
 }

@@ -1,8 +1,15 @@
-import { AGENT_CARD_PATH, type PushNotificationConfig } from "@a2a-js/sdk";
+import {
+  AGENT_CARD_PATH,
+  A2A_VERSION_HEADER,
+  type TaskPushNotificationConfig
+} from "@a2a-js/sdk";
 import {
   DefaultRequestHandler,
-  JsonRpcTransportHandler
+  JsonRpcTransportHandler,
+  ServerCallContext,
+  type User
 } from "@a2a-js/sdk/server";
+import { RequestMalformedError, toJsonRpcError } from "@a2a-js/sdk/errors";
 import {
   buildBaseCard,
   parsePrivateJwk,
@@ -54,6 +61,24 @@ function unauthorized(reason: string): Response {
   });
 }
 
+/**
+ * The verified calling gateway, as the SDK's {@link User}. A2A v1.0 made
+ * `ServerCallContext` mandatory across the server interfaces, and stores use
+ * `context.user` to scope data to its owner. Our scoping is one level up — the
+ * DO instance is already keyed by `identity.key` — so this exists to keep the
+ * context honest about who the authenticated caller is rather than to drive
+ * lookups.
+ */
+class GatewayUser implements User {
+  constructor(private readonly identity: GatewayIdentity) {}
+  get isAuthenticated(): boolean {
+    return true;
+  }
+  get userName(): string {
+    return this.identity.key ?? "";
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -102,42 +127,52 @@ export default {
         });
       }
 
-      const body = await request.json();
+      const body = (await request.json()) as Record<string, unknown>;
       const rpcBody = body as {
         id?: string | number | null;
         method?: string;
         params?: {
-          configuration?: { pushNotificationConfig?: PushNotificationConfig };
+          configuration?: {
+            taskPushNotificationConfig?: TaskPushNotificationConfig;
+          };
         };
       };
 
-      // This agent is async-only: a `message/send` must carry a
-      // `pushNotificationConfig` (webhook + token) so the reply can be delivered
-      // out of band. Reject a synchronous send up front — there is nowhere to
-      // notify otherwise. (`tasks/*` and discovery methods carry no config.)
-      const pushConfig = rpcBody.params?.configuration?.pushNotificationConfig;
-      if (rpcBody.method === "message/send") {
+      // This agent is async-only: a `SendMessage` must carry a push-notification
+      // config (webhook + token) so the reply can be delivered out of band.
+      // Reject a synchronous send up front — there is nowhere to notify
+      // otherwise. (`GetTask`/`CancelTask` and discovery carry no config.)
+      //
+      // v1.0 renamed both the method (`message/send` → `SendMessage`) and the
+      // field (`configuration.pushNotificationConfig` →
+      // `configuration.taskPushNotificationConfig`), and flattened `url`/`token`
+      // onto that object.
+      const pushConfig =
+        rpcBody.params?.configuration?.taskPushNotificationConfig;
+      if (rpcBody.method === "SendMessage") {
         let pushConfigError: string | undefined;
         if (!pushConfig?.url) {
           pushConfigError =
-            "pushNotificationConfig.url is required: this agent " +
+            "taskPushNotificationConfig.url is required: this agent " +
             "replies asynchronously via push notification (A2A §13.2)";
         } else if (!pushConfig.token) {
           pushConfigError =
-            "pushNotificationConfig.token is required: the gateway uses it " +
+            "taskPushNotificationConfig.token is required: the gateway uses it " +
             "to correlate the callback to the pending task (A2A §13.2)";
         } else {
           try {
             new URL(pushConfig.url);
           } catch {
-            pushConfigError = `pushNotificationConfig.url is not a valid URL: ${pushConfig.url}`;
+            pushConfigError = `taskPushNotificationConfig.url is not a valid URL: ${pushConfig.url}`;
           }
         }
         if (pushConfigError) {
+          // Map through the SDK so the JSON-RPC code and its `data` payload stay
+          // tied to the spec's error registry instead of a hard-coded -32602.
           return Response.json({
             jsonrpc: "2.0",
             id: rpcBody.id ?? null,
-            error: { code: -32602, message: pushConfigError }
+            error: toJsonRpcError(new RequestMalformedError(pushConfigError))
           });
         }
       }
@@ -151,7 +186,19 @@ export default {
         })
       );
       const rpc = new JsonRpcTransportHandler(handler);
-      const result = await rpc.handle(body);
+      // `ServerCallContext` is mandatory in v1.0. `requestedVersion` comes from
+      // the `A2A-Version` header and is validated against the versions our card
+      // declares on its JSON-RPC interface; leaving it unset makes the SDK assume
+      // v0.3, which this card no longer advertises. Passing `undefined` when the
+      // header is absent keeps that SDK default (and its clean
+      // `VersionNotSupportedError`) rather than silently promoting the caller.
+      const result = await rpc.handle(
+        body,
+        new ServerCallContext({
+          user: new GatewayUser(identity),
+          requestedVersion: request.headers.get(A2A_VERSION_HEADER) ?? undefined
+        })
+      );
 
       // We don't advertise streaming; reject async generators outright.
       if (Symbol.asyncIterator in (result as object)) {

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
+import { Role, type Part } from "@a2a-js/sdk";
 import type { RequestContext } from "@a2a-js/sdk/server";
 import type { ExecutionEventBus } from "@a2a-js/sdk/server";
 import type { ReactiveAgent } from "@/reactive-agent";
@@ -8,24 +9,39 @@ import type { HandleTaskParams } from "@/workflows/handle-task";
 
 const identity = { key: "custom:1:ada", name: "Ada", kind: "custom" };
 
-function requestContext(parts: unknown[]): RequestContext {
+function requestContext(parts: Part[]): RequestContext {
   return {
     taskId: "task-1",
     contextId: "context-1",
     userMessage: {
       messageId: "message-1",
-      role: "user",
-      kind: "message",
+      role: Role.ROLE_USER,
       parts
     }
   } as unknown as RequestContext;
+}
+
+/** A v1.0 text part, optionally carrying part metadata. */
+function text(value: string, metadata?: Record<string, unknown>): Part {
+  return {
+    content: { $case: "text", value },
+    metadata,
+    filename: "",
+    mediaType: "text/plain"
+  };
 }
 
 function executor(): A2AExecutor {
   return new A2AExecutor(identity, {
     pushConfig: {
       url: "https://gateway.example.test/a2a/notifications",
-      token: "push-token"
+      token: "push-token",
+      // v1.0 flattened `PushNotificationConfig` into `TaskPushNotificationConfig`;
+      // the gateway leaves these empty on a `SendMessage`.
+      tenant: "",
+      id: "",
+      taskId: "",
+      authentication: undefined
     },
     jku: "https://agent.example.test/.well-known/jwks.json"
   });
@@ -45,9 +61,7 @@ describe("A2AExecutor", () => {
     const finished = vi.fn();
 
     await executor().execute(
-      requestContext([
-        { kind: "text", text: "hello", metadata: { ignored: true } }
-      ]),
+      requestContext([text("hello", { ignored: true })]),
       { publish, finished } as unknown as ExecutionEventBus
     );
 
@@ -58,7 +72,10 @@ describe("A2AExecutor", () => {
         text: "hello"
       })
     });
-    expect(publish).toHaveBeenCalledWith({ id: "task-1" });
+    expect(publish).toHaveBeenCalledWith({
+      kind: "task",
+      data: { id: "task-1" }
+    });
     expect(finished).toHaveBeenCalledOnce();
   });
 
@@ -75,13 +92,16 @@ describe("A2AExecutor", () => {
     const finished = vi.fn();
 
     await expect(
-      executor().execute(requestContext([{ kind: "text", text: "hello" }]), {
+      executor().execute(requestContext([text("hello")]), {
         publish,
         finished
       } as unknown as ExecutionEventBus)
     ).resolves.toBeUndefined();
 
-    expect(publish).toHaveBeenCalledWith({ id: "task-1" });
+    expect(publish).toHaveBeenCalledWith({
+      kind: "task",
+      data: { id: "task-1" }
+    });
     expect(finished).toHaveBeenCalledOnce();
   });
 
@@ -97,7 +117,7 @@ describe("A2AExecutor", () => {
     const publish = vi.fn();
 
     await expect(
-      executor().execute(requestContext([{ kind: "text", text: "hello" }]), {
+      executor().execute(requestContext([text("hello")]), {
         publish,
         finished: vi.fn()
       } as unknown as ExecutionEventBus)
@@ -115,7 +135,7 @@ describe("A2AExecutor", () => {
     );
 
     await expect(
-      executor().execute(requestContext([{ kind: "text", text: "hello" }]), {
+      executor().execute(requestContext([text("hello")]), {
         publish: vi.fn(),
         finished: vi.fn()
       } as unknown as ExecutionEventBus)
@@ -127,7 +147,7 @@ describe("A2AExecutor", () => {
     const create = vi.spyOn(env.HANDLE_TASK_WORKFLOW, "create");
 
     await expect(
-      executor().execute(requestContext([{ kind: "text", text: "  " }]), {
+      executor().execute(requestContext([text("  ")]), {
         publish: vi.fn(),
         finished: vi.fn()
       } as unknown as ExecutionEventBus)

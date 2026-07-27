@@ -2,7 +2,7 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 import { importJWK, jwtVerify } from "jose";
 import { env } from "cloudflare:workers";
 import type { WorkflowStep } from "cloudflare:workers";
-import type { Task } from "@a2a-js/sdk";
+import { Task, TaskState } from "@a2a-js/sdk";
 import type { ReactiveAgent } from "@/reactive-agent";
 import { runHandleTask, type HandleTaskParams } from "@/workflows/handle-task";
 import { TASK_FAILED_TEXT } from "@/a2a/notify";
@@ -96,7 +96,7 @@ interface AgentOptions {
   /** Per-node chunk count before the run terminates. Default: 1 (single chunk). */
   chunks?: Record<number, number>;
   /** Task state `getTask` reports (cancellation). */
-  state?: Task["status"]["state"];
+  state?: TaskState;
   /** Runs when a node starts executing — used to cancel mid-DAG. */
   onExecute?: (id: number, agent: AgentFake) => void;
   /** Runs after a round returns — used to cancel during delivery. */
@@ -118,7 +118,7 @@ interface AgentFake {
     status: SubtaskStatus;
     dependsOn: number[];
   }[];
-  state?: Task["status"]["state"];
+  state?: TaskState;
   /** Highest number of `executeSubtaskChunk` calls in flight at once. */
   maxConcurrent: number;
   executed: number[];
@@ -158,11 +158,15 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
       }));
 
   /** The DO's own cancellation predicate, which every round-loop RPC applies. */
-  const canceled = () => agent.state === "canceled";
+  const canceled = () => agent.state === TaskState.TASK_STATE_CANCELED;
 
   const stub = {
     getTask: vi.fn(async (): Promise<Task | null> =>
-      agent.state ? ({ status: { state: agent.state } } as Task) : null
+      agent.state
+        ? ({
+            status: { state: agent.state, message: undefined, timestamp: "" }
+          } as Task)
+        : null
     ),
     markWorking: vi.fn(async () => (canceled() ? "canceled" : "ok")),
 
@@ -170,7 +174,8 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
     // state and reports it, which is what keeps `notify` from firing.
     saveTask: vi.fn(async (task: Task) => {
       if (opts.saveRefuses) return false;
-      if (canceled() && task.status.state !== "canceled") return false;
+      if (canceled() && task.status?.state !== TaskState.TASK_STATE_CANCELED)
+        return false;
       agent.saved = task;
       return true;
     }),
@@ -333,8 +338,17 @@ function mockFetch() {
   return captured;
 }
 
-const bodyOf = (captured: { init?: RequestInit }) =>
-  JSON.parse(captured.init?.body as string) as Task;
+/**
+ * The Task carried by a v1.0 push-notification body. The wire payload is a
+ * `StreamResponse` wrapper (`{ task: … }`) holding the JSON encoding, so this
+ * unwraps and decodes it back to the in-memory shape the assertions compare on.
+ */
+const bodyOf = (captured: { init?: RequestInit }): Task => {
+  const payload = JSON.parse(captured.init?.body as string) as {
+    task: unknown;
+  };
+  return Task.fromJSON(payload.task);
+};
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -364,7 +378,7 @@ describe("HandleTaskWorkflow — the round loop", () => {
       "sweep",
       "notify"
     ]);
-    expect(agent.saved?.status.state).toBe("completed");
+    expect(agent.saved?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
 
     // POSTed to the gateway webhook with the validation token + signed JWT.
     expect(captured.url).toBe(PUSH_URL);
@@ -380,12 +394,11 @@ describe("HandleTaskWorkflow — the round loop", () => {
     expect(payload.aud).toBe(PUSH_URL);
 
     const body = bodyOf(captured);
-    expect(body.kind).toBe("task");
     expect(body.id).toBe("task-1");
-    expect(body.status.state).toBe("completed");
-    expect(body.status.message?.parts?.[0]).toMatchObject({
-      kind: "text",
-      text: "the answer"
+    expect(body.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
+    expect(body.status?.message?.parts?.[0]?.content).toEqual({
+      $case: "text",
+      value: "the answer"
     });
   });
 
@@ -403,8 +416,9 @@ describe("HandleTaskWorkflow — the round loop", () => {
     expect(agent.turns).toEqual([
       { round: 0, allowControl: true, decision: "replied" }
     ]);
-    expect(bodyOf(captured).status.message?.parts?.[0]).toMatchObject({
-      text: "You said aisle seats."
+    expect(bodyOf(captured).status?.message?.parts?.[0]?.content).toEqual({
+      $case: "text",
+      value: "You said aisle seats."
     });
   });
 
@@ -433,7 +447,7 @@ describe("HandleTaskWorkflow — the round loop", () => {
       "sweep",
       "notify"
     ]);
-    expect(agent.saved?.status.state).toBe("completed");
+    expect(agent.saved?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
   });
 
   it("scopes each round's wave scan to that round's own DAG", async () => {
@@ -469,7 +483,7 @@ describe("HandleTaskWorkflow — the round loop", () => {
       "execute:1:chunk:1",
       "execute:1:chunk:2"
     ]);
-    expect(agent.saved?.status.state).toBe("completed");
+    expect(agent.saved?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
   });
 
   it("threads the push context into every round so it can stream progress", async () => {
@@ -516,7 +530,7 @@ describe("HandleTaskWorkflow — round budget", () => {
     ]);
     // The last round answered rather than delegating a ninth DAG.
     expect(agent.turns.at(-1)?.decision).toBe("replied");
-    expect(agent.saved?.status.state).toBe("completed");
+    expect(agent.saved?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
   });
 
   it("stops offering delegation once the task has spent its execution budget", async () => {
@@ -538,7 +552,7 @@ describe("HandleTaskWorkflow — round budget", () => {
     expect(agent.turns.map((t) => t.allowControl)).toEqual([true, true, false]);
     // Round 2 answered from what it had; node 3 never ran.
     expect(agent.executed).toEqual([1, 2]);
-    expect(agent.saved?.status.state).toBe("completed");
+    expect(agent.saved?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
   });
 });
 
@@ -662,7 +676,7 @@ describe("HandleTaskWorkflow — DAG execution", () => {
     // The next round still runs and the Task completes: partial success is a
     // result, and the model discloses the gap.
     expect(agent.turns).toHaveLength(2);
-    expect(agent.saved?.status.state).toBe("completed");
+    expect(agent.saved?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
   });
 
   it("fails only the branch whose step exhausted its retries, then answers", async () => {
@@ -691,7 +705,7 @@ describe("HandleTaskWorkflow — DAG execution", () => {
     // …and its sibling's durable work still reaches the next round.
     expect(agent.executed).toContain(2);
     expect(agent.turns).toHaveLength(2);
-    expect(agent.saved?.status.state).toBe("completed");
+    expect(agent.saved?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
   });
 
   it("delivers a failed Task when the DAG cannot progress", async () => {
@@ -715,7 +729,7 @@ describe("HandleTaskWorkflow — DAG execution", () => {
 
     expect(agent.executed).toEqual([]);
     expect(agent.turns).toHaveLength(1);
-    expect(bodyOf(captured).status.state).toBe("failed");
+    expect(bodyOf(captured).status?.state).toBe(TaskState.TASK_STATE_FAILED);
     expect(errorLog).toHaveBeenCalled();
   });
 });
@@ -734,9 +748,10 @@ describe("HandleTaskWorkflow — failure delivery", () => {
     expect(agent.turns).toHaveLength(1);
 
     const body = bodyOf(captured);
-    expect(body.status.state).toBe("failed");
-    expect(body.status.message?.parts?.[0]).toMatchObject({
-      text: TASK_FAILED_TEXT
+    expect(body.status?.state).toBe(TaskState.TASK_STATE_FAILED);
+    expect(body.status?.message?.parts?.[0]?.content).toEqual({
+      $case: "text",
+      value: TASK_FAILED_TEXT
     });
 
     // The diagnostic is logged, never sent to the user.
@@ -758,7 +773,7 @@ describe("HandleTaskWorkflow — failure delivery", () => {
     await runHandleTask(params(), stepFake().step);
 
     expect(agent.turns).toHaveLength(2);
-    expect(bodyOf(captured).status.state).toBe("failed");
+    expect(bodyOf(captured).status?.state).toBe(TaskState.TASK_STATE_FAILED);
     expect(JSON.stringify(bodyOf(captured))).not.toContain("no subtask");
   });
 });
@@ -766,7 +781,7 @@ describe("HandleTaskWorkflow — failure delivery", () => {
 describe("HandleTaskWorkflow — cancellation", () => {
   it("stops before the first round when already canceled", async () => {
     // `markWorking` would otherwise resurrect the task to `working`.
-    const agent = mockAgent({ state: "canceled" });
+    const agent = mockAgent({ state: TaskState.TASK_STATE_CANCELED });
     const captured = mockFetch();
     const { step, names } = stepFake();
 
@@ -791,7 +806,7 @@ describe("HandleTaskWorkflow — cancellation", () => {
         { reply: "unreached" }
       ],
       onExecute: (id, a) => {
-        if (id === 1) a.state = "canceled";
+        if (id === 1) a.state = TaskState.TASK_STATE_CANCELED;
       }
     });
     const captured = mockFetch();
@@ -830,7 +845,8 @@ describe("HandleTaskWorkflow — cancellation", () => {
     // — so the workflow reaches `complete` with a Task it fully intends to send.
     const agent = mockAgent({
       onTurn: (a) => {
-        if (a.turns.at(-1)?.decision === "replied") a.state = "canceled";
+        if (a.turns.at(-1)?.decision === "replied")
+          a.state = TaskState.TASK_STATE_CANCELED;
       }
     });
     const captured = mockFetch();
@@ -848,7 +864,7 @@ describe("HandleTaskWorkflow — cancellation", () => {
   it("does not start the next round or deliver when canceled after the DAG finished", async () => {
     const agent = mockAgent({
       onExecute: (_id, a) => {
-        a.state = "canceled";
+        a.state = TaskState.TASK_STATE_CANCELED;
       }
     });
     const captured = mockFetch();
