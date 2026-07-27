@@ -1,5 +1,5 @@
 import type { LanguageModel, ModelMessage, StepResult, ToolSet } from "ai";
-import { generateText, stepCountIs } from "ai";
+import { generateText, isStepCount } from "ai";
 import { isTransientAiError } from "@/agent/inference";
 import type { ModelPair } from "@/agent/model";
 import type {
@@ -184,7 +184,7 @@ export async function runResumableChunk(
 
   const chunkStartMs = deps.now();
 
-  const onStepFinish = async (step: StepResult<ToolSet>): Promise<void> => {
+  const onStepEnd = async (step: StepResult<ToolSet>): Promise<void> => {
     state.turns += 1;
     state.messages = windowMessages(
       [...state.messages, ...step.response.messages],
@@ -195,9 +195,9 @@ export async function runResumableChunk(
 
   const stopWhen = [
     // The entry guard above guarantees `maxTurns - state.turns >= 1` here, so the
-    // `Math.max(1, …)` is defensive only — it keeps `stepCountIs` from ever seeing
+    // `Math.max(1, …)` is defensive only — it keeps `isStepCount` from ever seeing
     // a non-positive count for any future caller.
-    stepCountIs(
+    isStepCount(
       Math.max(
         1,
         Math.min(deps.limits.turnsPerChunk, deps.limits.maxTurns - state.turns)
@@ -216,14 +216,14 @@ export async function runResumableChunk(
     try {
       result = await generateText({
         model: model(),
-        system: deps.system,
+        instructions: deps.system,
         messages: state.messages,
         tools: deps.tools,
         stopWhen,
         // Primary → fallback recovery is manual; SDK backoff would only add latency.
         maxRetries: 0,
         abortSignal: deps.abortSignal,
-        onStepFinish
+        onStepEnd
       });
     } catch (error) {
       // Check the signal before the error: an abort surfaces as a rejection, and
@@ -326,9 +326,9 @@ async function summarizeBudget(
     try {
       result = await generateText({
         model: model(),
-        system: deps.system,
+        instructions: deps.system,
         messages,
-        stopWhen: stepCountIs(1),
+        stopWhen: isStepCount(1),
         maxRetries: 0,
         abortSignal: deps.abortSignal
       });
