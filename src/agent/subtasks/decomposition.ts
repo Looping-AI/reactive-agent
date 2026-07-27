@@ -4,6 +4,7 @@ import type { ReferenceCatalogEntry } from "./catalog";
 import {
   SUBTASK_TYPE_KEYS,
   SubtaskParamsError,
+  subtaskParamProperties,
   validateSubtaskParams
 } from "./subtask-types";
 import type {
@@ -61,11 +62,17 @@ const subtaskProposalSchema = z.object({
   dependsOn: z.array(nonBlank("dependsOn entry")),
   /**
    * The type's required inputs — ids the model quotes from a tool result (e.g.
-   * a scorecard `card_id`). Which keys a type requires is declared in
-   * {@link file://./subtask-types.ts}; this schema only says they are flat
-   * strings, because the per-type contract is what actually validates them.
+   * a scorecard `card_id`). Every key any type declares is named here, gathered
+   * from those types by {@link subtaskParamProperties}; which of them a given
+   * type actually *requires* is the per-type contract, checked below.
+   *
+   * Named keys rather than a free-form record, deliberately: a record's value
+   * schema is the JSON Schema `additionalProperties` slot, which the AI SDK's
+   * strict-mode pass overwrites with `false` — turning "any string key" into "no
+   * key at all" and leaving the model no legal way to send params it was told to
+   * send. Explicit properties survive that pass, and say more besides.
    */
-  params: z.record(z.string(), z.string()).optional()
+  params: z.object(subtaskParamProperties()).optional()
 });
 
 /**
