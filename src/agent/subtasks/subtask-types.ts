@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { SUBTASK_TYPE_SPECS } from "@/recipes";
 import type {
   ResolvedRecipe,
@@ -94,6 +95,49 @@ export function validateSubtaskParams(
     );
   }
   return parsed.data;
+}
+
+/**
+ * Every param key any type declares, as the optional properties of the single
+ * flat `params` object the delegate tool advertises.
+ *
+ * Optional is not a weakening: which keys a given type *requires* is
+ * {@link validateSubtaskParams}'s call, and it still refuses a subtask whose
+ * type's params are missing. What this adds is **visibility**. One tool schema
+ * has to serve every type, so the only alternative to naming the union of keys
+ * here is naming none of them — and a key the schema does not name is a key the
+ * model has no legal way to send, whatever the description promises. That is
+ * exactly how an `arc-game` subtask once reached validation with no `card_id`:
+ * the field was declared as a free-form record, which the provider's schema
+ * conversion flattens to an object permitting no keys at all.
+ *
+ * Descriptions are prefixed with the owning type, so a flat namespace still
+ * reads unambiguously to the model (and a key two types share names both).
+ */
+export function subtaskParamProperties(): Record<
+  string,
+  z.ZodType<string | undefined>
+> {
+  const owners = new Map<string, string[]>();
+  const declared = new Map<string, z.ZodType<string>>();
+  for (const spec of SUBTASK_TYPE_SPECS) {
+    if (!spec.params) continue;
+    for (const [key, field] of Object.entries(spec.params.shape)) {
+      owners.set(key, [...(owners.get(key) ?? []), spec.key]);
+      declared.set(key, field);
+    }
+  }
+  return Object.fromEntries(
+    [...declared].map(([key, field]) => [
+      key,
+      // Described *after* `.optional()`, so the text sits on the schema this
+      // returns rather than on the type it wraps — readable by both the JSON
+      // Schema conversion and anything inspecting these properties directly.
+      field
+        .optional()
+        .describe(`${owners.get(key)?.join("/")}: ${field.description ?? key}`)
+    ])
+  );
 }
 
 /** The type catalogue as the delegating model is shown it. */

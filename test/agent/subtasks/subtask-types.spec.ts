@@ -10,12 +10,14 @@
  * may share one Recipe, and a Recipe never declares params.
  */
 import { describe, it, expect } from "vitest";
+import { z } from "zod";
 import {
   SUBTASK_TYPES,
   SUBTASK_TYPE_KEYS,
   SubtaskParamsError,
   renderSubtaskTypes,
   resolveRecipeForType,
+  subtaskParamProperties,
   subtaskTypeSpec,
   validateSubtaskParams
 } from "@/agent/subtasks/subtask-types";
@@ -110,6 +112,42 @@ describe("validateSubtaskParams", () => {
     expect(() => validateSubtaskParams(ARC_GAME_TYPE, {})).toThrow(
       new RegExp(ARC_GAME_TYPE)
     );
+  });
+});
+
+describe("subtaskParamProperties", () => {
+  it("derives itself from the manifest, naming every declared key", () => {
+    // The agent names no domain here either: the delegate schema's param keys
+    // come from the types that declare them, so a new domain is still a new
+    // folder plus a line in `recipes/index` — with no edit inside `agent/`.
+    const declared = SUBTASK_TYPE_SPECS.flatMap((spec) =>
+      spec.params ? Object.keys(spec.params.shape) : []
+    );
+    expect(Object.keys(subtaskParamProperties()).sort()).toEqual(
+      [...new Set(declared)].sort()
+    );
+  });
+
+  it("makes every key optional, since each is required by one type only", () => {
+    // One flat object serves every type; requiredness stays per-type, in
+    // `validateSubtaskParams`, which is what actually refuses a bad subtask.
+    const params = z.object(subtaskParamProperties());
+    expect(params.safeParse({}).success).toBe(true);
+    expect(params.safeParse({ card_id: "card-1" }).success).toBe(true);
+  });
+
+  it("attributes each key to the type that declares it", () => {
+    const described = subtaskParamProperties().card_id.description;
+    expect(described).toContain(ARC_GAME_TYPE);
+    // The owning type's own words survive the prefix — that text is how the
+    // model learns where to get the id.
+    expect(described).toContain("arc_open_scorecard");
+  });
+
+  it("keeps the value contract of the declaring type", () => {
+    // A blank id is refused here too, not just downstream: it would otherwise
+    // reach the ARC API and fail there with no useful diagnostic.
+    expect(subtaskParamProperties().card_id.safeParse("").success).toBe(false);
   });
 });
 

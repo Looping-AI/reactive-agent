@@ -19,6 +19,15 @@ import type { z } from "zod";
 export type SubtaskParams = Record<string, string>;
 
 /**
+ * A type's param declaration, as a shape the agent can read back — not an opaque
+ * validator. The keys have to be *enumerable* because the delegate tool's schema
+ * is built from them: a param the model cannot see declared is a param it will
+ * not send. See {@link SubtaskTypeSpec.params}.
+ */
+export type SubtaskParamsShape = Record<string, z.ZodType<string>>;
+export type SubtaskParamsSchema = z.ZodObject<SubtaskParamsShape>;
+
+/**
  * Execution budget for one Recipe, enforced by the resumable runner (not the
  * Workflow). The runner drives the model/tool loop in durable **chunks**: it runs
  * up to `turnsPerChunk` turns (or `chunkSoftMs` wall-clock, whichever first) per
@@ -85,8 +94,14 @@ export interface SubtaskTypeSpec {
   /**
    * Required params for this type, or null when it takes none. Kept to flat
    * strings: these are ids the model quotes from a tool result, not structures.
+   *
+   * A `z.object`, not an opaque `z.ZodType`, and that is load-bearing: the agent
+   * reads `.shape` back to build the `params` field of the delegate tool's schema
+   * (see `subtaskParamProperties`). Declaring a param the model is never shown is
+   * the failure this shape exists to prevent — describe each key with
+   * `.describe()`, because that text is what the model reads.
    */
-  params: z.ZodType<SubtaskParams> | null;
+  params: SubtaskParamsSchema | null;
   /** How the model is told to obtain each param, appended to the description. */
   paramsHelp?: string;
   /** The execution configuration this type runs under. */

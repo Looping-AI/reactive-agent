@@ -4,10 +4,10 @@
  */
 
 /** Workers AI model used by the agent tool loop. Must support function calling. */
-export const CHAT_MODEL_ID = "@cf/zai-org/glm-5.2";
+export const CHAT_MODEL_ID = "@cf/zai-org/glm-4.7-flash";
 
 /** Fallback model tried when the primary model throws an error. */
-export const CHAT_FALLBACK_MODEL_ID = "minimax/m3";
+export const CHAT_FALLBACK_MODEL_ID = "@cf/zai-org/glm-5.2";
 
 /** Cloudflare AI Gateway slug — "default" auto-provisions a gateway on first request. */
 export const AI_GATEWAY_ID = "default";

@@ -1,14 +1,17 @@
 import { describe, it, expect } from "vitest";
+import { asSchema } from "ai";
 import {
   decompositionProposalSchema,
   DecompositionValidationError,
   resolveDecomposition
 } from "@/agent/subtasks/decomposition";
+import { delegateTool } from "@/agent/subtasks/delegate";
 import type { ReferenceCatalogEntry } from "@/agent/subtasks/catalog";
 import type {
   DecompositionProposal,
   SubtaskProposal
 } from "@/agent/subtasks/types";
+import { SUBTASK_TYPE_SPECS } from "@/recipes";
 
 /** A three-entry catalog: the indices the model would select from. */
 const CATALOG: ReferenceCatalogEntry[] = [
@@ -289,5 +292,85 @@ describe("decompositionProposalSchema", () => {
         proposal({ referenceIndexes: [1.5] })
       ).success
     ).toBe(false);
+  });
+});
+
+/**
+ * The schema as the **provider** receives it, not as zod declares it — and the
+ * gap between those two is the reason this block exists.
+ *
+ * JSON Schema spends one slot, `additionalProperties`, on two unrelated jobs: a
+ * record's value type, and the strict-mode "no other keys" flag. The AI SDK's
+ * conversion writes `false` into it unconditionally, so `z.record(z.string(),
+ * z.string())` — correct in zod, and correct in zod's own JSON Schema output —
+ * reaches the model as an object that permits **no keys at all**. That shipped,
+ * and a Task failed on an `arc-game` subtask with no `card_id`: the model's
+ * reasoning said it was passing one, and the schema gave it nowhere to put it.
+ *
+ * So these assertions deliberately run on the converted output. Anything checked
+ * against the zod schema alone would have passed on the broken version too.
+ */
+describe("the delegate tool's schema, as converted for the provider", () => {
+  interface WireSchema {
+    type?: string;
+    description?: string;
+    properties?: Record<string, WireSchema>;
+    items?: WireSchema;
+    additionalProperties?: boolean | WireSchema;
+  }
+
+  function paramsWireSchema(): WireSchema {
+    const root = asSchema(delegateTool.inputSchema).jsonSchema as WireSchema;
+    const params = root.properties?.subtasks?.items?.properties?.params;
+    if (!params)
+      throw new Error("delegate schema exposes no subtasks[].params");
+    return params;
+  }
+
+  /** Every key any type declares — the union the one flat `params` must cover. */
+  const declaredKeys = [
+    ...new Set(
+      SUBTASK_TYPE_SPECS.flatMap((spec) =>
+        spec.params ? Object.keys(spec.params.shape) : []
+      )
+    )
+  ];
+
+  it("names every param key any type declares", () => {
+    // Sanity: a manifest with no params at all would make this vacuous.
+    expect(declaredKeys).toContain("card_id");
+    expect(Object.keys(paramsWireSchema().properties ?? {}).sort()).toEqual(
+      declaredKeys.sort()
+    );
+  });
+
+  it("never advertises an object that permits no keys", () => {
+    // The exact broken shape: `additionalProperties: false` with nothing in
+    // `properties` is unsatisfiable — the model cannot send params at all.
+    const params = paramsWireSchema();
+    if (params.additionalProperties === false) {
+      expect(Object.keys(params.properties ?? {}).length).toBeGreaterThan(0);
+    }
+  });
+
+  it("tells the model which type each key belongs to", () => {
+    // A flat namespace across types is only usable if each key says whose it is.
+    const properties = paramsWireSchema().properties ?? {};
+    for (const [key, field] of Object.entries(properties)) {
+      const owners = SUBTASK_TYPE_SPECS.filter(
+        (spec) => spec.params && key in spec.params.shape
+      );
+      expect(field.description).toContain(owners[0].key);
+    }
+  });
+
+  it("still describes how to obtain each param", () => {
+    // The prose from the type's own declaration survives the type prefix.
+    expect(paramsWireSchema().properties?.card_id?.description).toContain(
+      "arc_open_scorecard"
+    );
+    expect(paramsWireSchema().properties?.game_id?.description).toContain(
+      "arc_list_games"
+    );
   });
 });
