@@ -167,10 +167,14 @@ export function buildCompletedTask(
  * human, so it says *that* the request failed and never *why*: the internal
  * diagnostics (which model, which branch, which fault) stay on the Subtask rows
  * and in the logs, where an operator can read them and an end user cannot.
+ *
+ * Deliberately terse. It rides on a `failed` Task, and the gateway prefixes that
+ * with "⚠️ *Agent …* (failed):" — so an apology here would just say "something
+ * broke" twice, and naming the agent would repeat what the prefix already shows.
  */
 export const TASK_FAILED_TEXT =
-  "Sorry, I hit an unexpected error handling that request. Please try again, " +
-  "and check the agent's logs if it keeps happening.";
+  "Couldn't handle that request. Please try again — check the agent's logs " +
+  "if it keeps happening.";
 
 /**
  * The terminal `failed` Task POSTed to the gateway callback — decomposition
