@@ -441,7 +441,11 @@ async function attempt(
       model: model(),
       instructions,
       messages,
-      tools: { ...args.tools, ...controlTools },
+      // Control tools are declared *first*: tool order is part of the prompt, and
+      // the two endings are the thing every round has to reach. Work tool names
+      // are compile-time constants and none collides with a control name, so the
+      // spread order costs nothing.
+      tools: { ...controlTools, ...args.tools },
       // Every ending is a control call, so the model must always call something.
       // Work tools stay freely available — `required` constrains the *shape* of a
       // step's output, not which tool is chosen.
