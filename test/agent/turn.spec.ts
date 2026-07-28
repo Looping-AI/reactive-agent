@@ -870,6 +870,11 @@ describe("runTurn — what a round costs", () => {
     // A round that burned the primary and recovered on the fallback spent both.
     // Counting only the survivor would forgive the expensive half of a bad round
     // — precisely the round most worth charging for.
+    //
+    // Note this case reads the same before and after the allowance was split
+    // across attempts (the primary takes all 2, the fallback's floor gives it 1
+    // either way), which is exactly why it never caught the overshoot. The two
+    // cases below are the ones that pin the cap.
     const { model: primary } = capturing(
       { toolCall: { toolName: "echo", input: { text: "ping" } } },
       { toolCall: { toolName: "echo", input: { text: "ping" } } }
@@ -893,6 +898,87 @@ describe("runTurn — what a round costs", () => {
     expect(result.status).toBe("replied");
     // 2 from the exhausted primary + 1 from the fallback that answered.
     expect(result.turns).toBe(3);
+  });
+
+  // The allowance belongs to the round, not to each attempt. Handing both slots
+  // the same `turnsRemaining` made a round cost up to twice it — the sum above
+  // was right and simply never enforced, so a Task overshot its budget by >2x
+  // before the next round's check could see it.
+  it("splits the allowance across both attempts rather than giving each the whole thing", async () => {
+    // Both slots would loop forever if allowed to. Six scripted steps each, an
+    // allowance of three: the pair together must not exceed it.
+    const looping = () =>
+      mockModel(
+        ...Array.from({ length: 6 }, () => ({
+          toolCall: { toolName: "echo", input: { text: "ping" } }
+        }))
+      );
+    const result = await runTurn({
+      session: new FakeSession(),
+      taskId: TASK_ID,
+      round: 0,
+      text: "book me a flight",
+      mode: "open",
+      turnsRemaining: 3,
+      systemSuffix: CALLER_SUFFIX,
+      tools: ECHO_TOOL,
+      models: modelPair(looping, looping),
+      branches: []
+    });
+
+    // The primary spends all three; the fallback still gets the one step that
+    // keeps it able to reach an ending. One over, never double.
+    expect(result.turns).toBe(4);
+  });
+
+  it("lets a failed primary leave the fallback a usable remainder", async () => {
+    // The complement: a primary that fails *cheaply* must not eat the round.
+    // Two of the four turns are left, and the fallback gets exactly those.
+    const looping = () =>
+      mockModel(
+        ...Array.from({ length: 6 }, () => ({
+          toolCall: { toolName: "echo", input: { text: "ping" } }
+        }))
+      );
+    const result = await runTurn({
+      session: new FakeSession(),
+      taskId: TASK_ID,
+      round: 0,
+      text: "book me a flight",
+      mode: "open",
+      turnsRemaining: 4,
+      systemSuffix: CALLER_SUFFIX,
+      tools: ECHO_TOOL,
+      // Primary narrates instead of calling a control tool: one step, then fail.
+      models: modelPair(() => mockModel({ text: "just narrating" }), looping),
+      branches: []
+    });
+
+    expect(result.turns).toBe(4);
+  });
+
+  it("costs two when a final round has to fall back", async () => {
+    // One step per attempt, and the fallback genuinely needs its own: with none
+    // it could not produce the answer the ceiling exists to extract. Bounded at
+    // two, and worth stating rather than leaving "one turn" claimed.
+    const result = await runTurn({
+      session: new FakeSession(),
+      taskId: TASK_ID,
+      round: 0,
+      text: "book me a flight",
+      mode: "final",
+      turnsRemaining: 0,
+      systemSuffix: CALLER_SUFFIX,
+      tools: ECHO_TOOL,
+      models: modelPair(
+        () => mockModel({ text: "just narrating" }),
+        () => mockModel(finalReply("the fallback answered"))
+      ),
+      branches: []
+    });
+
+    expect(result.status).toBe("replied");
+    expect(result.turns).toBe(2);
   });
 });
 

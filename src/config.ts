@@ -70,9 +70,9 @@ export const MAIN_AGENT_LIMITS = {
 
 /**
  * The baseline every subagent branch runs under. A Recipe may override either
- * field and inherits the rest; see `normalizeLimits` in
- * {@link file://./recipes/validation.ts}, which is the boundary that keeps a
- * Recipe from widening its own limits.
+ * field — to any positive integer, larger included — and inherits the baseline for
+ * whatever it does not validly declare; see `resolveLimits` in
+ * {@link file://./recipes/validation.ts}. A default, not a ceiling.
  */
 export const SUBAGENT_LIMITS: RecipeLimits = {
   maxTurns: 20,

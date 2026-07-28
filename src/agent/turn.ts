@@ -386,6 +386,9 @@ export type TurnDecision =
  *   punishment but the shape of the ceiling — a budget that ends in a forced
  *   answer returns the work, where one that simply stopped would discard it. The
  *   subagent runner's `summarizeBudget` is the same move one level down.
+ *   Costs one turn, or two if the primary model fails and the fallback has to
+ *   produce the answer instead; a fallback with no step to spend could not answer
+ *   at all.
  */
 export type RoundMode = "open" | "final";
 
@@ -401,10 +404,15 @@ export interface RunTurnArgs {
   /** What this round may do — see {@link RoundMode}. */
   mode: RoundMode;
   /**
-   * Turns still unspent in the Task's budget, bounding this round's tool loop.
-   * There is no per-round allowance: an early round that dithers spends what a
-   * later one would have had, and is then handed a `final` round to answer in.
-   * Ignored when `mode` is `final`, which is always exactly one turn.
+   * Turns still unspent in the Task's budget, bounding this **round** — both its
+   * tool loop and its primary→fallback pair together, not each attempt
+   * separately. There is no per-round allowance beyond it: an early round that
+   * dithers spends what a later one would have had, and is then handed a `final`
+   * round to answer in.
+   *
+   * A round may exceed it by exactly one, and only when the primary consumed the
+   * whole remainder and the fallback still needs a step to reach an ending. Read
+   * with `mode: "final"`, where the round is one step per attempt regardless.
    */
   turnsRemaining: number;
   /** Per-request system-prompt suffix (verified caller context). */
@@ -485,8 +493,17 @@ async function attempt(
   // the composing round has every branch result in its messages already, so the
   // thing it needs is not a lookup but an ending.
   const workTools: ToolSet = final ? {} : args.tools;
-  // One turn is all a `final` round gets: it exists to produce the answer, and
-  // that answer is deliberately spent *beyond* the budget rather than out of it.
+  // One step per attempt for a `final` round: it exists to produce the answer,
+  // and that answer is deliberately spent *beyond* the budget rather than out of
+  // it. An `open` round gets what its caller says is left — `runTurn` decrements
+  // that between attempts, which is what keeps the two slots from each spending a
+  // full allowance.
+  //
+  // The `Math.max(1, …)` floor is load-bearing, not defensive: a primary that
+  // consumed the entire remainder still hands the fallback one step. The
+  // alternative is a round that cannot run its fallback at all, which fails the
+  // round and costs the Task its answer — a far worse trade than one turn. So a
+  // round may exceed its allowance by exactly one, and no more.
   const stepBudget = final ? 1 : Math.max(1, args.turnsRemaining);
   let turns = 0;
   const content = args.onContent
@@ -633,7 +650,17 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
       slot === "primary" ? models.primaryId() : models.fallbackId();
     const model = slot === "primary" ? models.primary : models.fallback;
 
-    const outcome = await attempt(args, model, system, messages);
+    // The allowance is the *round's*, not each attempt's. Handing both slots the
+    // same `turnsRemaining` let one round spend twice it — the budget summed the
+    // two attempts correctly and then never enforced the total, so a Task could
+    // overshoot `MAIN_AGENT_LIMITS.maxTurns` by more than 2x before the next
+    // round's check saw it.
+    const outcome = await attempt(
+      { ...args, turnsRemaining: args.turnsRemaining - turns },
+      model,
+      system,
+      messages
+    );
     turns += outcome.turns;
     if (!outcome.ok) {
       errors.push(outcome.error);

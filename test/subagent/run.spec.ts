@@ -397,6 +397,30 @@ describe("runResumableChunk", () => {
     });
   });
 
+  it("charges the fallback for what the primary already spent", async () => {
+    // `isStepCount` counts within one `generateText` call, so a `stopWhen` built
+    // once per chunk and shared with the fallback would hand it the allowance the
+    // primary had already used. Running out of steps is normally a *yield* here
+    // rather than a failure, which hid this — it only surfaces when the primary
+    // does real work and then genuinely fails.
+    const primary = () => mockModel(CALL_ECHO, CALL_ECHO, { text: "" });
+    const fallback = () =>
+      mockModel(...Array.from({ length: 10 }, () => CALL_ECHO));
+
+    const out = await runResumableChunk(
+      null,
+      deps({
+        model: primary(),
+        models: modelPair(primary, fallback),
+        tools: ECHO,
+        limits: { maxTurns: 5 }
+      })
+    );
+
+    // 3 spent failing, 2 left for the fallback — not another full 5.
+    expect(out.state.turns).toBe(5);
+  });
+
   it("ends a chunk as soon as a tool emits a progress event", async () => {
     const progress: ProgressEvent[] = [];
     const tools: ToolSet = {

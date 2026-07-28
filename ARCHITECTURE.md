@@ -198,10 +198,24 @@ termination argument, and it is the same move the subagent runner makes one leve
 down with `summarizeBudget`.
 
 Turns are counted across every round _and_ across the primary→fallback attempt
-inside one, because a fallback attempt is real spend. Rounds are not a budget:
-each open round spends at least one turn, so rounds can never outnumber turns, and
-a round that dithered through twenty of them cost exactly what twenty rounds
-would. Neither are chunks — see **Platform constraints** below.
+inside one, because a fallback attempt is real spend — the fallback restarts the
+round from the same messages, so a failed primary is work redone, with whatever
+tool side effects it already had. The allowance belongs to the **round**, and
+`runTurn` decrements it between the two attempts; handing each slot the full
+remainder is a bug that lets one round cost twice its budget.
+
+A round may exceed its allowance by exactly one turn, and only in one case: the
+primary consumed the whole remainder and the fallback still needs a step to reach
+an ending. Refusing it would fail the round and cost the Task its answer, which is
+a far worse trade than one turn. A `mode: "final"` round is one step per attempt
+for the same reason, so it costs two if it falls back. Worst case for a Task is
+therefore `maxTurns + 1` for the overshooting round plus 2 for the forced answer —
+23 against a budget of 20, not 42.
+
+Rounds are not a budget: each open round spends at least one turn, so rounds can
+never outnumber turns, and a round that dithered through twenty of them cost
+exactly what twenty rounds would. Neither are chunks — see **Platform
+constraints** below.
 
 Time is budgeted separately because turns do not imply it. A round waiting on slow
 subtasks burns hours while `turnsUsed` barely moves, and a turn count is no proxy
@@ -379,8 +393,11 @@ currencies the main agent is budgeted in, one level down, defaulting to
 `SUBAGENT_LIMITS` (20 turns / 30 min). A Recipe declares only the fields it wants
 to differ and inherits the rest; `historyWindow` is required outright. One rule
 governs which is which: **`config.ts` declares a baseline ⇒ merge; it does not ⇒
-require.** `validateRecipe` is the single boundary that applies it, so a Recipe
-can never widen its own limits — the baseline does not come from the declaration.
+require.** `validateRecipe` is the single boundary that applies it. The baseline
+is a default, not a ceiling: a Recipe may declare a budget larger than
+`SUBAGENT_LIMITS` and it is honored — sizing its own branch is what `limits` is
+for. The capability allowlists (models, tool families) are the part a Recipe
+cannot widen; its budget is the deliberate exception.
 
 `executeChunk(request, chunk, runtime)` advances one chunk, checkpointing rolling
 state to a `run_state` row after every turn and returning either a terminal result

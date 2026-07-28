@@ -222,17 +222,26 @@ export async function runResumableChunk(
     await deps.checkpoint(state);
   };
 
-  // Four boundaries, and only the first two are budgets. A chunk ends on whichever
-  // comes first; the run ends only on a budget.
-  const stopWhen = [
+  /**
+   * Four boundaries, and only the first two are budgets. A chunk ends on
+   * whichever comes first; the run ends only on a budget.
+   *
+   * Rebuilt per attempt rather than once per chunk, and that is the whole point:
+   * `isStepCount` counts within one `generateText` call, so a `stopWhen` shared
+   * with the fallback would hand it the turn allowance the primary already spent.
+   * `onStepEnd` has moved `state.turns` by then, so recomputing here charges the
+   * fallback for what the run has actually used.
+   */
+  const boundaries = () => [
     // The turn budget — all of what is left of it. There is deliberately no
     // per-chunk turn allowance: a turn count cannot bound a step's *duration*,
     // which is the only thing the step timeout cares about, so the wall-clock
     // predicate below owns that job alone.
     //
-    // The entry guard above guarantees `maxTurns - state.turns >= 1` here, so the
-    // `Math.max(1, …)` is defensive only — it keeps `isStepCount` from ever seeing
-    // a non-positive count for any future caller.
+    // The `Math.max(1, …)` floor matters on the fallback: a primary that spent
+    // the whole budget before failing still leaves it one step to reach an
+    // ending, so a chunk may exceed `maxTurns` by exactly one rather than
+    // returning nothing at all.
     isStepCount(Math.max(1, deps.limits.maxTurns - state.turns)),
     // The run-wide deadline. Without it the entry guard would only observe the
     // deadline at the next chunk boundary, up to `chunkSoftMs` past it.
@@ -256,7 +265,7 @@ export async function runResumableChunk(
         instructions: deps.system,
         messages: state.messages,
         tools: deps.tools,
-        stopWhen,
+        stopWhen: boundaries(),
         maxOutputTokens: MAX_OUTPUT_TOKENS,
         // Primary → fallback recovery is manual; SDK backoff would only add latency.
         maxRetries: 0,

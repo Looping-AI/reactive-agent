@@ -11,8 +11,9 @@ import type { RecipeLimits, ResolvedRecipe, ValidatedRecipe } from "./types";
  * The domains live in sibling folders, each owning its soul and configuration.
  * This module imports none of them — it owns only what code must be able to say
  * about *any* Recipe: which models and tool families it may select, and how a
- * malformed one is made safe or refused. A domain cannot widen its own limits by
- * declaring them, because the check does not come from the declaration.
+ * malformed one is made safe or refused. A domain cannot widen its *capabilities*
+ * by declaring them, because the allowlists do not come from the declaration. Its
+ * budget is the deliberate exception — see {@link resolveLimits}.
  */
 
 /**
@@ -42,8 +43,11 @@ export const KNOWN_TOOL_FAMILIES: ReadonlySet<string> = new Set([
  * positive integer wins; anything else — missing, null, zero, fractional — falls
  * back to the baseline rather than reaching the runner.
  *
- * Defense-in-depth for a future DB-sourced Recipe, and the reason a Recipe cannot
- * widen its own limits: the baseline does not come from the declaration.
+ * The baseline is a default, not a ceiling: a Recipe may declare a budget larger
+ * than {@link SUBAGENT_LIMITS} and it is honored — sizing its own branch is what
+ * declaring `limits` is for, so nothing here clamps. What the merge does buy, as
+ * defense-in-depth for a future DB-sourced Recipe, is that a corrupt or absent
+ * value cannot reach the runner as a zero, fractional, or missing budget.
  *
  * Exported separately from {@link validateRecipe} because it must never throw.
  * The execution fingerprint is computed *before* a Recipe is validated — that
