@@ -200,9 +200,18 @@ down with `summarizeBudget`.
 Turns are counted across every round _and_ across the primary→fallback attempt
 inside one, because a fallback attempt is real spend — the fallback restarts the
 round from the same messages, so a failed primary is work redone, with whatever
-tool side effects it already had. The allowance belongs to the **round**, and
-`runTurn` decrements it between the two attempts; handing each slot the full
-remainder is a bug that lets one round cost twice its budget.
+tool side effects it already had. The allowance belongs to the **round**, not to
+each attempt.
+
+That is enforced by shape rather than by discipline. A round is handed one mutable
+[`TurnBudget`](src/agent/budget.ts), both model slots draw on it, and each attempt
+reads what is left on entry — so a fallback cannot be given the turns the primary
+already burned. Nothing between the model loop and the RPC return carries a count:
+`spent` is incremented where the turn is spent and read where the Workflow meters
+it. An earlier design passed the allowance down as a number and returned the cost
+back up as a field on every outcome variant, which meant keeping the two attempts
+honest depended on remembering to subtract between them — and forgetting let one
+round cost twice its budget.
 
 A round may exceed its allowance by exactly one turn, and only in one case: the
 primary consumed the whole remainder and the fallback still needs a step to reach
@@ -716,6 +725,7 @@ traffic. They are characteristics, not known bugs; none is a correctness hole.
 | [`src/a2a/notify.ts`](src/a2a/notify.ts)                                     | Build the submitted/completed Tasks; sign + POST the gateway push-notification callback.                                                                                                                            |
 | [`src/workflows/handle-task.ts`](src/workflows/handle-task.ts)               | `HandleTaskWorkflow` — durable controller for the round loop: `working` → `turn:<round>` → `scan`/`execute` → next round → `complete` → `notify`.                                                                   |
 | [`src/agent/turn.ts`](src/agent/turn.ts)                                     | One main-agent round — `runTurn`: answer in plain text, or call `delegate` for 1-8 Subtask drafts. `renderTurnMessages` reunites earlier rounds' calls with their results; deterministic-join degradation.          |
+| [`src/agent/budget.ts`](src/agent/budget.ts)                                 | `TurnBudget` — one round's allowance, shared by both model attempts and mutated where the turn is spent. `stepAllowance` is the per-attempt remainder, used by the main agent and the subagent runner alike.        |
 | [`src/agent/inference.ts`](src/agent/inference.ts)                           | Shared model plumbing: `isTransientAiError`, `buildIntermediateContentHandler`, `OnContent`.                                                                                                                        |
 | [`src/agent/subtasks/types.ts`](src/agent/subtasks/types.ts)                 | RPC-safe Subtask contracts (`Subtask`, `SubtaskReference`, `RecipeExecutionRequest`, `SubtaskNode`, …).                                                                                                             |
 | [`src/agent/subtasks/catalog.ts`](src/agent/subtasks/catalog.ts)             | `buildReferenceCatalog` — the ephemeral 1..N numbering of eligible history turns (compaction summaries excluded).                                                                                                   |

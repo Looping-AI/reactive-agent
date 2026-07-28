@@ -2,6 +2,7 @@ import type { LanguageModel, ModelMessage, StepResult, ToolSet } from "ai";
 import { generateText, isStepCount } from "ai";
 import { MAX_OUTPUT_TOKENS } from "@/config";
 import { CHUNK_SOFT_MS } from "@/platform";
+import { stepAllowance } from "@/agent/budget";
 import { isTransientAiError } from "@/agent/inference";
 import { validateRecipe } from "@/recipes/validation";
 import type { ModelPair } from "@/agent/model";
@@ -16,10 +17,10 @@ import { renderSubagentPrompt } from "./prompt";
 
 /**
  * The resumable execution runner — ONE loop for every Recipe, from a single-shot
- * default Subtask to a thousand-turn game. It runs the model/tool loop in durable
- * **chunks**: each call advances up to `turnsPerChunk` turns (or `chunkSoftMs`
- * wall-clock, or until a tool emits progress), checkpoints its rolling state after
- * every turn, and returns either a terminal result or a "not done" yield. The
+ * general Subtask to a long game. It runs the model/tool loop in durable
+ * **chunks**: each call advances as far as `chunkSoftMs` allows (or until the run
+ * spends its budget, or until a tool emits progress), checkpoints its rolling state
+ * after every turn, and returns either a terminal result or a "not done" yield. The
  * facet persists the state between chunks and the Workflow runs each chunk as its
  * own durable, retryable step — so no single step ever approaches the platform
  * step timeout, and a crash loses at most the in-flight turn.
@@ -237,12 +238,7 @@ export async function runResumableChunk(
     // per-chunk turn allowance: a turn count cannot bound a step's *duration*,
     // which is the only thing the step timeout cares about, so the wall-clock
     // predicate below owns that job alone.
-    //
-    // The `Math.max(1, …)` floor matters on the fallback: a primary that spent
-    // the whole budget before failing still leaves it one step to reach an
-    // ending, so a chunk may exceed `maxTurns` by exactly one rather than
-    // returning nothing at all.
-    isStepCount(Math.max(1, deps.limits.maxTurns - state.turns)),
+    isStepCount(stepAllowance(deps.limits.maxTurns, state.turns)),
     // The run-wide deadline. Without it the entry guard would only observe the
     // deadline at the next chunk boundary, up to `chunkSoftMs` past it.
     () => deps.now() - state.startedAtMs >= deps.limits.maxWallMs,

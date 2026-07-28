@@ -189,19 +189,40 @@ export interface DecompositionProposal {
  * (mirrors {@link RecipeExecutionResult}).
  *
  * `turns` is what this round cost, which the Workflow meters against the Task's
- * budget. The idempotent recovery paths — a round replayed from durable rows
- * rather than re-inferred — report **0**, because they ran no model and genuinely
- * cannot know. That is exact on a clean replay, where the Workflow's own cached
- * step return already carries the original number, and under-counts by one round
- * when a step crashed mid-flight and re-ran. Accepted rather than fixed: a
- * replying round writes no durable row at all, so nothing exists to hang a
- * per-round count on, and the wall clock bounds the crash-loop case anyway.
+ * budget. This is the **only** type that carries it, and it carries it because the
+ * count has to cross an RPC boundary to reach a Workflow in another isolate;
+ * everything inside the DO shares one mutable {@link file://../budget.ts TurnBudget}
+ * instead. The field is attached in a single place — see `runTaskTurn` — so no
+ * branch can drop it and no branch can invent it.
+ *
+ * The idempotent recovery paths — a round replayed from durable rows rather than
+ * re-inferred — therefore report **0** structurally: they return before any model
+ * runs, so the budget they hand back is untouched. That is exact on a clean
+ * replay, where the Workflow's own cached step return already carries the original
+ * number, and under-counts by one round when a step crashed mid-flight and re-ran.
+ * Accepted rather than fixed: a replying round writes no durable row at all, so
+ * nothing exists to hang a per-round count on, and the wall clock bounds the
+ * crash-loop case anyway.
  */
 export type TurnTaskResult =
   | { status: "replied"; reply: string; turns: number }
   | { status: "delegated"; reply: string; subtasks: Subtask[]; turns: number }
   | { status: "failed"; error: string; turns: number }
   | { status: "canceled"; turns: number };
+
+/**
+ * Distributive `Omit` — applies per member, so the discriminated union survives.
+ * A plain `Omit<TurnTaskResult, "turns">` collapses all four into one loose shape
+ * whose `reply` and `subtasks` are independently optional.
+ */
+type WithoutTurns<T> = T extends unknown ? Omit<T, "turns"> : never;
+
+/**
+ * What a round decided, before its cost is attached. The DO's round logic returns
+ * this and lets one wrapper bill the budget, rather than every branch remembering
+ * to report a number it did not compute.
+ */
+export type TurnVerdict = WithoutTurns<TurnTaskResult>;
 
 /**
  * One branch's outcome as a later round sees it — a plain, RPC-safe subset of the

@@ -7,6 +7,7 @@ import type {
 import { generateText, hasToolCall, isStepCount } from "ai";
 import type { SessionMessage } from "agents/experimental/memory/session";
 import { MAIN_AGENT_LIMITS, MAX_OUTPUT_TOKENS, MAX_SUBTASKS } from "@/config";
+import { stepAllowance, type TurnBudget } from "./budget";
 import { FINAL_REPLY_TOOL_NAME, finalReplyTool } from "./final-reply";
 import {
   buildIntermediateContentHandler,
@@ -404,17 +405,15 @@ export interface RunTurnArgs {
   /** What this round may do — see {@link RoundMode}. */
   mode: RoundMode;
   /**
-   * Turns still unspent in the Task's budget, bounding this **round** — both its
-   * tool loop and its primary→fallback pair together, not each attempt
-   * separately. There is no per-round allowance beyond it: an early round that
-   * dithers spends what a later one would have had, and is then handed a `final`
-   * round to answer in.
+   * The Task's unspent turns, and the tally this round writes back into them.
+   * Mutated in place as the model works, so the primary and the fallback draw on
+   * one allowance rather than one each — see {@link TurnBudget}.
    *
-   * A round may exceed it by exactly one, and only when the primary consumed the
-   * whole remainder and the fallback still needs a step to reach an ending. Read
-   * with `mode: "final"`, where the round is one step per attempt regardless.
+   * There is no per-round allowance beyond what the Task has left: an early round
+   * that dithers spends what a later one would have had, and is then handed a
+   * `final` round to answer in. The caller reads `spent` when the round returns.
    */
-  turnsRemaining: number;
+  budget: TurnBudget;
   /** Per-request system-prompt suffix (verified caller context). */
   systemSuffix: string;
   /** The main agent's gated **work** tools, merged over the session's own tools. */
@@ -433,24 +432,18 @@ export interface RunTurnArgs {
  * rather than running a synthesized subtask nobody asked for. Transient faults
  * throw instead (the Workflow step retries).
  *
- * Every variant carries `turns`, because every variant cost something. It is the
- * **sum across both model attempts**, not the winning one's: a round that burned
- * the primary and recovered on the fallback spent both, and a budget that counted
- * only the winner would quietly forgive the expensive half of a bad round.
+ * What the round cost is not here: it is in the caller's {@link TurnBudget}, which
+ * every exit has already charged — including the ones that failed. A round that
+ * burned the primary and recovered on the fallback spent both, and there is no
+ * variant that could quietly forgive the expensive half of a bad round.
  */
 export type RunTurnOutcome =
-  | { status: "replied"; reply: string; turns: number }
-  | {
-      status: "delegated";
-      reply: string;
-      drafts: SubtaskDraft[];
-      turns: number;
-    }
-  | { status: "failed"; error: string; turns: number };
+  | { status: "replied"; reply: string }
+  | { status: "delegated"; reply: string; drafts: SubtaskDraft[] }
+  | { status: "failed"; error: string };
 
 type Attempt =
-  | { ok: true; decision: TurnDecision; turns: number }
-  | { ok: false; error: unknown; turns: number };
+  { ok: true; decision: TurnDecision } | { ok: false; error: unknown };
 
 /**
  * One attempt against a single model: let it work, and take whichever ending it
@@ -472,8 +465,9 @@ type Attempt =
  * the turn budget mid-tool-use, or answering in prose despite
  * `toolChoice: "required"` — is caught below.
  *
- * Reports the steps it spent whether it succeeded or not. A failed attempt cost
- * exactly as much as a successful one.
+ * Charges the budget as it goes, whether it succeeds or not: a failed attempt cost
+ * exactly as much as a successful one, and a call that died on its fourth step
+ * still spent four turns.
  */
 async function attempt(
   args: RunTurnArgs,
@@ -493,19 +487,15 @@ async function attempt(
   // the composing round has every branch result in its messages already, so the
   // thing it needs is not a lookup but an ending.
   const workTools: ToolSet = final ? {} : args.tools;
-  // One step per attempt for a `final` round: it exists to produce the answer,
-  // and that answer is deliberately spent *beyond* the budget rather than out of
-  // it. An `open` round gets what its caller says is left — `runTurn` decrements
-  // that between attempts, which is what keeps the two slots from each spending a
-  // full allowance.
+  // One step per attempt for a `final` round: it exists to produce the answer, and
+  // that answer is deliberately spent *beyond* the budget rather than out of it.
   //
-  // The `Math.max(1, …)` floor is load-bearing, not defensive: a primary that
-  // consumed the entire remainder still hands the fallback one step. The
-  // alternative is a round that cannot run its fallback at all, which fails the
-  // round and costs the Task its answer — a far worse trade than one turn. So a
-  // round may exceed its allowance by exactly one, and no more.
-  const stepBudget = final ? 1 : Math.max(1, args.turnsRemaining);
-  let turns = 0;
+  // An `open` round gets whatever the shared budget still holds, read here rather
+  // than at the top of the round — so the fallback sees what the primary spent
+  // without anyone having to subtract it. See {@link stepAllowance} for the floor.
+  const stepBudget = final
+    ? 1
+    : stepAllowance(args.budget.allowance, args.budget.spent);
   const content = args.onContent
     ? buildIntermediateContentHandler(args.onContent, [
         DELEGATE_TOOL_NAME,
@@ -536,11 +526,10 @@ async function attempt(
       // We do our own primary → fallback recovery, so disable the SDK's
       // per-model backoff (it would only add latency and duplicate the fallback).
       maxRetries: 0,
-      // Counted here rather than from `result.steps` so a throw mid-loop still
-      // reports the steps already spent — a call that died on its fourth step
-      // cost four turns, and the `catch` below has no `result` to read.
+      // Charged here rather than from `result.steps` so a throw mid-loop still
+      // bills the steps already spent — the `catch` below has no `result` to read.
       onStepEnd: async (step) => {
-        turns += 1;
+        args.budget.spent += 1;
         if (content) await content(step);
       }
     });
@@ -551,7 +540,6 @@ async function attempt(
     if (delegates.length > 1) {
       return {
         ok: false,
-        turns,
         error: new Error(
           `model called ${DELEGATE_TOOL_NAME} ${delegates.length} times in one turn`
         )
@@ -563,7 +551,6 @@ async function attempt(
       // is the acknowledgment for the work, not an answer instead of it.
       return {
         ok: true,
-        turns,
         decision: {
           kind: "delegate",
           proposal: delegates[0].input as DecompositionProposal
@@ -580,7 +567,6 @@ async function attempt(
       const { text } = replies[replies.length - 1].input as { text: string };
       return {
         ok: true,
-        turns,
         decision: { kind: "reply", text: text.trim() }
       };
     }
@@ -599,13 +585,12 @@ async function attempt(
     }
     return {
       ok: false,
-      turns,
       error: new Error(
         `round produced no decision (finishReason=${result.finishReason}, textLength=${result.text.trim().length})`
       )
     };
   } catch (error) {
-    return { ok: false, turns, error };
+    return { ok: false, error };
   }
 }
 
@@ -642,26 +627,15 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
 
   const diagnostics: string[] = [];
   const errors: unknown[] = [];
-  // Summed across both slots: a fallback attempt is spend, not a free retry.
-  let turns = 0;
 
   for (const slot of ["primary", "fallback"] as const) {
     const modelId =
       slot === "primary" ? models.primaryId() : models.fallbackId();
     const model = slot === "primary" ? models.primary : models.fallback;
 
-    // The allowance is the *round's*, not each attempt's. Handing both slots the
-    // same `turnsRemaining` let one round spend twice it — the budget summed the
-    // two attempts correctly and then never enforced the total, so a Task could
-    // overshoot `MAIN_AGENT_LIMITS.maxTurns` by more than 2x before the next
-    // round's check saw it.
-    const outcome = await attempt(
-      { ...args, turnsRemaining: args.turnsRemaining - turns },
-      model,
-      system,
-      messages
-    );
-    turns += outcome.turns;
+    // Both slots draw on the one `args.budget`, which each attempt reads on entry
+    // and charges as it works. A fallback attempt is spend, not a free retry.
+    const outcome = await attempt(args, model, system, messages);
     if (!outcome.ok) {
       errors.push(outcome.error);
       diagnostics.push(`${slot} (${modelId}): ${String(outcome.error)}`);
@@ -684,7 +658,7 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
           outcome.decision.text
         )
       );
-      return { status: "replied", reply, turns };
+      return { status: "replied", reply };
     }
 
     let resolved: ReturnType<typeof resolveDecomposition>;
@@ -717,8 +691,7 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
     return {
       status: "delegated",
       reply: stored,
-      drafts: resolved.drafts,
-      turns
+      drafts: resolved.drafts
     };
   }
 
@@ -744,8 +717,8 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
         joinSuccessfulBranches(branches)
       )
     );
-    return { status: "replied", reply, turns };
+    return { status: "replied", reply };
   }
 
-  return { status: "failed", error: detail, turns };
+  return { status: "failed", error: detail };
 }
