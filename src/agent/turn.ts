@@ -6,7 +6,8 @@ import type {
 } from "ai";
 import { generateText, hasToolCall, isStepCount } from "ai";
 import type { SessionMessage } from "agents/experimental/memory/session";
-import { MAX_STEPS, MAX_SUBTASKS } from "@/config";
+import { MAX_OUTPUT_TOKENS, MAX_STEPS, MAX_SUBTASKS } from "@/config";
+import { FINAL_REPLY_TOOL_NAME, finalReplyTool } from "./final-reply";
 import {
   buildIntermediateContentHandler,
   isTransientAiError,
@@ -26,6 +27,7 @@ import {
   type ReferenceCatalogEntry
 } from "./subtasks/catalog";
 import { resolveDecomposition } from "./subtasks/decomposition";
+import { SUBTASK_TYPE_KEYS } from "./subtasks/subtask-types";
 import {
   DELEGATE_TOOL_NAME,
   delegateCallInput,
@@ -57,17 +59,26 @@ import type {
  *   model keeps reasoning over their results. Every round gets them, including the
  *   one that writes the final reply — looking something up before answering is
  *   ordinary work, not a special phase.
- * - **Control tools** — today only {@link delegateTool} — have no `execute`. The
- *   call *is* the round's output: the loop halts on it and the Workflow performs
- *   it durably. A future `escalate` (ask the human) is the same shape: another
- *   variant of {@link TurnDecision}, another `case` in the Workflow's switch.
+ * - **Control tools** — {@link delegateTool} and {@link finalReplyTool} — have no
+ *   `execute`. The call *is* the round's output: the loop halts on it, and for
+ *   `delegate` the Workflow performs it durably. A future `escalate` (ask the
+ *   human) is the same shape: another variant of {@link TurnDecision}, another
+ *   `case` in the Workflow's switch.
  *
- * Nothing forces the choice. An earlier design pinned `toolChoice` to force
- * delegation in one phase and forbid it in another, which meant a request the main
- * agent was best placed to answer got shipped to a memoryless subagent, and
- * material that came back could only ever be turned into prose. Here plain text is
- * a first-class outcome, and delegating twice is allowed — the model decides, and
- * only the round budget bounds it.
+ * Nothing forces the *choice*, and that is deliberate. An earlier design pinned
+ * `toolChoice` to a specific tool to force delegation in one phase and forbid it in
+ * another, which meant a request the main agent was best placed to answer got
+ * shipped to a memoryless subagent, and material that came back could only ever be
+ * turned into prose. That is still rejected: the model picks its own ending, and
+ * delegating twice is allowed.
+ *
+ * What *is* forced is that the round end in a control call at all —
+ * `toolChoice: "required"`, with both endings declared as tools. Plain text used to
+ * be an outcome, and it made narration indistinguishable from an answer: a model
+ * that wrote "I'll start the game" and emitted no call ended the Task successfully
+ * having done nothing. Two named tools is also a much easier discrimination for a
+ * small model than prose-versus-tool, which is what the weaker fallback models
+ * consistently got wrong. See {@link file://./final-reply.ts final-reply.ts}.
  *
  * The model reasons over the whole conversation but references it by **catalog
  * index only** — see {@link renderTurnMessages}.
@@ -78,14 +89,14 @@ export const TURN_INSTRUCTIONS = `
 
 # Answering this request
 
-You are replying to the user yourself. You have two ways to act, and the choice is
-yours:
+You are replying to the user yourself. You have two ways to end this round, and the
+choice is yours:
 
-**1. Answer directly.** Write your reply as plain text. Do this whenever the
-request is yours to answer — anything about this conversation, your own history,
-memory, or tools, and anything you can settle with the tools available to you
-here. Use those tools first if they help: look something up, recall older history,
-then answer.
+**1. Answer directly.** Call the \`${FINAL_REPLY_TOOL_NAME}\` tool with your reply. Do
+this whenever the request is yours to answer — anything about this conversation,
+your own history, memory, or tools, and anything you can settle with the tools
+available to you here. Use those tools first if they help: look something up,
+recall older history, then answer.
 
 **2. Delegate.** Call the \`${DELEGATE_TOOL_NAME}\` tool to hand work to isolated
 subagents that run concurrently — research, long-running jobs, or anything better
@@ -94,6 +105,10 @@ then decide again: answer, or delegate once more.
 
 Do not delegate work you can simply do. Do not answer from thin air work that
 genuinely needs doing.
+
+**Every round must end in one of those two calls.** Prose on its own does not reach
+the user and does not start any work — if you decide to do something, make the call
+that does it in the same turn rather than describing what you are about to do.
 
 ## Delegating
 
@@ -108,12 +123,16 @@ genuinely needs doing.
 
 Each subtask has:
 
-- "localKey": a short unique identifier within this call (e.g. "research").
-- "type": a short semantic label for the kind of work (e.g. "research", "draft").
-- "prompt": a complete, self-contained instruction. The subagent executing it has
-  no memory, no conversation history, and no access to this session — everything
-  it needs must be in this prompt or in the references you select. Write it as an
-  instruction to a capable stranger.
+- "localKey": a short unique identifier within this call (e.g. "research"). Must not
+  be blank.
+- "type": exactly one of ${SUBTASK_TYPE_KEYS.map((k) => `"${k}"`).join(", ")}. These are
+  the only accepted values — any other word is rejected and the whole call fails.
+  Pick "general" for ordinary work; see the tool description for what each type
+  does and which params it needs.
+- "prompt": a complete, self-contained instruction, and never blank. The subagent
+  executing it has no memory, no conversation history, and no access to this
+  session — everything it needs must be in this prompt or in the references you
+  select. Write it as an instruction to a capable stranger.
 - "referenceIndexes": the indexes of conversation turns the subagent must read
   verbatim, chosen from the turns marked "[ref N]" below. Reference only what that
   subtask actually needs. Turns without a "[ref N]" marker cannot be referenced;
@@ -132,9 +151,9 @@ output is raw material for you, never something the user sees directly.
 ## Using results that have come back
 
 When a \`${DELEGATE_TOOL_NAME}\` call's results are already in this conversation, they are
-yours to use. Write in your own voice — do not paste results verbatim, introduce
-them as "subtask output", or mention subtasks, subagents, or delegation. The user
-asked you.
+yours to use. Put your answer in a \`${FINAL_REPLY_TOOL_NAME}\` call, in your own voice —
+do not paste results verbatim, introduce them as "subtask output", or mention
+subtasks, subagents, or delegation. The user asked you.
 
 If some work failed or was skipped, say plainly what you could not do, in one
 short sentence, without diagnostics or blame — then give them everything you did
@@ -153,15 +172,17 @@ started playing and will report back, without promising a time.`;
 /**
  * Appended instead of the delegation half when the round may not delegate — the
  * last round of the budget, or a Task that has spent its execution budget. The
- * tool is not declared at all in that case, so this only explains a constraint the
- * model can already see.
+ * `delegate` tool is not declared at all in that case, so this only explains a
+ * constraint the model can already see. `final_reply` still is, and remains the
+ * only way to end.
  */
 export const FINAL_ROUND_INSTRUCTIONS = `
 
 # No further delegation
 
-You cannot delegate on this turn — answer the user now, from what you already
-have. If something is missing or failed, say so plainly and give them the rest.`;
+You cannot delegate on this turn — call \`${FINAL_REPLY_TOOL_NAME}\` now and answer the
+user from what you already have. If something is missing or failed, say so plainly
+and give them the rest.`;
 
 /** User-facing note appended when a deterministic join has to disclose gaps. */
 const PARTIAL_NOTE =
@@ -391,15 +412,16 @@ type Attempt =
  * model still gets its turn.
  *
  * The model uses its work tools freely — answering well can genuinely need a
- * lookup or a recall — and the loop ends one of two ways: it calls `delegate` (no
- * `execute`, so there is nothing to continue from and the loop halts on the call),
- * or it stops with text, which *is* the reply. Text alongside a `delegate` call is
- * a preamble, not an answer: the control call wins.
+ * lookup or a recall — and the loop ends by calling one of the two control tools.
+ * Neither has an `execute`, so there is nothing to continue from and the loop halts
+ * on the call. A `delegate` alongside a `final_reply` is an acknowledgment paired
+ * with the work it acknowledges: delegating wins.
  *
  * Every deterministic failure collapses to `{ ok: false }`: the SDK rejects a call
  * whose input violates the schema (`InvalidToolInputError`) or names an unknown
- * tool (`NoSuchToolError`), and a run that ended with neither a decision nor text
- * — burning `MAX_STEPS` mid-tool-use — is caught below.
+ * tool (`NoSuchToolError`), and a run that ended without a control call — burning
+ * `MAX_STEPS` mid-tool-use, or answering in prose despite `toolChoice: "required"`
+ * — is caught below.
  */
 async function attempt(
   args: RunTurnArgs,
@@ -407,20 +429,37 @@ async function attempt(
   instructions: string,
   messages: ModelMessage[]
 ): Promise<Attempt> {
+  // `final_reply` is declared on every round, including the one that may not
+  // delegate — otherwise the final round would have no legal way to end.
+  const controlTools: ToolSet = {
+    [FINAL_REPLY_TOOL_NAME]: finalReplyTool,
+    ...(args.allowControl ? { [DELEGATE_TOOL_NAME]: delegateTool } : {})
+  };
+
   try {
     const result = await generateText({
       model: model(),
       instructions,
       messages,
-      tools: args.allowControl
-        ? { ...args.tools, [DELEGATE_TOOL_NAME]: delegateTool }
-        : args.tools,
-      stopWhen: [isStepCount(MAX_STEPS), hasToolCall(DELEGATE_TOOL_NAME)],
+      tools: { ...args.tools, ...controlTools },
+      // Every ending is a control call, so the model must always call something.
+      // Work tools stay freely available — `required` constrains the *shape* of a
+      // step's output, not which tool is chosen.
+      toolChoice: "required",
+      maxOutputTokens: MAX_OUTPUT_TOKENS,
+      stopWhen: [
+        isStepCount(MAX_STEPS),
+        hasToolCall(DELEGATE_TOOL_NAME),
+        hasToolCall(FINAL_REPLY_TOOL_NAME)
+      ],
       // We do our own primary → fallback recovery, so disable the SDK's
       // per-model backoff (it would only add latency and duplicate the fallback).
       maxRetries: 0,
       onStepEnd: args.onContent
-        ? buildIntermediateContentHandler(args.onContent, [DELEGATE_TOOL_NAME])
+        ? buildIntermediateContentHandler(args.onContent, [
+            DELEGATE_TOOL_NAME,
+            FINAL_REPLY_TOOL_NAME
+          ])
         : undefined
     });
 
@@ -437,6 +476,8 @@ async function attempt(
     }
     if (delegates.length === 1) {
       // Already schema-validated by the SDK against the tool's `inputSchema`.
+      // Delegating wins over a `final_reply` emitted in the same step: the reply
+      // is the acknowledgment for the work, not an answer instead of it.
       return {
         ok: true,
         decision: {
@@ -446,16 +487,34 @@ async function attempt(
       };
     }
 
-    const text = result.text.trim();
-    if (!text || result.finishReason === "length") {
-      return {
-        ok: false,
-        error: new Error(
-          `round produced no decision (finishReason=${result.finishReason}, empty=${!text})`
-        )
-      };
+    const replies = result.toolCalls.filter(
+      (c) => c.toolName === FINAL_REPLY_TOOL_NAME
+    );
+    if (replies.length >= 1) {
+      // Schema-validated too, including the non-blank refinement — so the last
+      // call of a repeated set is a complete reply, not an empty one.
+      const { text } = replies[replies.length - 1].input as { text: string };
+      return { ok: true, decision: { kind: "reply", text: text.trim() } };
     }
-    return { ok: true, decision: { kind: "reply", text } };
+
+    // No control call. Either the model ran out of steps mid-tool-use, or it
+    // ignored `toolChoice: "required"` and narrated an action instead of taking
+    // one — the failure this whole design exists to catch. Failing the attempt
+    // hands the round to the fallback model rather than shipping the narration to
+    // the user as if it were an answer.
+    if (result.finishReason === "length") {
+      console.warn("[turn] model output truncated", {
+        taskId: args.taskId,
+        round: args.round,
+        maxOutputTokens: MAX_OUTPUT_TOKENS
+      });
+    }
+    return {
+      ok: false,
+      error: new Error(
+        `round produced no decision (finishReason=${result.finishReason}, textLength=${result.text.trim().length})`
+      )
+    };
   } catch (error) {
     return { ok: false, error };
   }

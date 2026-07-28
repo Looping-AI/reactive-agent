@@ -1,4 +1,5 @@
 import type { FinishReason, StepResult, ToolSet } from "ai";
+import { APICallError, RetryError } from "ai";
 
 /**
  * Shared Workers-AI plumbing for the agent's inference operations — the pieces
@@ -24,14 +25,49 @@ export type OnContent = (
   stepIndex: number
 ) => void | Promise<void>;
 
-/** Whether an error is a transient Workers-AI capacity/timeout condition. */
+/** Workers-AI error codes and message fragments that mean "try again later". */
+const TRANSIENT_MESSAGE_FRAGMENTS = [
+  "3040",
+  "3046",
+  "capacity temporarily exceeded",
+  "request timeout",
+  "rate limit",
+  "too many requests",
+  "overloaded",
+  "service unavailable"
+];
+
+/** HTTP statuses worth another attempt: timeout, conflict, throttle, any 5xx. */
+function isRetryableStatus(status: number | undefined): boolean {
+  if (status === undefined) return false;
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+/**
+ * Whether an error is a transient availability condition rather than a
+ * deterministic bad-output one.
+ *
+ * The distinction decides who handles it: transient throws out of the attempt loop
+ * so the Workflow step retries the whole round, while everything else burns the
+ * model slot and hands over to the fallback. Classifying a capacity blip as
+ * deterministic is the expensive mistake — it spends both slots on an outage and
+ * fails a Task that would have succeeded a second later.
+ *
+ * Structured signals first: the SDK's own `APICallError.isRetryable`, then the
+ * status code, then `RetryError` (raised once the SDK's internal backoff is
+ * exhausted). The message fragments stay as the last resort for the Workers-AI
+ * error codes, which arrive as prose on a plain `Error`.
+ */
 export function isTransientAiError(err: unknown): boolean {
+  if (APICallError.isInstance(err)) {
+    if (err.isRetryable) return true;
+    if (isRetryableStatus(err.statusCode)) return true;
+  }
+  if (RetryError.isInstance(err)) return true;
   if (!(err instanceof Error)) return false;
-  return (
-    err.message.includes("3040") ||
-    err.message.includes("3046") ||
-    err.message.toLowerCase().includes("capacity temporarily exceeded") ||
-    err.message.toLowerCase().includes("request timeout")
+  const message = err.message.toLowerCase();
+  return TRANSIENT_MESSAGE_FRAGMENTS.some((fragment) =>
+    message.includes(fragment)
   );
 }
 

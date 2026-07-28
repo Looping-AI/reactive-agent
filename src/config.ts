@@ -4,13 +4,31 @@
  */
 
 /** Workers AI model used by the agent tool loop. Must support function calling. */
-export const CHAT_MODEL_ID = "@cf/zai-org/glm-4.7-flash";
+export const CHAT_MODEL_ID = "@cf/moonshotai/kimi-k2.7-code";
 
-/** Fallback model tried when the primary model throws an error. */
+/**
+ * Fallback model tried when the primary model throws an error. Deliberately a
+ * *different vendor and family* from {@link CHAT_MODEL_ID}.
+ */
 export const CHAT_FALLBACK_MODEL_ID = "@cf/zai-org/glm-5.2";
 
 /** Cloudflare AI Gateway slug — "default" auto-provisions a gateway on first request. */
 export const AI_GATEWAY_ID = "default";
+
+/**
+ * Output-token ceiling for every chat call. Left unset, the binding applies its own
+ * per-model default, which on a reasoning model is spent on `reasoning_content`
+ * before the tool call is ever emitted — a truncated round that reads as a clean
+ * answer. Generous on purpose: the ceiling exists to bound a runaway, not to
+ * ration, and both slots have >=131k of context to draw on.
+ */
+export const MAX_OUTPUT_TOKENS = 16_384;
+
+/**
+ * Reasoning budget for the reasoning-capable chat models. Forwarded on the
+ * binding's `inputs` object by `workers-ai-provider` (see `chatSettings`).
+ */
+export const REASONING_EFFORT = "medium" as const;
 
 /** Upper bound on tool-loop steps in a single turn (bounds the `generateText` loop). */
 export const MAX_STEPS = 8;

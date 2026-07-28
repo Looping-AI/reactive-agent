@@ -165,25 +165,33 @@ is the design:
   They never end a round. **Every** round gets them, including the one that writes
   the final reply: looking something up before answering is ordinary work, not a
   special phase.
-- **Control tools** — today only
-  [`delegate`](src/agent/subtasks/delegate.ts) — have no `execute`. The call _is_
-  the round's output: the loop halts on it (there is nothing to continue from) and
-  the Workflow performs it durably, over minutes or hours.
+- **Control tools** — [`delegate`](src/agent/subtasks/delegate.ts) and
+  [`final_reply`](src/agent/final-reply.ts) — have no `execute`. The call _is_ the
+  round's output: the loop halts on it (there is nothing to continue from), and for
+  `delegate` the Workflow performs it durably, over minutes or hours.
 
-Nothing forces the choice. Plain text at the end of the loop is a first-class,
-terminal answer; a `delegate` call is a decision to do work first. A model that
-ends with neither has failed the attempt, and the fallback model runs.
+Nothing forces the _choice_ — a `final_reply` call is a terminal answer, a
+`delegate` call is a decision to do work first, and the model picks. What is forced
+is that the round end in a control call at all: `toolChoice` is `"required"`, and a
+model that ends any other way has failed the attempt, so the fallback model runs.
 
-This replaced a design that pinned `toolChoice` to _force_ delegation in one phase
-and _forbid_ it in the next. Both were wrong in practice: a question about the
-agent's own history got shipped to a memoryless subagent that could not see it,
-and material that came back could only ever be turned into prose, never acted on.
+Prose used to be the way a round answered, and that made narration
+indistinguishable from an answer — a model that wrote "I'll start the game" and
+emitted no call ended the Task successfully having done nothing. Weaker fallback
+models did this constantly. Two named tools is also a far easier discrimination for
+a small model than prose-versus-tool.
+
+This is not a return to the earlier design that pinned `toolChoice` to a _specific
+tool_, forcing delegation in one phase and forbidding it in the next. Both of those
+were wrong in practice: a question about the agent's own history got shipped to a
+memoryless subagent that could not see it, and material that came back could only
+ever be turned into prose, never acted on. The model still chooses its own ending.
 
 The one constraint is the budget. `MAX_TURN_ROUNDS` (8) bounds the loop, and the
 last round — or any round of a Task that has already spent `MAX_CHUNKS_PER_TASK`
-chunk steps — is handed `allowControl: false`: the control tools are not declared
-at all, so it must answer from what it has. That is the whole termination
-argument.
+chunk steps — is handed `allowControl: false`: `delegate` is not declared at all,
+so `final_reply` is the only ending left and the round must answer from what it
+has. That is the whole termination argument.
 
 Failure is graded rather than fatal. Both models producing nothing usable fails
 the _Task_ only when there is no durable work behind it; with completed branches
@@ -542,24 +550,26 @@ The test suite is deliberately **hermetic** — no network, no real inference �
 a few things are proven only by construction and stay unverified until production
 traffic. They are characteristics, not known bugs; none is a correctness hole.
 
-1. **The delegation tool call, on both ends — and the unforced choice.** A round
-   needs the real models to call `delegate` and fill its schema, and a later round
-   gets a history containing that call paired with a `tool` result.
-   `test/agent/turn.spec.ts` asserts both shapes reach the provider, but a mock
-   model cannot prove `@cf/zai-org/glm-5.2` and `@cf/google/gemma-4-26b-a4b-it`
-   **honor** them. Removing the `toolChoice` pinning adds a second unknown that no
-   hermetic test can close: whether these models _judge_ well — delegating work
-   they cannot do, and answering the ones they can. Failure stays graceful (a
-   round that lands on neither a call nor text exhausts both models; a later round
-   that mishandles the pair falls through to `joinSuccessfulBranches`), so the
-   thing to watch in the first live tasks is not crashes but **choices**: read the
-   AI Gateway logs for rounds that answered when they should have delegated.
+1. **The control tool calls, on both ends — and the unforced choice.** A round
+   needs the real models to call `delegate` or `final_reply` and fill the schema,
+   and a later round gets a history containing the `delegate` call paired with a
+   `tool` result. `test/agent/turn.spec.ts` asserts every shape reaches the
+   provider, but a mock model cannot prove `@cf/zai-org/glm-4.7-flash` and
+   `@cf/moonshotai/kimi-k2.7-code` **honor** them. `toolChoice: "required"` closes
+   the failure mode where a model narrated instead of acting, but it cannot make a
+   model _judge_ well — delegating work it cannot do, and answering what it can.
+   Failure stays graceful (a round that lands on no control call exhausts both
+   models; a later round that mishandles the pair falls through to
+   `joinSuccessfulBranches`), so the thing to watch in the first live tasks is not
+   crashes but **choices**: read the AI Gateway logs for rounds that answered when
+   they should have delegated. A model that ignores `required` outright would show
+   up as rounds failing with `round produced no decision`.
 2. **Chunk-step timing and the resumable runner.** A chunk runs at most
    `turnsPerChunk` model turns bounded by `chunkSoftMs` (~4 min for the ARC
    recipe), well under the platform's default 10-minute step timeout, and it
    checkpoints after every turn — so unlike the old whole-loop step, a timeout or
    crash resumes from the last turn instead of replaying the chunk. What stays
-   unverified without production traffic is whether `@cf/zai-org/glm-5.2` sustains
+   unverified without production traffic is whether the chat models sustain
    coherent tool-driven play over hundreds of turns (dithering, malformed calls,
    context drift) — the metrics footer (turns / model calls / wall-clock) and AI
    Gateway logs make it observable; tune `limits`/`historyWindow`/soul with

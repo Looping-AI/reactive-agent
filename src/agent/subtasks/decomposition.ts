@@ -44,7 +44,16 @@ export class DecompositionValidationError extends Error {
   }
 }
 
-const nonBlank = (label: string) =>
+/**
+ * A required string that is not whitespace.
+ *
+ * The `.refine()` is enforced by the SDK (which validates tool input with the zod
+ * schema) but is **invisible to the model**: refinements do not survive JSON-Schema
+ * conversion. So any field using this must also say "must not be blank" in its
+ * `.describe()`, or the model is held to a rule it was never shown — and a blank
+ * value throws out of `generateText` rather than being corrected.
+ */
+export const nonBlank = (label: string) =>
   z
     .string()
     .min(1)

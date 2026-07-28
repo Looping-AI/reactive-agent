@@ -21,7 +21,7 @@ import type {
 } from "@/agent/subtasks/types";
 import type { GatewayIdentity } from "@/a2a/verify";
 import { freshStub } from "../helpers/do";
-import { mockModel, type MockStep } from "../agent/mock-model";
+import { finalReply, mockModel, type MockStep } from "../agent/mock-model";
 
 const IDENTITY: GatewayIdentity = {
   key: "custom:1:tests",
@@ -309,7 +309,7 @@ describe("runTaskTurn — delegating", () => {
 describe("runTaskTurn — answering", () => {
   it("treats plain text as the terminal reply and persists it", async () => {
     await runInDurableObject(freshStub("turn-reply"), async (instance) => {
-      instance.modelsOverride = pairOf(mockModel({ text: "the answer" }));
+      instance.modelsOverride = pairOf(mockModel(finalReply("the answer")));
 
       const result = await turn(instance);
 
@@ -325,7 +325,7 @@ describe("runTaskTurn — answering", () => {
 
   it("returns the durable answer on a re-run, with no inference", async () => {
     await runInDurableObject(freshStub("turn-answered"), async (instance) => {
-      instance.modelsOverride = pairOf(mockModel({ text: "first answer" }));
+      instance.modelsOverride = pairOf(mockModel(finalReply("first answer")));
       await turn(instance);
 
       const models = countingPair();
@@ -345,7 +345,9 @@ describe("runTaskTurn — answering", () => {
       db.subtasks.start(rows[0].id, { recipeId: "default", recipeVersion: 1 });
       db.subtasks.complete(rows[0].id, [{ kind: "text", text: "raw finding" }]);
 
-      instance.modelsOverride = pairOf(mockModel({ text: "composed answer" }));
+      instance.modelsOverride = pairOf(
+        mockModel(finalReply("composed answer"))
+      );
       const result = await turn(instance, { round: 1 });
 
       expect(result).toEqual({
@@ -373,7 +375,7 @@ describe("runTaskTurn — answering", () => {
         db.subtasks.complete(rows[i].id, [{ kind: "text", text: part }]);
       }
 
-      const model = mockModel({ text: "composed answer" });
+      const model = mockModel(finalReply("composed answer"));
       const orig = model.doGenerate.bind(model);
       let seen = "";
       model.doGenerate = async (options: Parameters<typeof orig>[0]) => {
