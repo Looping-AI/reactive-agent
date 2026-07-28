@@ -4,7 +4,7 @@ import type {
   ModelMessage,
   ToolSet
 } from "ai";
-import { generateText, hasToolCall, stepCountIs } from "ai";
+import { generateText, hasToolCall, isStepCount } from "ai";
 import type { SessionMessage } from "agents/experimental/memory/session";
 import { MAX_STEPS, MAX_SUBTASKS } from "@/config";
 import {
@@ -404,22 +404,22 @@ type Attempt =
 async function attempt(
   args: RunTurnArgs,
   model: () => LanguageModel,
-  system: string,
+  instructions: string,
   messages: ModelMessage[]
 ): Promise<Attempt> {
   try {
     const result = await generateText({
       model: model(),
-      system,
+      instructions,
       messages,
       tools: args.allowControl
         ? { ...args.tools, [DELEGATE_TOOL_NAME]: delegateTool }
         : args.tools,
-      stopWhen: [stepCountIs(MAX_STEPS), hasToolCall(DELEGATE_TOOL_NAME)],
+      stopWhen: [isStepCount(MAX_STEPS), hasToolCall(DELEGATE_TOOL_NAME)],
       // We do our own primary → fallback recovery, so disable the SDK's
       // per-model backoff (it would only add latency and duplicate the fallback).
       maxRetries: 0,
-      onStepFinish: args.onContent
+      onStepEnd: args.onContent
         ? buildIntermediateContentHandler(args.onContent, [DELEGATE_TOOL_NAME])
         : undefined
     });

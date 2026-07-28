@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { importJWK, jwtVerify, decodeProtectedHeader } from "jose";
-import type { Task } from "@a2a-js/sdk";
+import { A2A_CONTENT_TYPE, Role, TaskState } from "@a2a-js/sdk";
 import {
   buildSubmittedTask,
   buildCompletedTask,
@@ -11,9 +11,17 @@ import {
   NOTIFICATION_TOKEN_HEADER,
   TASK_FAILED_TEXT
 } from "@/a2a/notify";
+import type { PlainTask } from "@/a2a/task";
 import { TEST_AGENT_PRIVATE_JWK } from "../fixtures";
 
 const JKU = "https://agent.example.com/.well-known/jwks.json";
+
+/** Concatenate the text of a Task's status message, v1.0 `content` oneof and all. */
+function statusText(task: PlainTask): string {
+  return (task.status.message?.parts ?? [])
+    .flatMap((p) => (p.content?.$case === "text" ? [p.content.value] : []))
+    .join("");
+}
 const AUD = "https://gateway.test/a2a/notifications";
 
 async function agentPublicKey() {
@@ -25,26 +33,18 @@ async function agentPublicKey() {
 describe("buildSubmittedTask", () => {
   it("is a submitted Task with the given id + contextId", () => {
     const task = buildSubmittedTask("task-1", "ctx-1");
-    expect(task.kind).toBe("task");
     expect(task.id).toBe("task-1");
     expect(task.contextId).toBe("ctx-1");
-    expect(task.status.state).toBe("submitted");
+    expect(task.status.state).toBe(TaskState.TASK_STATE_SUBMITTED);
   });
 });
 
 describe("buildCompletedTask", () => {
   it("is a completed Task carrying the reply in status.message (where the gateway reads it)", () => {
     const task = buildCompletedTask("task-1", "ctx-1", "the answer");
-    expect(task.status.state).toBe("completed");
-    const parts = task.status.message?.parts ?? [];
-    const text = parts
-      .filter(
-        (p): p is Extract<typeof p, { kind: "text" }> => p.kind === "text"
-      )
-      .map((p) => p.text)
-      .join("");
-    expect(text).toBe("the answer");
-    expect(task.status.message?.role).toBe("agent");
+    expect(task.status.state).toBe(TaskState.TASK_STATE_COMPLETED);
+    expect(statusText(task)).toBe("the answer");
+    expect(task.status.message?.role).toBe(Role.ROLE_AGENT);
   });
 
   it("uses a deterministic ${taskId}:final messageId (stable across notify-step retries)", () => {
@@ -58,11 +58,9 @@ describe("buildCompletedTask", () => {
 describe("buildFailedTask", () => {
   it("is a failed Task carrying user-safe text in status.message", () => {
     const task = buildFailedTask("task-1", "ctx-1", TASK_FAILED_TEXT);
-    expect(task.status.state).toBe("failed");
-    expect(task.status.message?.role).toBe("agent");
-    expect(task.status.message?.parts?.[0]).toMatchObject({
-      text: TASK_FAILED_TEXT
-    });
+    expect(task.status.state).toBe(TaskState.TASK_STATE_FAILED);
+    expect(task.status.message?.role).toBe(Role.ROLE_AGENT);
+    expect(statusText(task)).toBe(TASK_FAILED_TEXT);
   });
 
   it("shares the deterministic ${taskId}:final messageId with the completed builder", () => {
@@ -84,19 +82,12 @@ describe("buildFailedTask", () => {
 describe("buildWorkingTask", () => {
   it("is a working Task carrying the given intermediate text + messageId", () => {
     const task = buildWorkingTask("task-1", "ctx-1", "progress…", "step:0");
-    expect(task.status.state).toBe("working");
+    expect(task.status.state).toBe(TaskState.TASK_STATE_WORKING);
     expect(task.id).toBe("task-1");
     expect(task.contextId).toBe("ctx-1");
-    expect(task.status.message?.role).toBe("agent");
+    expect(task.status.message?.role).toBe(Role.ROLE_AGENT);
     expect(task.status.message?.messageId).toBe("task-1:step:0");
-    const parts = task.status.message?.parts ?? [];
-    const text = parts
-      .filter(
-        (p): p is Extract<typeof p, { kind: "text" }> => p.kind === "text"
-      )
-      .map((p) => p.text)
-      .join("");
-    expect(text).toBe("progress…");
+    expect(statusText(task)).toBe("progress…");
   });
 
   it("keys milestone messages by their semantic phase", () => {
@@ -167,7 +158,7 @@ describe("postNotification", () => {
       })
     );
 
-    const task: Task = buildCompletedTask("task-1", "ctx-1", "hi");
+    const task = buildCompletedTask("task-1", "ctx-1", "hi");
     const res = await postNotification(AUD, "tok-123", "jwt-abc", task);
 
     expect(res.status).toBe(200);
@@ -176,7 +167,43 @@ describe("postNotification", () => {
     const headers = new Headers(captured.init?.headers);
     expect(headers.get(NOTIFICATION_TOKEN_HEADER)).toBe("tok-123");
     expect(headers.get("authorization")).toBe("Bearer jwt-abc");
-    expect(headers.get("content-type")).toBe("application/json");
-    expect(JSON.parse(captured.init?.body as string).id).toBe("task-1");
+    expect(headers.get("content-type")).toBe(A2A_CONTENT_TYPE);
+  });
+
+  it("sends the A2A v1.0 wire body: a StreamResponse-wrapped Task, JSON-encoded", async () => {
+    // This is the regression this test exists for. The in-memory protobuf shape
+    // is not the wire shape, so a plain `JSON.stringify(task)` would emit a
+    // numeric `state` and a `{ $case, value }` part wrapper — parseable JSON that
+    // no A2A peer accepts. The gateway also needs the `task` payload key to know
+    // which event shape this is, now that v1.0 has dropped `kind`.
+    const captured: { init?: RequestInit } = {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        captured.init = init;
+        return new Response("ok", { status: 200 });
+      })
+    );
+
+    const task = buildCompletedTask("task-1", "ctx-1", "hi");
+    await postNotification(AUD, "tok-123", "jwt-abc", task);
+
+    expect(JSON.parse(captured.init?.body as string)).toEqual({
+      task: {
+        id: "task-1",
+        contextId: "ctx-1",
+        status: {
+          state: "TASK_STATE_COMPLETED",
+          timestamp: expect.any(String),
+          message: {
+            messageId: "task-1:final",
+            contextId: "ctx-1",
+            taskId: "task-1",
+            role: "ROLE_AGENT",
+            parts: [{ text: "hi", mediaType: "text/plain" }]
+          }
+        }
+      }
+    });
   });
 });

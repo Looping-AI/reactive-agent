@@ -20,13 +20,19 @@ export class InboundPartError extends Error {
   }
 }
 
-/** Concatenate the text parts of an inbound A2A message. */
+/**
+ * Concatenate the text parts of an inbound A2A message.
+ *
+ * A2A v1.0 replaced the `TextPart`/`FilePart`/`DataPart` union with one `Part`
+ * carrying a `content` oneof, so text is selected on `content.$case` rather than
+ * the old `kind` discriminator. Parts with no content at all are skipped: the
+ * field is optional in the generated type.
+ */
 export function textOf(message: Message): string {
   return (message.parts ?? [])
-    .filter(
-      (p: Part): p is Extract<Part, { kind: "text" }> => p.kind === "text"
+    .flatMap((p: Part) =>
+      p.content?.$case === "text" ? [p.content.value] : []
     )
-    .map((p) => p.text)
     .join("")
     .trim();
 }

@@ -41,7 +41,7 @@ function isIntermediateStep(step: { finishReason: FinishReason }): boolean {
 }
 
 /**
- * Returns a fresh `onStepFinish` callback for one `generateText` attempt.
+ * Returns a fresh `onStepEnd` callback for one `generateText` attempt.
  * Fires `onContent` for each intermediate step (text that accompanies tool
  * calls); the final step is skipped because its text is the operation's return
  * value. A fresh handler per attempt resets the 0-based `stepIndex` counter so a

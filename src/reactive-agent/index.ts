@@ -1,9 +1,8 @@
 import { Agent, type Schedule } from "agents";
 import { env } from "cloudflare:workers";
 import type { ToolSet } from "ai";
-import type { Task } from "@a2a-js/sdk";
+import { TaskState, type Task } from "@a2a-js/sdk";
 import type { GatewayIdentity } from "@/a2a/verify";
-import type { PlainTask } from "@/a2a/task";
 import { parsePrivateJwk } from "@/a2a/card";
 import {
   buildWorkingTask,
@@ -11,6 +10,8 @@ import {
   signCallbackJwt
 } from "@/a2a/notify";
 import { AgentDB } from "@/db/db";
+import { stateOf } from "@/db/models/tasks";
+import type { PlainTask } from "@/a2a/task";
 import {
   createModelPair,
   embedTexts,
@@ -866,7 +867,8 @@ export class ReactiveAgent extends Agent<Env> {
 
   /** Whether the parent Task has been canceled (checked before and after work). */
   private async isTaskCanceled(taskId: string): Promise<boolean> {
-    return this.db.tasks.get(taskId)?.status.state === "canceled";
+    const task = this.db.tasks.get(taskId);
+    return task !== null && stateOf(task) === TaskState.TASK_STATE_CANCELED;
   }
 
   // --- Async task state (accept + notify) ---------------------------------
@@ -875,9 +877,10 @@ export class ReactiveAgent extends Agent<Env> {
   // Native RPC methods — the DO is never a network-reachable server. The
   // workflow, which cannot touch this SQLite directly, calls these via DO RPC.
   //
-  // The Task-returning methods return {@link PlainTask} (the SDK `Task` minus its
-  // `unknown`-bearing extension `metadata`); returning the raw SDK `Task` would
-  // collapse the generated DO-stub types to `never`. See {@link file://../a2a/task.ts}.
+  // The Task-returning methods return {@link PlainTask} — the SDK `Task`
+  // narrowed to what survives Cloudflare's RPC types. Returning the raw SDK
+  // `Task` breaks the generated DO-stub types (under v1.0 it blows past
+  // TypeScript's instantiation-depth limit). See {@link file://../a2a/task.ts}.
 
   async beginTask(input: {
     messageId: string;
@@ -904,7 +907,7 @@ export class ReactiveAgent extends Agent<Env> {
    * therefore converge on the same method.
    */
   async saveTask(task: Task): Promise<boolean> {
-    if (task.status.state === "canceled") {
+    if (stateOf(task) === TaskState.TASK_STATE_CANCELED) {
       await this.markCanceled(task.id, task);
       return true;
     }

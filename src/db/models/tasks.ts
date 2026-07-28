@@ -1,6 +1,6 @@
-import type { Task } from "@a2a-js/sdk";
-import { eq, lt } from "drizzle-orm";
+import { Task, TaskState, taskStateToJSON } from "@a2a-js/sdk";
 import type { PlainTask } from "@/a2a/task";
+import { eq, lt } from "drizzle-orm";
 import { buildSubmittedTask } from "@/a2a/notify";
 import { notifyTasks } from "@/db/schema";
 import type { DB } from "@/db/db";
@@ -10,14 +10,36 @@ function nowIso(): string {
 }
 
 /**
+ * A Task's state, tolerating the `status`-less Task the SDK's generated type
+ * permits (`TaskStatus | undefined`). Nothing we build omits it, so an
+ * unspecified state means the row came from somewhere unexpected — and it
+ * compares equal to none of the states the callers switch on.
+ */
+export function stateOf(task: Task): TaskState {
+  return task.status?.state ?? TaskState.TASK_STATE_UNSPECIFIED;
+}
+
+/**
  * Query methods for the `notify_tasks` table (async A2A task state).
  *
  * Bound to a drizzle handle by {@link AgentDB} and reached as `db.tasks.*`.
  * Migrations are owned by `AgentDB`, not this factory — it only issues queries.
+ *
+ * Rows hold the Task in its **A2A wire form** (`Task.toJSON`), not the in-memory
+ * protobuf shape the SDK hands us. Those differ under v1.0 — enums are numbers
+ * in memory but `SCREAMING_SNAKE` strings on the wire, and `Part.content` is a
+ * `{ $case, value }` wrapper in memory but a bare named key on the wire — so a
+ * plain `JSON.stringify` would persist a shape that is neither valid A2A JSON
+ * nor stable across SDK versions. Encoding on write and decoding on read keeps
+ * the stored bytes the spec's own format.
  */
 export function makeTasks(db: DB) {
+  // Every row was written by the builders in `@/a2a/notify`, which produce
+  // exactly the narrowed {@link PlainTask} shape, so the decode lands back on it.
   const parse = (row: { taskJson: string }): PlainTask =>
-    JSON.parse(row.taskJson) as PlainTask;
+    Task.fromJSON(JSON.parse(row.taskJson)) as PlainTask;
+
+  const serialize = (task: Task): string => JSON.stringify(Task.toJSON(task));
 
   const readOne = (taskId: string): PlainTask | null => {
     const row = db
@@ -29,20 +51,23 @@ export function makeTasks(db: DB) {
   };
 
   const upsert = (task: Task): void => {
+    // Denormalized for observability only — nothing filters on it — so it holds
+    // the readable canonical name rather than the enum's ordinal.
+    const state = taskStateToJSON(stateOf(task));
     db.insert(notifyTasks)
       .values({
         taskId: task.id,
         messageId: null,
-        state: task.status.state,
-        taskJson: JSON.stringify(task),
+        state,
+        taskJson: serialize(task),
         createdAt: Date.now(),
         updatedAt: Date.now()
       })
       .onConflictDoUpdate({
         target: notifyTasks.taskId,
         set: {
-          state: task.status.state,
-          taskJson: JSON.stringify(task),
+          state,
+          taskJson: serialize(task),
           updatedAt: Date.now()
         }
       })
@@ -72,8 +97,8 @@ export function makeTasks(db: DB) {
         .values({
           taskId: task.id,
           messageId: input.messageId,
-          state: task.status.state,
-          taskJson: JSON.stringify(task),
+          state: taskStateToJSON(stateOf(task)),
+          taskJson: serialize(task),
           createdAt: Date.now(),
           updatedAt: Date.now()
         })
@@ -81,7 +106,7 @@ export function makeTasks(db: DB) {
       return task;
     },
 
-    /** Load a task by id (for `tasks/get` via the Worker's `DurableTaskStore`). */
+    /** Load a task by id (for `GetTask` via the Worker's `DurableTaskStore`). */
     get(taskId: string): PlainTask | null {
       return readOne(taskId);
     },
@@ -93,7 +118,7 @@ export function makeTasks(db: DB) {
      * Guarded exactly like {@link markWorking}, and for the same reason: a
      * `canceled` row is terminal, so nothing may write a non-canceled state over
      * it. That closes the window between the workflow's terminal build and its
-     * callback — the read-check-write is synchronous here, so a `tasks/cancel`
+     * callback — the read-check-write is synchronous here, so a `CancelTask`
      * landing mid-delivery makes this return `false` and the notify never fires.
      * Writing `canceled` onto a live row stays allowed: that is how the a2a-js
      * handler's own cancel branch records the cancellation.
@@ -101,8 +126,9 @@ export function makeTasks(db: DB) {
     save(task: Task): boolean {
       const existing = readOne(task.id);
       if (
-        existing?.status.state === "canceled" &&
-        task.status.state !== "canceled"
+        existing !== null &&
+        stateOf(existing) === TaskState.TASK_STATE_CANCELED &&
+        stateOf(task) !== TaskState.TASK_STATE_CANCELED
       ) {
         return false;
       }
@@ -117,8 +143,13 @@ export function makeTasks(db: DB) {
      */
     markWorking(taskId: string): void {
       const task = readOne(taskId);
-      if (!task || task.status.state !== "submitted") return;
-      task.status = { ...task.status, state: "working", timestamp: nowIso() };
+      if (!task || stateOf(task) !== TaskState.TASK_STATE_SUBMITTED) return;
+      task.status = {
+        ...task.status,
+        state: TaskState.TASK_STATE_WORKING,
+        message: task.status?.message,
+        timestamp: nowIso()
+      };
       upsert(task);
     },
 
@@ -130,7 +161,12 @@ export function makeTasks(db: DB) {
     cancel(taskId: string): PlainTask | null {
       const task = readOne(taskId);
       if (!task) return null;
-      task.status = { ...task.status, state: "canceled", timestamp: nowIso() };
+      task.status = {
+        ...task.status,
+        state: TaskState.TASK_STATE_CANCELED,
+        message: task.status?.message,
+        timestamp: nowIso()
+      };
       upsert(task);
       return task;
     },

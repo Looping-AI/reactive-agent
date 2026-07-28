@@ -17,22 +17,22 @@ sequenceDiagram
     Gateway->>Gateway: verify card JWS + PIN kid/jku (TOFU)
 
     Note over Admin,Agent: Each call — "B knows A is really A", then async accept + notify
-    Gateway->>Agent: POST /a2a message/send (Bearer gateway JWT, pushNotificationConfig{url,token})
+    Gateway->>Agent: POST /a2a SendMessage (Bearer gateway JWT, taskPushNotificationConfig{url,token})
     Agent->>Gateway: GET /.well-known/jwks.json (gateway public JWKS)
     Gateway-->>Agent: gateway public JWKS
     Agent->>Agent: verify JWT (sig + iss + aud + exp)
     Agent->>Agent: record submitted Task (DO) + start HandleTaskWorkflow
     Agent-->>Gateway: submitted Task (the accept — returns immediately)
     Note over Agent: workflow: round loop — answer, or delegate subtasks and decide again (out of band)
-    Agent->>Gateway: POST pushNotificationConfig.url (/a2a/notifications)<br/>x-a2a-notification-token + Bearer(card-key JWT), body = completed Task
+    Agent->>Gateway: POST taskPushNotificationConfig.url (/a2a/notifications)<br/>x-a2a-notification-token + Bearer(card-key JWT), body = StreamResponse{task}
     Gateway->>Gateway: verify token row + callback JWT (pinned card key), post reply to Slack
 ```
 
 This agent therefore does three things:
 
 1. **Serves a signed AgentCard** at `/.well-known/agent-card.json`. The card is
-   signed with a detached-payload EdDSA flattened JWS over its **canonical JSON**
-   (see [`src/a2a/canonical.ts`](src/a2a/canonical.ts)). The gateway verifies this and
+   signed with a detached-payload EdDSA flattened JWS over its **JCS-canonical
+   JSON** (the SDK's `generateAgentCardSignature`). The gateway verifies this and
    pins the signing key's `kid` + `jku` on first registration (Trust-On-First-Use).
 2. **Publishes its card-signing public JWKS** at `/.well-known/jwks.json` (the
    card's `jku`), so the gateway can resolve the signing key.
@@ -379,7 +379,7 @@ Retry safety rests on two mechanisms:
   Task completes. **Degrade rather than discard**: failing a Task whose branch work
   is already durable would throw away results the user asked for. Transient faults
   still throw for the step to retry.
-- **Cancellation is a phase return, not a probe.** `tasks/cancel` converges on the
+- **Cancellation is a phase return, not a probe.** `CancelTask` converges on the
   DO's `markCanceled` from both entry points (the executor, and — the path that
   actually runs — the a2a-js handler's own cancel branch through `saveTask`).
   Every phase RPC then reports the verdict itself: `markWorking` returns
@@ -412,8 +412,8 @@ Retry safety rests on two mechanisms:
 ## Async task delivery (accept + notify)
 
 The gateway dispatches remote agents **asynchronously** (A2A push notifications,
-spec §13.2): it never blocks on generation. A `message/send` carries a
-`configuration.pushNotificationConfig` (`{ url, token }` — the gateway's
+spec §13.2): it never blocks on generation. A `SendMessage` carries a
+`configuration.taskPushNotificationConfig` (`{ url, token }` — the gateway's
 `/a2a/notifications` webhook + a per-task validation token), the agent must
 **accept immediately** with a `submitted`/`working` Task, and the reply is
 delivered later by POSTing the terminal Task back to that webhook. A synchronous
@@ -421,15 +421,15 @@ delivered later by POSTing the terminal Task back to that webhook. A synchronous
 
 This agent implements that contract in three moving parts:
 
-- **Accept (Worker).** [`src/index.ts`](src/index.ts) rejects a `message/send`
-  without a `pushNotificationConfig` (JSON-RPC `-32602` — this agent is
+- **Accept (Worker).** [`src/index.ts`](src/index.ts) rejects a `SendMessage`
+  without a `taskPushNotificationConfig` (JSON-RPC `-32602` — this agent is
   async-only), then the [`A2AExecutor`](src/a2a/executor.ts) records a `submitted`
   Task via the DO (`beginTask`, idempotent on the gateway's `messageId`), starts a
   [`HandleTaskWorkflow`](src/workflows/handle-task.ts) whose instance id is derived
   from that `messageId`, and publishes the Task as the accept — all in well under
   the gateway's 30s accept timeout. Task state persists in the DO
   ([`src/a2a/task-store.ts`](src/a2a/task-store.ts) backs the a2a-js `TaskStore`),
-  so `tasks/get` works across the accept→callback gap. Rows are retained for 30 days;
+  so `GetTask` works across the accept→callback gap. Rows are retained for 30 days;
   `ReactiveAgent.cleanupOldTasks` runs as a weekly cron (Sunday 01:00 UTC) via the
   Agents SDK `this.schedule` API, registered idempotently in `onStart`.
 - **Generate + deliver (Workflow).**
@@ -471,7 +471,7 @@ namespaces (`db.tasks`, `db.subtasks`). Two tables:
 
 | Table          | Role                                                                                         |
 | -------------- | -------------------------------------------------------------------------------------------- |
-| `notify_tasks` | A2A Task state across the accept→callback gap; answers `tasks/get`.                          |
+| `notify_tasks` | A2A Task state across the accept→callback gap; answers `GetTask`.                            |
 | `subtasks`     | One row per Subtask, tagged with the `round` that delegated it — the loop's source of truth. |
 
 `subtasks` uses an SQLite `AUTOINCREMENT` integer primary key, so a `SubtaskId` is
@@ -498,17 +498,25 @@ the generated SQL is bundled inline in
 Subtasks are cleaned up together after 30 days (both keyed on their own
 `created_at`, written in the same Task lifecycle).
 
-## Canonical JSON (must match the gateway)
+## Card canonicalization (owned by the SDK)
 
-The card signature is computed over a deterministic serialization:
+The card signature is computed over a **JCS (RFC 8785)** canonicalization of the
+card with its `signatures` field excluded, then signed as a detached-payload
+EdDSA flattened JWS.
 
-- object keys sorted recursively (ascending),
-- `JSON.stringify` with no insignificant whitespace,
-- the `signatures` field excluded,
-- payload bytes = UTF-8, base64url (no padding) for the JWS.
+Since A2A v1.0 this is the SDK's own contract, not ours:
+[`src/a2a/card.ts`](src/a2a/card.ts) calls `generateAgentCardSignature` (which
+canonicalizes via `canonicalizeAgentCard`), and the gateway verifies with the
+matching `verifyAgentCardSignature`. Both sides run the same library code, so the
+hand-rolled canonicalizer this project used to keep byte-for-byte in sync with
+the gateway is gone.
 
-[`src/a2a/canonical.ts`](src/a2a/canonical.ts) is a byte-for-byte copy of the gateway's
-[`src/a2a/card-verify.ts`](https://github.com/Looping-AI/looping-gateway/blob/main/src/a2a/card-verify.ts) canonicalizer. **If you change one, change both.**
+One ordering rule survives and is load-bearing: **the card is converted with
+`AgentCard.toJSON` before it is signed.** The verifier normalizes whatever it
+receives through `AgentCard.toJSON(AgentCard.fromJSON(card))` before
+canonicalizing, so signing the in-memory (protobuf-shaped) card covers different
+bytes than the verifier checks and fails every time. `test/a2a/card.spec.ts` pins
+this end-to-end against the SDK verifier.
 
 ## Environment
 
@@ -587,7 +595,7 @@ traffic. They are characteristics, not known bugs; none is a correctness hole.
    model call, and caches nothing) but cannot prove the delivery itself. If the
    RPC does not land, the abort silently never fires and cancellation degrades to
    the pre-existing chunk-boundary polling: slower, never incorrect. Watch the
-   first live `tasks/cancel` of an ARC game — model calls should stop within
+   first live `CancelTask` of an ARC game — model calls should stop within
    seconds, not at the next ~4-minute boundary.
 5. **`@cloudflare/shell` is experimental.** The workspace is backed by shell's
    `Workspace` ("API surface still settling"). The blast radius is contained to the
@@ -603,7 +611,6 @@ traffic. They are characteristics, not known bugs; none is a correctness hole.
 | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`src/index.ts`](src/index.ts)                                               | Worker entry: card / JWKS; verifies JWT, then runs the A2A JSON-RPC server dispatching into the caller's DO.                                                                                                        |
 | [`src/a2a/card.ts`](src/a2a/card.ts)                                         | Build + sign the AgentCard; derive public JWKS; parse signing key.                                                                                                                                                  |
-| [`src/a2a/canonical.ts`](src/a2a/canonical.ts)                               | Canonical JSON contract (mirrors the gateway).                                                                                                                                                                      |
 | [`src/a2a/verify.ts`](src/a2a/verify.ts)                                     | Verify the gateway identity JWT.                                                                                                                                                                                    |
 | [`src/reactive-agent/index.ts`](src/reactive-agent/index.ts)                 | `ReactiveAgent` DO — owns the caller's Session, the round-loop RPCs (`runTaskTurn`/`executeSubtaskChunk`/`skipBlockedSubtasks`, …), and durable async task state (`beginTask`, …).                                  |
 | [`src/a2a/task.ts`](src/a2a/task.ts)                                         | `PlainTask` — SDK `Task` minus `unknown` extension `metadata`, so DO-RPC `Task` returns don't collapse to `never`.                                                                                                  |

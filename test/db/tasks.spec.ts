@@ -8,6 +8,8 @@
 import { describe, it, expect } from "vitest";
 import { runInDurableObject } from "cloudflare:test";
 import { AgentDB } from "@/db/db";
+import { TaskState } from "@a2a-js/sdk";
+import { testAgentMessage, testStatus } from "../fixtures";
 import { freshStub, doStorage, withTasks } from "../helpers/do";
 
 // ---------------------------------------------------------------------------
@@ -20,10 +22,9 @@ describe("tasks.begin", () => {
       tasks.begin({ messageId: "msg-1", taskId: "t-1", contextId: "ctx-1" })
     );
 
-    expect(task.kind).toBe("task");
     expect(task.id).toBe("t-1");
     expect(task.contextId).toBe("ctx-1");
-    expect(task.status.state).toBe("submitted");
+    expect(task.status.state).toBe(TaskState.TASK_STATE_SUBMITTED);
   });
 
   it("is idempotent on messageId — a dispatch retry returns the original task", async () => {
@@ -66,7 +67,7 @@ describe("tasks.get", () => {
     });
 
     expect(task?.id).toBe("t-2");
-    expect(task?.status.state).toBe("submitted");
+    expect(task?.status.state).toBe(TaskState.TASK_STATE_SUBMITTED);
   });
 });
 
@@ -84,12 +85,12 @@ describe("tasks.save", () => {
       });
       tasks.save({
         ...task,
-        status: { ...task.status, state: "working" }
+        status: testStatus(TaskState.TASK_STATE_WORKING)
       });
       return tasks.get("t-3");
     });
 
-    expect(result?.status.state).toBe("working");
+    expect(result?.status.state).toBe(TaskState.TASK_STATE_WORKING);
   });
 });
 
@@ -105,7 +106,7 @@ describe("tasks.markWorking", () => {
       return tasks.get("t-4");
     });
 
-    expect(result?.status.state).toBe("working");
+    expect(result?.status.state).toBe(TaskState.TASK_STATE_WORKING);
   });
 
   it("is a no-op for an unknown task", async () => {
@@ -127,7 +128,7 @@ describe("tasks.markWorking", () => {
       return tasks.get("t-4b");
     });
 
-    expect(result?.status.state).toBe("canceled");
+    expect(result?.status.state).toBe(TaskState.TASK_STATE_CANCELED);
   });
 });
 
@@ -145,24 +146,18 @@ describe("tasks.save", () => {
       });
       tasks.save({
         ...task,
-        status: {
-          state: "completed",
-          timestamp: new Date().toISOString(),
-          message: {
-            kind: "message",
-            role: "agent",
-            messageId: "reply-5",
-            parts: [{ kind: "text", text: "all done" }],
-            contextId: "ctx-5"
-          }
-        }
+        status: testStatus(
+          TaskState.TASK_STATE_COMPLETED,
+          testAgentMessage("reply-5", "all done", "ctx-5")
+        )
       });
       return tasks.get("t-5");
     });
 
-    expect(result?.status.state).toBe("completed");
-    expect(result?.status.message?.parts?.[0]).toMatchObject({
-      text: "all done"
+    expect(result?.status.state).toBe(TaskState.TASK_STATE_COMPLETED);
+    expect(result?.status.message?.parts?.[0]?.content).toEqual({
+      $case: "text",
+      value: "all done"
     });
   });
 
@@ -180,13 +175,13 @@ describe("tasks.save", () => {
       tasks.cancel("t-5b");
       const applied = tasks.save({
         ...task,
-        status: { state: "completed", timestamp: new Date().toISOString() }
+        status: testStatus(TaskState.TASK_STATE_COMPLETED)
       });
       return { applied, stored: tasks.get("t-5b") };
     });
 
     expect(result.applied).toBe(false);
-    expect(result.stored?.status.state).toBe("canceled");
+    expect(result.stored?.status.state).toBe(TaskState.TASK_STATE_CANCELED);
   });
 
   // The a2a-js handler records a cancellation through the TaskStore (its own
@@ -201,13 +196,13 @@ describe("tasks.save", () => {
       tasks.markWorking("t-5c");
       const applied = tasks.save({
         ...task,
-        status: { state: "canceled", timestamp: new Date().toISOString() }
+        status: testStatus(TaskState.TASK_STATE_CANCELED)
       });
       return { applied, stored: tasks.get("t-5c") };
     });
 
     expect(result.applied).toBe(true);
-    expect(result.stored?.status.state).toBe("canceled");
+    expect(result.stored?.status.state).toBe(TaskState.TASK_STATE_CANCELED);
   });
 });
 
@@ -222,7 +217,7 @@ describe("tasks.cancel", () => {
       return tasks.cancel("t-6");
     });
 
-    expect(result?.status.state).toBe("canceled");
+    expect(result?.status.state).toBe(TaskState.TASK_STATE_CANCELED);
   });
 
   it("returns null for an unknown task", async () => {
@@ -240,7 +235,7 @@ describe("tasks.cancel", () => {
       return tasks.get("t-7");
     });
 
-    expect(result?.status.state).toBe("canceled");
+    expect(result?.status.state).toBe(TaskState.TASK_STATE_CANCELED);
   });
 });
 

@@ -1,7 +1,7 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import worker from "@/index";
-import type { Task } from "@a2a-js/sdk";
+import { TaskState, type Task } from "@a2a-js/sdk";
 import type { ReactiveAgent } from "@/reactive-agent";
 import { buildSubmittedTask } from "@/a2a/notify";
 import type { GatewayIdentity } from "@/a2a/verify";
@@ -17,8 +17,8 @@ const PUSH_TOKEN = "push-token-abc";
 
 // Stub env for tests that only need config vars (auth/card/jwks paths) and
 // do not exercise ReactiveAgent routing — ReactiveAgent is left undefined.
-// Tests that go through message/send (which enqueues a Workflow and calls
-// getAgent) or tasks/cancel (which spies on env.ReactiveAgent.get) pass
+// Tests that go through SendMessage (which enqueues a Workflow and calls
+// getAgent) or CancelTask (which spies on env.ReactiveAgent.get) pass
 // the real miniflare `env` instead so the DO binding is live.
 const TEST_ENV: Env = {
   A2A_SIGNING_KEY: JSON.stringify(TEST_AGENT_PRIVATE_JWK),
@@ -44,7 +44,7 @@ async function req(
   );
 }
 
-/** A `message/send` JSON-RPC body carrying `text` (with or without a push config). */
+/** A `SendMessage` JSON-RPC body carrying `text` (with or without a push config). */
 function sendBody(
   text: string,
   opts: {
@@ -53,7 +53,7 @@ function sendBody(
     pushConfig?: { url?: string; token?: string };
   } = {}
 ) {
-  const { push = true, method = "message/send", pushConfig } = opts;
+  const { push = true, method = "SendMessage", pushConfig } = opts;
   const resolvedPushConfig = pushConfig ?? { url: PUSH_URL, token: PUSH_TOKEN };
   return {
     jsonrpc: "2.0",
@@ -62,15 +62,14 @@ function sendBody(
     params: {
       message: {
         messageId: "msg-test-1",
-        role: "user",
-        kind: "message",
-        parts: [{ kind: "text", text }],
+        role: "ROLE_USER",
+        parts: [{ text, mediaType: "text/plain" }],
         contextId: "ctx-1"
       },
       ...(push
         ? {
             configuration: {
-              pushNotificationConfig: resolvedPushConfig
+              taskPushNotificationConfig: resolvedPushConfig
             }
           }
         : {})
@@ -78,12 +77,12 @@ function sendBody(
   };
 }
 
-/** A `tasks/cancel` JSON-RPC body for `taskId`. */
+/** A `CancelTask` JSON-RPC body for `taskId`. */
 function cancelBody(taskId: string) {
   return {
     jsonrpc: "2.0",
     id: "1",
-    method: "tasks/cancel",
+    method: "CancelTask",
     params: { id: taskId }
   };
 }
@@ -102,7 +101,10 @@ async function postRpc(
       body: JSON.stringify(body),
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${token}`
+        authorization: `Bearer ${token}`,
+        // v1.0 negotiates the protocol version per request; without this the SDK
+        // assumes v0.3, which this agent's card no longer advertises.
+        "A2A-Version": "1.0"
       }
     },
     workerEnv
@@ -194,7 +196,7 @@ describe("POST /a2a", () => {
     expect(res.status).toBe(400);
   });
 
-  it("accepts a message/send with a pushNotificationConfig: records a submitted Task and starts the handle workflow", async () => {
+  it("accepts a SendMessage with a taskPushNotificationConfig: records a submitted Task and starts the handle workflow", async () => {
     const identity = {
       key: "custom:1:ada",
       name: "Ada",
@@ -203,19 +205,24 @@ describe("POST /a2a", () => {
     };
     // Executor uses global env for routing; miniflare DO handles beginTask and
     // HANDLE_TASK_WORKFLOW.create. We assert on the observable HTTP contract only.
+    vi.spyOn(env.HANDLE_TASK_WORKFLOW, "create").mockResolvedValue(
+      undefined as never
+    );
     const res = await postRpc(sendBody("Hello from test!"), identity);
 
     expect(res.status).toBe(200);
     const body = await res.json<{
-      result: { kind: string; id: string; status: { state: string } };
+      result: { task?: { id: string; status: { state: string } } };
     }>();
-    // The accept ack is a *submitted Task*, not a Message.
-    expect(body.result.kind).toBe("task");
-    expect(body.result.status.state).toBe("submitted");
-    expect(body.result.id.length).toBeGreaterThan(0);
+    // The accept ack is a *submitted Task*, not a Message. v1.0 dropped the
+    // `kind` discriminator; `SendMessage` now returns a `SendMessageResponse`
+    // whose payload key names which of the two it is.
+    expect(body.result.task).toBeDefined();
+    expect(body.result.task!.status.state).toBe("TASK_STATE_SUBMITTED");
+    expect(body.result.task!.id.length).toBeGreaterThan(0);
   });
 
-  it("rejects a message/send without a pushNotificationConfig (async-only)", async () => {
+  it("rejects a SendMessage without a taskPushNotificationConfig (async-only)", async () => {
     const res = await postRpc(
       sendBody("hi", { push: false }),
       { key: "custom:1:ada" },
@@ -226,7 +233,7 @@ describe("POST /a2a", () => {
     expect(body.error?.code).toBe(-32602);
   });
 
-  it("rejects a message/send with a pushNotificationConfig missing the token", async () => {
+  it("rejects a SendMessage with a taskPushNotificationConfig missing the token", async () => {
     const res = await postRpc(
       sendBody("hi", { pushConfig: { url: PUSH_URL } }),
       { key: "custom:1:ada" },
@@ -240,7 +247,7 @@ describe("POST /a2a", () => {
     expect(body.error?.message).toMatch(/token/);
   });
 
-  it("rejects a message/send with a malformed pushNotificationConfig url", async () => {
+  it("rejects a SendMessage with a malformed taskPushNotificationConfig url", async () => {
     const res = await postRpc(
       sendBody("hi", { pushConfig: { url: "not-a-url", token: PUSH_TOKEN } }),
       { key: "custom:1:ada" },
@@ -256,9 +263,9 @@ describe("POST /a2a", () => {
 
   it("rejects a streaming method with an unsupported-operation JSON-RPC error", async () => {
     // The card advertises `streaming: false`, so the a2a-js handler rejects
-    // `message/stream` up front with a JSON-RPC error (HTTP 200, code -32004).
+    // `SendStreamingMessage` up front with a JSON-RPC error (HTTP 200, code -32004).
     const res = await postRpc(
-      sendBody("hi", { method: "message/stream" }),
+      sendBody("hi", { method: "SendStreamingMessage" }),
       { key: "custom:1:ada" },
       TEST_ENV
     );
@@ -267,7 +274,7 @@ describe("POST /a2a", () => {
     expect(body.error?.code).toBe(-32004);
   });
 
-  it("tasks/cancel — publishes a canceled Task for a known taskId", async () => {
+  it("CancelTask — publishes a canceled Task for a known taskId", async () => {
     const taskId = "task-cancel-test-1";
     const contextId = "ctx-cancel-1";
     const tasks = new Map<string, Task>([
@@ -292,7 +299,8 @@ describe("POST /a2a", () => {
           ...task,
           status: {
             ...task.status,
-            state: "canceled" as const,
+            state: TaskState.TASK_STATE_CANCELED,
+            message: task.status?.message,
             timestamp: new Date().toISOString()
           }
         };
@@ -305,16 +313,15 @@ describe("POST /a2a", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json<{
-      result: { kind: string; id: string; status: { state: string } };
+      result: { id: string; status: { state: string } };
     }>();
     expect(body.result).toBeDefined();
-    expect(body.result.kind).toBe("task");
     expect(body.result.id).toBe(taskId);
-    // Cancel must flip the state to "canceled" — the notify workflow skips canceled tasks.
-    expect(body.result.status.state).toBe("canceled");
+    // Cancel must flip the state to canceled — the notify workflow skips canceled tasks.
+    expect(body.result.status.state).toBe("TASK_STATE_CANCELED");
   });
 
-  it("tasks/cancel — returns taskNotFound error for an unknown taskId", async () => {
+  it("CancelTask — returns taskNotFound error for an unknown taskId", async () => {
     const res = await postRpc(cancelBody("no-such-task"), {
       key: "custom:1:ada"
     });

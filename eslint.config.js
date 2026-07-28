@@ -1,6 +1,11 @@
 import tseslint from "typescript-eslint";
+import { noDeprecatedObjectProperties } from "./eslint-rules/no-deprecated-object-properties.js";
 
 const LINTED_FILES = ["src/**/*.ts", "test/**/*.ts"];
+
+const localPlugin = {
+  rules: { "no-deprecated-object-properties": noDeprecatedObjectProperties }
+};
 
 export default tseslint.config(
   {
@@ -30,7 +35,7 @@ export default tseslint.config(
     // Type-aware pass — enables @deprecated detection without switching the
     // whole config to recommendedTypeChecked and its stricter rule set.
     files: LINTED_FILES,
-    plugins: { "@typescript-eslint": tseslint.plugin },
+    plugins: { "@typescript-eslint": tseslint.plugin, local: localPlugin },
     languageOptions: {
       parser: tseslint.parser,
       parserOptions: {
@@ -39,7 +44,10 @@ export default tseslint.config(
       }
     },
     rules: {
-      "@typescript-eslint/no-deprecated": "error"
+      "@typescript-eslint/no-deprecated": "error",
+      // Covers the object-literal keys `no-deprecated` structurally cannot see —
+      // i.e. every `generateText({ system: … })`-style options bag. See the rule.
+      "local/no-deprecated-object-properties": "error"
     }
   },
   {
