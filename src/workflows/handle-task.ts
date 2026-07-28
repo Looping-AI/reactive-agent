@@ -12,12 +12,9 @@ import {
 import { getAgent, type TurnPushContext } from "@/reactive-agent";
 import { selectWave } from "@/agent/subtasks/scheduler";
 import type { SubtaskId } from "@/agent/subtasks/types";
-import {
-  MAX_SUBTASKS,
-  MAX_CHUNKS_PER_BRANCH,
-  MAX_CHUNKS_PER_TASK,
-  MAX_TURN_ROUNDS
-} from "@/config";
+import { MAIN_AGENT_LIMITS, MAX_SUBTASKS } from "@/config";
+import { MAX_CHUNKS_PER_BRANCH } from "@/platform";
+import type { RoundMode } from "@/agent/turn";
 
 /**
  * The async task controller. The gateway no longer waits for a synchronous reply:
@@ -37,9 +34,10 @@ import {
  *    again — answer, or delegate once more.
  * 3. **Deliver** — persist the terminal Task, then POST a signed callback.
  *
- * The main agent is never forced either way. The last round of the budget is
- * offered no control tools at all, so it has to answer; every earlier round
- * chooses. That is the whole reason this file is a loop.
+ * The main agent is never forced either way. A round that has run out of budget —
+ * `MAIN_AGENT_LIMITS`, in turns or in wall clock — is handed no tools but the
+ * answer, so it has to give one; every other round chooses. That is the whole
+ * reason this file is a loop, and the whole termination argument.
  *
  * Why a Workflow (not a DO alarm / `waitUntil`): `step.do(...)` gives durable,
  * independently-retried steps that survive isolate eviction, and a future
@@ -102,8 +100,9 @@ export class HandleTaskWorkflow extends WorkflowEntrypoint<
  * truth").
  *
  * **Step names are durable cache keys.** Everything inside the round loop carries
- * its round for that reason: `turn:<round>`, `scan:<round>:<wave>`,
- * `cancel:<round>:<wave>`. Renaming one silently re-runs its effect on replay.
+ * its round for that reason: `turn:<round>`, `deadline:<round>`,
+ * `scan:<round>:<wave>`, `cancel:<round>:<wave>`. Renaming one silently re-runs
+ * its effect on replay.
  */
 export async function runHandleTask(
   p: HandleTaskParams,
@@ -125,42 +124,89 @@ export async function runHandleTask(
   );
   if (!started) return;
 
-  // Durable chunk steps spent so far, across every round. Summed from cached step
-  // returns, so a replay reconstructs the identical number and the `allowControl`
-  // input below stays deterministic.
-  let chunksUsed = 0;
+  // Main-agent turns spent so far, across every round. Summed from cached step
+  // returns, so a replay reconstructs the identical number and the `mode` input
+  // below stays deterministic.
+  let turnsUsed = 0;
 
-  for (let round = 0; round < MAX_TURN_ROUNDS; round++) {
+  // The Task's own start, in a step so replays read the original instant rather
+  // than restarting the clock — otherwise a Workflow that retried its way through
+  // the night would never observe the deadline it had long since passed.
+  //
+  // When escalation lands, this is the line that needs care: a Task suspended on
+  // `step.waitForEvent(...)` must **rebase** it on resume, or a human's thinking
+  // time is charged to the agent and a Task that asked a question is dead before
+  // the answer arrives. `turnsUsed` needs no such handling — waiting costs none.
+  const startedAtMs = await step.do("started", async () => Date.now());
+
+  // At most one round per turn of the budget, **plus one**: an `open` round always
+  // spends at least one turn, so `maxTurns` of them exhaust the budget — and the
+  // forced-answer round that follows needs an iteration of its own to happen in.
+  // Off by one here and a Task of cheap rounds would fall out of the loop with no
+  // reply instead of being made to give one.
+  for (let round = 0; round <= MAIN_AGENT_LIMITS.maxTurns; round++) {
+    // The clock is read *inside a step* so its answer is cached with the round:
+    // `mode` is a step input, and a replay that re-read `Date.now()` would
+    // reconstruct a different one. Time is the budget a Task can spend without
+    // spending the other — a round waiting on slow subtasks moves it while
+    // `turnsUsed` does not.
+    const overdue = await step.do(
+      `deadline:${round}`,
+      async () => Date.now() - startedAtMs >= MAIN_AGENT_LIMITS.maxWallMs
+    );
+
+    // Out of turns or out of time ⇒ this round gets no tools at all and must
+    // answer. Not a failure mode: it is how a ceiling returns the work instead of
+    // dropping it.
+    const mode: RoundMode =
+      turnsUsed >= MAIN_AGENT_LIMITS.maxTurns || overdue ? "final" : "open";
+    if (mode === "final") {
+      // Worth its own line: from the outside, a round the budget ended is
+      // indistinguishable from a model that simply chose to answer.
+      console.warn("[handle-task] task budget spent, forcing an answer", {
+        taskId: p.taskId,
+        round,
+        turnsUsed,
+        overdue
+      });
+    }
+
     // The main agent decides. `runTaskTurn` persists whatever the round produced
     // — a final reply, or the Subtask rows plus the acknowledgment it already
-    // pushed — so this step returns only the verdict. A typed `failed` is a real
-    // outcome (both models produced unusable output, with no durable work to fall
-    // back on) and routes to failed delivery; a transient fault throws and the
-    // step retries, recovering from the durable rows with no second inference.
-    //
-    // A round may delegate only while there is budget left for another round *and*
-    // for the execution it would start. Denying it is not a failure mode: the
-    // round is simply handed no control tools and answers from what it has.
-    const allowControl =
-      round < MAX_TURN_ROUNDS - 1 && chunksUsed < MAX_CHUNKS_PER_TASK;
-
+    // pushed — so this step returns only the verdict plus what it cost. A typed
+    // `failed` is a real outcome (both models produced unusable output, with no
+    // durable work to fall back on) and routes to failed delivery; a transient
+    // fault throws and the step retries, recovering from the durable rows with no
+    // second inference.
     const turn = await step.do(`turn:${round}`, async () => {
       // Projected to a plain object: an RPC return carries a `Disposable` brand a
-      // step result cannot serialize.
+      // step result cannot serialize. Every branch must carry `turns` — a field
+      // this projection drops is a field the budget never sees.
       const result = await stub.runTaskTurn({
         taskId: p.taskId,
         text: p.text,
         identity: p.identity,
         round,
-        allowControl,
+        mode,
+        turnsRemaining: MAIN_AGENT_LIMITS.maxTurns - turnsUsed,
         push
       });
       if (result.status === "replied")
-        return { status: result.status, reply: result.reply };
+        return {
+          status: result.status,
+          reply: result.reply,
+          turns: result.turns
+        };
       if (result.status === "failed")
-        return { status: result.status, error: result.error };
-      return { status: result.status };
+        return {
+          status: result.status,
+          error: result.error,
+          turns: result.turns
+        };
+      return { status: result.status, turns: result.turns };
     });
+
+    turnsUsed += turn.turns;
 
     if (turn.status === "canceled") return;
     if (turn.status === "failed") {
@@ -179,17 +225,16 @@ export async function runHandleTask(
 
     // Delegated: run this round's DAG, then loop and let the model decide again.
     const executed = await executeDag(p, step, stub, round, push);
-    if (executed.outcome === "canceled") return;
-    chunksUsed += executed.chunks;
-    if (executed.outcome === "stuck") {
+    if (executed === "canceled") return;
+    if (executed === "stuck") {
       await deliver(p, step, stub, null);
       return;
     }
   }
 
-  // Unreachable: the last round is offered no control tools, so it either answers
-  // or fails, and both return above. Reaching here means a round delegated when it
-  // was told it could not.
+  // Unreachable: a `final` round is handed only `final_reply`, so it either
+  // answers or fails, and both return above. Reaching here means a round
+  // delegated with no turns left to do it with.
   console.error("[handle-task] round budget exhausted without a reply", {
     taskId: p.taskId
   });
@@ -197,14 +242,14 @@ export async function runHandleTask(
 }
 
 /**
- * How one round's DAG ended, plus the durable chunk steps it spent (which the
- * round loop meters against `MAX_CHUNKS_PER_TASK`). `stuck` is an invariant
- * violation — see {@link selectWave}.
+ * How one round's DAG ended. `stuck` is an invariant violation — see
+ * {@link selectWave}.
+ *
+ * No chunk count: chunks are not a budget any more. What a branch may spend is
+ * bounded by its own Recipe's turns and wall clock, and `MAX_CHUNKS_PER_BRANCH`
+ * is only a platform backstop.
  */
-interface DagResult {
-  outcome: "done" | "canceled" | "stuck";
-  chunks: number;
-}
+type DagOutcome = "done" | "canceled" | "stuck";
 
 /**
  * Drive one round's Subtask DAG to termination, one wave at a time.
@@ -225,8 +270,7 @@ async function executeDag(
   stub: AgentStub,
   round: number,
   push: TurnPushContext
-): Promise<DagResult> {
-  let chunks = 0;
+): Promise<DagOutcome> {
   for (let wave = 0; wave <= MAX_SUBTASKS; wave++) {
     // One durable step per wave: `skipBlockedSubtasks` reports cancellation,
     // propagates skips past any branch that just failed, and returns the
@@ -242,11 +286,11 @@ async function executeDag(
       await step.do(`cancel:${round}:${wave}`, async () => {
         await stub.cancelPendingSubtasks(p.taskId);
       });
-      return { outcome: "canceled", chunks };
+      return "canceled";
     }
 
     const decision = selectWave(scan.nodes);
-    if (decision.kind === "done") return { outcome: "done", chunks };
+    if (decision.kind === "done") return "done";
     if (decision.kind === "stuck") {
       console.error("[handle-task] subtask DAG made no progress", {
         taskId: p.taskId,
@@ -254,23 +298,22 @@ async function executeDag(
         wave,
         active: decision.active
       });
-      return { outcome: "stuck", chunks };
+      return "stuck";
     }
 
     // Every dependency-ready node runs concurrently — the 8-Subtask maximum is
     // the only fan-out bound. `runBranch` never rejects, so a single branch
     // cannot fast-fail `Promise.all` and strand its siblings' durable results.
-    const spent = await Promise.all(
+    await Promise.all(
       decision.ids.map((id) => runBranch(p, step, stub, id, push))
     );
-    for (const n of spent) chunks += n;
   }
 
   console.error("[handle-task] subtask DAG exceeded its wave budget", {
     taskId: p.taskId,
     round
   });
-  return { outcome: "stuck", chunks };
+  return "stuck";
 }
 
 /**
@@ -291,9 +334,14 @@ async function executeDag(
  * round disclose the gap, rather than discarding the durable work its siblings
  * finished.
  *
- * Returns the number of chunk steps it spent, which the round loop meters against
- * the whole-Task budget. Step ids are unique across rounds (SQLite assigns them),
- * so these names need no round prefix.
+ * What bounds a branch is its Recipe's turns and wall clock, both enforced inside
+ * the child, both ending in a report rather than a kill.
+ * {@link MAX_CHUNKS_PER_BRANCH} is a platform backstop held unreachable by design
+ * (see `platform.ts`), so the `failSubtask` below should never fire — if it does,
+ * a Recipe has been given more turns than the cap allows.
+ *
+ * Step ids are unique across rounds (SQLite assigns them), so these names need no
+ * round prefix.
  */
 async function runBranch(
   p: HandleTaskParams,
@@ -301,11 +349,9 @@ async function runBranch(
   stub: AgentStub,
   id: SubtaskId,
   push: TurnPushContext
-): Promise<number> {
-  let spent = 0;
+): Promise<void> {
   try {
     for (let chunk = 0; chunk < MAX_CHUNKS_PER_BRANCH; chunk++) {
-      spent = chunk + 1;
       // Chunk 0 keeps the historic `execute:<id>` step name so single-chunk
       // branches replay byte-identically; later chunks append `:chunk:<n>`.
       const stepName =
@@ -315,9 +361,10 @@ async function runBranch(
         const outcome = await stub.executeSubtaskChunk(id, chunk, push);
         return outcome.done;
       });
-      if (done) return spent;
+      if (done) return;
     }
-    // The run never terminated within its chunk budget — treat as stuck.
+    // Unreachable while every Recipe's `maxTurns` stays under the cap: a chunk
+    // that yields always advanced a turn, so the budget summary comes first.
     console.error("[handle-task] subtask exceeded its chunk budget", {
       taskId: p.taskId,
       subtaskId: id
@@ -328,7 +375,6 @@ async function runBranch(
         `execution exceeded ${MAX_CHUNKS_PER_BRANCH} chunks`
       );
     });
-    return spent;
   } catch (err) {
     console.error("[handle-task] subtask execution exhausted retries", {
       taskId: p.taskId,
@@ -338,7 +384,6 @@ async function runBranch(
     await step.do(`fail:${id}`, async () => {
       await stub.failSubtask(id, `execution exhausted retries: ${String(err)}`);
     });
-    return spent;
   }
 }
 

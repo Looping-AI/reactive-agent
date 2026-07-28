@@ -8,6 +8,7 @@ import type { AgentDB } from "@/db/db";
 import { subagentName } from "@/subagent";
 import { sessionText } from "@/agent/history";
 import { createModelPair, type ModelPair } from "@/agent/model";
+import { MAIN_AGENT_LIMITS } from "@/config";
 import { testAgentMessage, testTask } from "../fixtures";
 import { freshStub } from "../helpers/do";
 
@@ -54,7 +55,8 @@ describe("ReactiveAgent — Session persistence (real SQLite)", () => {
         text: "remember: my favorite color is teal",
         identity: IDENTITY,
         round: 0,
-        allowControl: true
+        mode: "open",
+        turnsRemaining: MAIN_AGENT_LIMITS.maxTurns
       });
     });
 
@@ -82,7 +84,8 @@ describe("ReactiveAgent — Session persistence (real SQLite)", () => {
         text: "hello",
         identity: IDENTITY,
         round: 0,
-        allowControl: true,
+        mode: "open",
+        turnsRemaining: MAIN_AGENT_LIMITS.maxTurns,
         push: {
           taskId: "t-push",
           contextId: "c-push",

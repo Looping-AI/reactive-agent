@@ -6,7 +6,8 @@ import { Task, TaskState } from "@a2a-js/sdk";
 import type { ReactiveAgent } from "@/reactive-agent";
 import { runHandleTask, type HandleTaskParams } from "@/workflows/handle-task";
 import { TASK_FAILED_TEXT } from "@/a2a/notify";
-import { MAX_CHUNKS_PER_BRANCH, MAX_TURN_ROUNDS } from "@/config";
+import { MAIN_AGENT_LIMITS } from "@/config";
+import type { RoundMode } from "@/agent/turn";
 import type {
   SubtaskNode,
   SubtaskScan,
@@ -21,10 +22,10 @@ import {
 /**
  * Workflow-level coverage of the round loop. The DO is faked, but the fake owns
  * a real in-memory DAG — it applies the same skip-to-fixpoint rule the parent
- * does, and it honors `allowControl` the way a real round does (a round handed no
- * control tools cannot delegate) — so wave ordering, skip propagation, fan-out
- * concurrency, and the round budget are actually exercised here rather than
- * scripted. The DO-side behaviour these fakes stand in for is proven for real in
+ * does, it honors `mode` the way a real round does (a `final` round has no
+ * delegate tool), and it charges each round against the turn budget — so wave
+ * ordering, skip propagation, fan-out concurrency, and the budget are actually
+ * exercised here rather than scripted. The DO-side behaviour these fakes stand in for is proven for real in
  * `test/reactive-agent/subtasks-rpc.spec.ts`.
  */
 
@@ -80,10 +81,18 @@ type Outcome = "completed" | "failed" | "throw";
 /**
  * One scripted round: it delegates a DAG (`[id, dependsOn][]`), answers the user,
  * or reports a typed failure. A round scripted to delegate but handed
- * `allowControl: false` answers instead — the real model has no tool to call.
+ * `mode: "final"` answers instead — the real model has no tool to call.
+ *
+ * `costs` is what the round spends against the Task's turn budget; it defaults to
+ * one, the cheapest a real round can be.
  */
-type Round =
-  { dag: [number, number[]][] } | { reply: string } | { fails: string };
+type Round = (
+  | { dag: [number, number[]][] }
+  | { reply: string }
+  | {
+      fails: string;
+    }
+) & { costs?: number };
 
 /** Delegate then answer — the shape a normal task takes. */
 const DEFAULT_ROUNDS: Round[] = [{ dag: [[1, []]] }, { reply: "the answer" }];
@@ -128,7 +137,7 @@ interface AgentFake {
   /** Set once the post-delivery child sweep ran. */
   swept?: boolean;
   /** One entry per round that actually ran an inference, in order. */
-  turns: { round: number; allowControl: boolean; decision: string }[];
+  turns: { round: number; mode: RoundMode; decision: string }[];
 }
 
 const BLOCKED = new Set<SubtaskStatus>(["failed", "skipped", "canceled"]);
@@ -180,50 +189,46 @@ function mockAgent(opts: AgentOptions = {}): AgentFake {
       return true;
     }),
 
-    runTaskTurn: vi.fn(
-      async (input: { round: number; allowControl: boolean }) => {
-        if (canceled()) return { status: "canceled" as const };
-        const script = rounds[input.round] ?? { reply: "the answer" };
+    runTaskTurn: vi.fn(async (input: { round: number; mode: RoundMode }) => {
+      if (canceled()) return { status: "canceled" as const, turns: 0 };
+      const script = rounds[input.round] ?? { reply: "the answer" };
+      const turns = script.costs ?? 1;
 
-        // A round with no control tools cannot delegate, whatever it intended.
-        const delegating = "dag" in script && input.allowControl;
-        const decision =
-          "fails" in script ? "failed" : delegating ? "delegated" : "replied";
-        agent.turns.push({
-          round: input.round,
-          allowControl: input.allowControl,
-          decision
-        });
+      // A `final` round has no delegate tool, whatever it intended.
+      const delegating = "dag" in script && input.mode === "open";
+      const decision =
+        "fails" in script ? "failed" : delegating ? "delegated" : "replied";
+      agent.turns.push({ round: input.round, mode: input.mode, decision });
 
-        if ("fails" in script) {
-          return { status: "failed" as const, error: script.fails };
-        }
-        if (!delegating) {
-          const reply = "reply" in script ? script.reply : "forced answer";
-          const out = { status: "replied" as const, reply };
-          opts.onTurn?.(agent);
-          return out;
-        }
-
-        const base = agent.nodes.length;
-        for (const [i, [id, dependsOn]] of script.dag.entries()) {
-          agent.nodes.push({
-            id,
-            round: input.round,
-            ordinal: base + i,
-            status: "pending",
-            dependsOn
-          });
-        }
-        const out = {
-          status: "delegated" as const,
-          reply: "On it.",
-          subtasks: []
-        };
+      if ("fails" in script) {
+        return { status: "failed" as const, error: script.fails, turns };
+      }
+      if (!delegating) {
+        const reply = "reply" in script ? script.reply : "forced answer";
+        const out = { status: "replied" as const, reply, turns };
         opts.onTurn?.(agent);
         return out;
       }
-    ),
+
+      const base = agent.nodes.length;
+      for (const [i, [id, dependsOn]] of script.dag.entries()) {
+        agent.nodes.push({
+          id,
+          round: input.round,
+          ordinal: base + i,
+          status: "pending",
+          dependsOn
+        });
+      }
+      const out = {
+        status: "delegated" as const,
+        reply: "On it.",
+        subtasks: [],
+        turns
+      };
+      opts.onTurn?.(agent);
+      return out;
+    }),
 
     // Reports cancellation with the wave, then mirrors the parent's fixpoint
     // rule: a node whose prerequisite did not succeed is skipped, and skipping
@@ -369,10 +374,13 @@ describe("HandleTaskWorkflow — the round loop", () => {
     // makes it auditable on replay. Every name inside the loop carries its round.
     expect(names).toEqual([
       "working",
+      "started",
+      "deadline:0",
       "turn:0",
       "scan:0:0",
       "execute:1",
       "scan:0:1",
+      "deadline:1",
       "turn:1",
       "complete",
       "sweep",
@@ -411,10 +419,18 @@ describe("HandleTaskWorkflow — the round loop", () => {
 
     await runHandleTask(params(), step);
 
-    expect(names).toEqual(["working", "turn:0", "complete", "sweep", "notify"]);
+    expect(names).toEqual([
+      "working",
+      "started",
+      "deadline:0",
+      "turn:0",
+      "complete",
+      "sweep",
+      "notify"
+    ]);
     expect(agent.executed).toEqual([]);
     expect(agent.turns).toEqual([
-      { round: 0, allowControl: true, decision: "replied" }
+      { round: 0, mode: "open", decision: "replied" }
     ]);
     expect(bodyOf(captured).status?.message?.parts?.[0]?.content).toEqual({
       $case: "text",
@@ -434,14 +450,18 @@ describe("HandleTaskWorkflow — the round loop", () => {
     expect(agent.executed).toEqual([1, 2]);
     expect(names).toEqual([
       "working",
+      "started",
+      "deadline:0",
       "turn:0",
       "scan:0:0",
       "execute:1",
       "scan:0:1",
+      "deadline:1",
       "turn:1",
       "scan:1:0",
       "execute:2",
       "scan:1:1",
+      "deadline:2",
       "turn:2",
       "complete",
       "sweep",
@@ -511,11 +531,34 @@ describe("HandleTaskWorkflow — the round loop", () => {
   });
 });
 
-describe("HandleTaskWorkflow — round budget", () => {
-  it("hands the last round no control tools, so it must answer", async () => {
-    // Every round asks to delegate; only the budget stops it.
+describe("HandleTaskWorkflow — the task budget", () => {
+  it("forces an answer once the turns are spent, however few rounds that took", async () => {
+    // One expensive round eats the whole budget. Rounds are not the limit and
+    // never were — a round that dithered through twenty turns has cost exactly as
+    // much as twenty rounds that did not.
     const agent = mockAgent({
-      rounds: Array.from({ length: MAX_TURN_ROUNDS }, (_, i) => ({
+      rounds: [
+        { dag: [[1, []]], costs: MAIN_AGENT_LIMITS.maxTurns },
+        { dag: [[2, []]] },
+        { reply: "unreached" }
+      ]
+    });
+    mockFetch();
+
+    await runHandleTask(params(), stepFake().step);
+
+    expect(agent.turns.map((t) => t.mode)).toEqual(["open", "final"]);
+    // Round 1 answered from what it had; node 2 never ran.
+    expect(agent.turns.at(-1)?.decision).toBe("replied");
+    expect(agent.executed).toEqual([1]);
+    expect(agent.saved?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
+  });
+
+  it("lets cheap rounds keep delegating until the turns run out", async () => {
+    // The complement: the budget counts turns, not rounds, so a Task made of
+    // one-turn rounds gets as many of them as it has turns.
+    const agent = mockAgent({
+      rounds: Array.from({ length: MAIN_AGENT_LIMITS.maxTurns }, (_, i) => ({
         dag: [[i + 1, []]] as [number, number[]][]
       }))
     });
@@ -523,36 +566,69 @@ describe("HandleTaskWorkflow — round budget", () => {
 
     await runHandleTask(params(), stepFake().step);
 
-    expect(agent.turns).toHaveLength(MAX_TURN_ROUNDS);
-    expect(agent.turns.map((t) => t.allowControl)).toEqual([
-      ...Array(MAX_TURN_ROUNDS - 1).fill(true),
-      false
+    // maxTurns open rounds to spend the budget, then the round that must answer.
+    expect(agent.turns).toHaveLength(MAIN_AGENT_LIMITS.maxTurns + 1);
+    expect(agent.turns.map((t) => t.mode)).toEqual([
+      ...Array(MAIN_AGENT_LIMITS.maxTurns).fill("open"),
+      "final"
     ]);
-    // The last round answered rather than delegating a ninth DAG.
     expect(agent.turns.at(-1)?.decision).toBe("replied");
     expect(agent.saved?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
   });
 
-  it("stops offering delegation once the task has spent its execution budget", async () => {
-    // Two branches at the per-branch cap exceed MAX_CHUNKS_PER_TASK between them,
-    // so the third round is handed no control tools even though rounds remain.
+  it("forces an answer on the wall clock, with turns still to spare", async () => {
+    // The budget turns cannot see. One slow branch — a single round costing a
+    // single turn — burns an hour, so the turn count has barely moved. Only
+    // elapsed time has, and it is the whole reason time is budgeted separately.
+    let clock = 1_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
+
     const agent = mockAgent({
-      rounds: [
-        { dag: [[1, []]] },
-        { dag: [[2, []]] },
-        { dag: [[3, []]] },
-        { reply: "unreached" }
-      ],
-      chunks: { 1: MAX_CHUNKS_PER_BRANCH, 2: MAX_CHUNKS_PER_BRANCH }
+      rounds: [{ dag: [[1, []]] }, { dag: [[2, []]] }, { reply: "unreached" }],
+      onExecute: () => {
+        clock += MAIN_AGENT_LIMITS.maxWallMs + 1;
+      }
     });
     mockFetch();
 
     await runHandleTask(params(), stepFake().step);
 
-    expect(agent.turns.map((t) => t.allowControl)).toEqual([true, true, false]);
-    // Round 2 answered from what it had; node 3 never ran.
-    expect(agent.executed).toEqual([1, 2]);
+    expect(agent.turns.map((t) => t.mode)).toEqual(["open", "final"]);
+    // Round 1 answered from what it had rather than delegating node 2.
+    expect(agent.turns.at(-1)?.decision).toBe("replied");
+    expect(agent.executed).toEqual([1]);
     expect(agent.saved?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
+  });
+
+  it("reads the deadline from a cached step, so a replay does not restart the clock", async () => {
+    // `mode` is a step *input*. If the elapsed check re-ran `Date.now()` on
+    // replay it would reconstruct a different one, and a Workflow that retried
+    // its way past the deadline would never observe it.
+    let clock = 1_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const cache = new Map<string, unknown>();
+
+    const first = mockAgent({
+      rounds: [{ dag: [[1, []]] }, { dag: [[2, []]] }, { reply: "unreached" }],
+      onExecute: () => {
+        clock += MAIN_AGENT_LIMITS.maxWallMs + 1;
+      }
+    });
+    mockFetch();
+    await runHandleTask(params(), stepFake(cache).step);
+    expect(first.turns.map((t) => t.mode)).toEqual(["open", "final"]);
+
+    // Replay the same instance from the cache, with the clock now far beyond the
+    // deadline from the very first round. The cached verdicts must win.
+    clock += 10 * MAIN_AGENT_LIMITS.maxWallMs;
+    const replay = mockAgent({
+      rounds: [{ dag: [[1, []]] }, { dag: [[2, []]] }, { reply: "unreached" }]
+    });
+    mockFetch();
+    await runHandleTask(params(), stepFake(cache).step);
+
+    expect(replay.turns).toHaveLength(0); // every round served from cache
+    expect(replay.saved).toBeUndefined();
   });
 });
 
@@ -610,6 +686,8 @@ describe("HandleTaskWorkflow — DAG execution", () => {
     expect(agent.maxConcurrent).toBe(1);
     expect(names).toEqual([
       "working",
+      "started",
+      "deadline:0",
       "turn:0",
       "scan:0:0",
       "execute:1",
@@ -618,6 +696,7 @@ describe("HandleTaskWorkflow — DAG execution", () => {
       "scan:0:2",
       "execute:3",
       "scan:0:3",
+      "deadline:1",
       "turn:1",
       "complete",
       "sweep",
@@ -744,7 +823,15 @@ describe("HandleTaskWorkflow — failure delivery", () => {
     await runHandleTask(params(), step);
 
     // No DAG, no second round — straight to failed delivery.
-    expect(names).toEqual(["working", "turn:0", "complete", "sweep", "notify"]);
+    expect(names).toEqual([
+      "working",
+      "started",
+      "deadline:0",
+      "turn:0",
+      "complete",
+      "sweep",
+      "notify"
+    ]);
     expect(agent.turns).toHaveLength(1);
 
     const body = bodyOf(captured);
@@ -911,12 +998,15 @@ describe("HandleTaskWorkflow — replay", () => {
     // …and the replayed run still walked the identical step sequence.
     expect(replay.names).toEqual([
       "working",
+      "started",
+      "deadline:0",
       "turn:0",
       "scan:0:0",
       "execute:1",
       "scan:0:1",
       "execute:2",
       "scan:0:2",
+      "deadline:1",
       "turn:1",
       "complete",
       "sweep",

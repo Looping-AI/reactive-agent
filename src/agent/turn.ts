@@ -6,7 +6,7 @@ import type {
 } from "ai";
 import { generateText, hasToolCall, isStepCount } from "ai";
 import type { SessionMessage } from "agents/experimental/memory/session";
-import { MAX_OUTPUT_TOKENS, MAX_STEPS, MAX_SUBTASKS } from "@/config";
+import { MAIN_AGENT_LIMITS, MAX_OUTPUT_TOKENS, MAX_SUBTASKS } from "@/config";
 import { FINAL_REPLY_TOOL_NAME, finalReplyTool } from "./final-reply";
 import {
   buildIntermediateContentHandler,
@@ -56,9 +56,10 @@ import type {
  *
  * - **Work tools** (`recall`, `browser_*`, the Session's `set_context`) carry an
  *   `execute` and run *inside* the round's tool loop. They never end a round; the
- *   model keeps reasoning over their results. Every round gets them, including the
- *   one that writes the final reply — looking something up before answering is
- *   ordinary work, not a special phase.
+ *   model keeps reasoning over their results. Every round gets them except the one
+ *   the budget forced — looking something up before answering is ordinary work,
+ *   not a special phase, right up until there is nothing left to spend on it
+ *   (see {@link RoundMode}).
  * - **Control tools** — {@link delegateTool} and {@link finalReplyTool} — have no
  *   `execute`. The call *is* the round's output: the loop halts on it, and for
  *   `delegate` the Workflow performs it durably. A future `escalate` (ask the
@@ -170,19 +171,27 @@ ARC-AGI-3 game ls20."). This runs long — acknowledge in your "reply" that you 
 started playing and will report back, without promising a time.`;
 
 /**
- * Appended instead of the delegation half when the round may not delegate — the
- * last round of the budget, or a Task that has spent its execution budget. The
- * `delegate` tool is not declared at all in that case, so this only explains a
- * constraint the model can already see. `final_reply` still is, and remains the
- * only way to end.
+ * Appended when the Task has spent its budget (see {@link RoundMode}). Neither
+ * `delegate` nor any work tool is declared in that case, so this explains a
+ * constraint the model can already see rather than imposing one. `final_reply`
+ * remains, and is the only way to end.
+ *
+ * It names the budget on purpose. "You cannot delegate" reads as a capability the
+ * model should route around; "you have spent N turns" reads as a fact, and the
+ * only sensible response to it is the answer.
  */
 export const FINAL_ROUND_INSTRUCTIONS = `
 
-# No further delegation
+# Your budget is spent
 
-You cannot delegate on this turn — call \`${FINAL_REPLY_TOOL_NAME}\` now and answer the
-user from what you already have. If something is missing or failed, say so plainly
-and give them the rest.`;
+You have used this task's full budget of ${MAIN_AGENT_LIMITS.maxTurns} turns, or its ${Math.round(MAIN_AGENT_LIMITS.maxWallMs / 60_000)} minutes of
+wall-clock time. You have no tools left except one: call \`${FINAL_REPLY_TOOL_NAME}\` now and
+answer the user from what you already have. You cannot delegate, look anything up,
+or take any other action.
+
+Give them everything you did manage. If something is missing or failed, say so
+plainly in one short sentence — do not apologize at length, and do not describe
+budgets, limits, or this constraint.`;
 
 /** User-facing note appended when a deterministic join has to disclose gaps. */
 const PARTIAL_NOTE =
@@ -366,6 +375,20 @@ export type TurnDecision =
   | { kind: "reply"; text: string }
   | { kind: "delegate"; proposal: DecompositionProposal };
 
+/**
+ * How much rope this round gets, decided by the Workflow from the Task's spent
+ * budget.
+ *
+ * - `open` — the normal round: `delegate`, `final_reply`, and every work tool.
+ *   It may spend whatever is left of the turn budget.
+ * - `final` — the Task has spent its turns or its wall clock. **No work tools and
+ *   no `delegate`**: the only thing on the table is the answer. This is not a
+ *   punishment but the shape of the ceiling — a budget that ends in a forced
+ *   answer returns the work, where one that simply stopped would discard it. The
+ *   subagent runner's `summarizeBudget` is the same move one level down.
+ */
+export type RoundMode = "open" | "final";
+
 export interface RunTurnArgs {
   /** The DO's one continuous Session. */
   session: SessionLike;
@@ -375,8 +398,15 @@ export interface RunTurnArgs {
   round: number;
   /** The inbound user text (keeps its `<turn>` provenance wrapper verbatim). Appended on round 0 only. */
   text: string;
-  /** Whether this round may delegate; false ⇒ the control tools are not declared at all. */
-  allowControl: boolean;
+  /** What this round may do — see {@link RoundMode}. */
+  mode: RoundMode;
+  /**
+   * Turns still unspent in the Task's budget, bounding this round's tool loop.
+   * There is no per-round allowance: an early round that dithers spends what a
+   * later one would have had, and is then handed a `final` round to answer in.
+   * Ignored when `mode` is `final`, which is always exactly one turn.
+   */
+  turnsRemaining: number;
   /** Per-request system-prompt suffix (verified caller context). */
   systemSuffix: string;
   /** The main agent's gated **work** tools, merged over the session's own tools. */
@@ -394,14 +424,25 @@ export interface RunTurnArgs {
  * output *and* there was no durable work to fall back on — the parent Task fails
  * rather than running a synthesized subtask nobody asked for. Transient faults
  * throw instead (the Workflow step retries).
+ *
+ * Every variant carries `turns`, because every variant cost something. It is the
+ * **sum across both model attempts**, not the winning one's: a round that burned
+ * the primary and recovered on the fallback spent both, and a budget that counted
+ * only the winner would quietly forgive the expensive half of a bad round.
  */
 export type RunTurnOutcome =
-  | { status: "replied"; reply: string }
-  | { status: "delegated"; reply: string; drafts: SubtaskDraft[] }
-  | { status: "failed"; error: string };
+  | { status: "replied"; reply: string; turns: number }
+  | {
+      status: "delegated";
+      reply: string;
+      drafts: SubtaskDraft[];
+      turns: number;
+    }
+  | { status: "failed"; error: string; turns: number };
 
 type Attempt =
-  { ok: true; decision: TurnDecision } | { ok: false; error: unknown };
+  | { ok: true; decision: TurnDecision; turns: number }
+  | { ok: false; error: unknown; turns: number };
 
 /**
  * One attempt against a single model: let it work, and take whichever ending it
@@ -420,8 +461,11 @@ type Attempt =
  * Every deterministic failure collapses to `{ ok: false }`: the SDK rejects a call
  * whose input violates the schema (`InvalidToolInputError`) or names an unknown
  * tool (`NoSuchToolError`), and a run that ended without a control call — burning
- * `MAX_STEPS` mid-tool-use, or answering in prose despite `toolChoice: "required"`
- * — is caught below.
+ * the turn budget mid-tool-use, or answering in prose despite
+ * `toolChoice: "required"` — is caught below.
+ *
+ * Reports the steps it spent whether it succeeded or not. A failed attempt cost
+ * exactly as much as a successful one.
  */
 async function attempt(
   args: RunTurnArgs,
@@ -429,12 +473,28 @@ async function attempt(
   instructions: string,
   messages: ModelMessage[]
 ): Promise<Attempt> {
+  const final = args.mode === "final";
   // `final_reply` is declared on every round, including the one that may not
   // delegate — otherwise the final round would have no legal way to end.
   const controlTools: ToolSet = {
     [FINAL_REPLY_TOOL_NAME]: finalReplyTool,
-    ...(args.allowControl ? { [DELEGATE_TOOL_NAME]: delegateTool } : {})
+    ...(final ? {} : { [DELEGATE_TOOL_NAME]: delegateTool })
   };
+  // A `final` round is handed nothing to work with, only the way out. Leaving the
+  // work tools on would invite it to spend a budget it has already spent — and
+  // the composing round has every branch result in its messages already, so the
+  // thing it needs is not a lookup but an ending.
+  const workTools: ToolSet = final ? {} : args.tools;
+  // One turn is all a `final` round gets: it exists to produce the answer, and
+  // that answer is deliberately spent *beyond* the budget rather than out of it.
+  const stepBudget = final ? 1 : Math.max(1, args.turnsRemaining);
+  let turns = 0;
+  const content = args.onContent
+    ? buildIntermediateContentHandler(args.onContent, [
+        DELEGATE_TOOL_NAME,
+        FINAL_REPLY_TOOL_NAME
+      ])
+    : undefined;
 
   try {
     const result = await generateText({
@@ -445,26 +505,27 @@ async function attempt(
       // the two endings are the thing every round has to reach. Work tool names
       // are compile-time constants and none collides with a control name, so the
       // spread order costs nothing.
-      tools: { ...controlTools, ...args.tools },
+      tools: { ...controlTools, ...workTools },
       // Every ending is a control call, so the model must always call something.
       // Work tools stay freely available — `required` constrains the *shape* of a
       // step's output, not which tool is chosen.
       toolChoice: "required",
       maxOutputTokens: MAX_OUTPUT_TOKENS,
       stopWhen: [
-        isStepCount(MAX_STEPS),
+        isStepCount(stepBudget),
         hasToolCall(DELEGATE_TOOL_NAME),
         hasToolCall(FINAL_REPLY_TOOL_NAME)
       ],
       // We do our own primary → fallback recovery, so disable the SDK's
       // per-model backoff (it would only add latency and duplicate the fallback).
       maxRetries: 0,
-      onStepEnd: args.onContent
-        ? buildIntermediateContentHandler(args.onContent, [
-            DELEGATE_TOOL_NAME,
-            FINAL_REPLY_TOOL_NAME
-          ])
-        : undefined
+      // Counted here rather than from `result.steps` so a throw mid-loop still
+      // reports the steps already spent — a call that died on its fourth step
+      // cost four turns, and the `catch` below has no `result` to read.
+      onStepEnd: async (step) => {
+        turns += 1;
+        if (content) await content(step);
+      }
     });
 
     const delegates = result.toolCalls.filter(
@@ -473,6 +534,7 @@ async function attempt(
     if (delegates.length > 1) {
       return {
         ok: false,
+        turns,
         error: new Error(
           `model called ${DELEGATE_TOOL_NAME} ${delegates.length} times in one turn`
         )
@@ -484,6 +546,7 @@ async function attempt(
       // is the acknowledgment for the work, not an answer instead of it.
       return {
         ok: true,
+        turns,
         decision: {
           kind: "delegate",
           proposal: delegates[0].input as DecompositionProposal
@@ -498,7 +561,11 @@ async function attempt(
       // Schema-validated too, including the non-blank refinement — so the last
       // call of a repeated set is a complete reply, not an empty one.
       const { text } = replies[replies.length - 1].input as { text: string };
-      return { ok: true, decision: { kind: "reply", text: text.trim() } };
+      return {
+        ok: true,
+        turns,
+        decision: { kind: "reply", text: text.trim() }
+      };
     }
 
     // No control call. Either the model ran out of steps mid-tool-use, or it
@@ -515,12 +582,13 @@ async function attempt(
     }
     return {
       ok: false,
+      turns,
       error: new Error(
         `round produced no decision (finishReason=${result.finishReason}, textLength=${result.text.trim().length})`
       )
     };
   } catch (error) {
-    return { ok: false, error };
+    return { ok: false, turns, error };
   }
 }
 
@@ -553,10 +621,12 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
     (await session.refreshSystemPrompt()) +
     systemSuffix +
     TURN_INSTRUCTIONS +
-    (args.allowControl ? "" : FINAL_ROUND_INSTRUCTIONS);
+    (args.mode === "final" ? FINAL_ROUND_INSTRUCTIONS : "");
 
   const diagnostics: string[] = [];
   const errors: unknown[] = [];
+  // Summed across both slots: a fallback attempt is spend, not a free retry.
+  let turns = 0;
 
   for (const slot of ["primary", "fallback"] as const) {
     const modelId =
@@ -564,6 +634,7 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
     const model = slot === "primary" ? models.primary : models.fallback;
 
     const outcome = await attempt(args, model, system, messages);
+    turns += outcome.turns;
     if (!outcome.ok) {
       errors.push(outcome.error);
       diagnostics.push(`${slot} (${modelId}): ${String(outcome.error)}`);
@@ -586,7 +657,7 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
           outcome.decision.text
         )
       );
-      return { status: "replied", reply };
+      return { status: "replied", reply, turns };
     }
 
     let resolved: ReturnType<typeof resolveDecomposition>;
@@ -616,7 +687,12 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
         resolved.reply
       )
     );
-    return { status: "delegated", reply: stored, drafts: resolved.drafts };
+    return {
+      status: "delegated",
+      reply: stored,
+      drafts: resolved.drafts,
+      turns
+    };
   }
 
   // A transient fault is not a decision failure — let the step retry rather than
@@ -641,8 +717,8 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
         joinSuccessfulBranches(branches)
       )
     );
-    return { status: "replied", reply };
+    return { status: "replied", reply, turns };
   }
 
-  return { status: "failed", error: detail };
+  return { status: "failed", error: detail, turns };
 }

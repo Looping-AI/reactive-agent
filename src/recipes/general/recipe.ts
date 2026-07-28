@@ -1,11 +1,4 @@
-import {
-  CHAT_MODEL_ID,
-  CHAT_FALLBACK_MODEL_ID,
-  DEFAULT_MAX_TURNS,
-  DEFAULT_TURNS_PER_CHUNK,
-  DEFAULT_CHUNK_SOFT_MS,
-  DEFAULT_HISTORY_WINDOW
-} from "@/config";
+import { CHAT_MODEL_ID, CHAT_FALLBACK_MODEL_ID } from "@/config";
 import type { ResolvedRecipe, SubtaskTypeSpec } from "@/recipes/types";
 import { GENERAL_SUBAGENT_SOUL } from "./soul";
 
@@ -29,15 +22,12 @@ export const GENERAL_RECIPE: ResolvedRecipe = {
   soul: GENERAL_SUBAGENT_SOUL,
   toolFamilies: ["browser"],
   enabled: true,
-  // maxTurns === turnsPerChunk ⇒ the general recipe always completes in a single
-  // durable chunk, identical to the pre-resumable-runner behavior. historyWindow
-  // exceeds maxTurns so a general run never prunes its own context.
-  limits: {
-    maxTurns: DEFAULT_MAX_TURNS,
-    turnsPerChunk: DEFAULT_TURNS_PER_CHUNK,
-    chunkSoftMs: DEFAULT_CHUNK_SOFT_MS
-  },
-  historyWindow: DEFAULT_HISTORY_WINDOW,
+  // Nothing to override: work with no domain of its own has no reason to want a
+  // different budget from the baseline.
+  limits: {},
+  // Comfortably above the turn budget, so a general run never prunes its own
+  // context. Stated rather than defaulted — see `ResolvedRecipe.historyWindow`.
+  historyWindow: 64,
   reportMetrics: false
 };
 

@@ -9,7 +9,7 @@ import {
   type RunTurnArgs
 } from "@/agent/turn";
 import { createModelPair, type ModelPair } from "@/agent/model";
-import { MAX_STEPS, MAX_SUBTASKS } from "@/config";
+import { MAIN_AGENT_LIMITS, MAX_SUBTASKS } from "@/config";
 import {
   deterministicSessionMessage,
   finalReplyMessageId,
@@ -84,6 +84,23 @@ function branch(over: Partial<CompositionBranch> = {}): CompositionBranch {
   };
 }
 
+/**
+ * Split the turn count off an outcome. Every `RunTurnOutcome` carries `turns`,
+ * but most cases here are about *what* a round decided rather than what it cost —
+ * so the helpers hand back a stripped outcome (keeping their `toEqual`
+ * assertions exact) plus the count for the cases that do care.
+ */
+// Distributes over the union, so the discriminated variants survive the omit —
+// a plain `Omit<RunTurnOutcome, "turns">` collapses them into one loose shape.
+type WithoutTurns<T> = T extends unknown ? Omit<T, "turns"> : never;
+
+function splitTurns<T extends { turns: number }>(
+  outcome: T
+): { outcome: WithoutTurns<T>; turns: number } {
+  const { turns, ...rest } = outcome;
+  return { outcome: rest as WithoutTurns<T>, turns };
+}
+
 /** Drive one round with a scripted primary model. */
 function run(
   model: LanguageModel,
@@ -95,13 +112,14 @@ function run(
     taskId: TASK_ID,
     round: opts.round ?? 0,
     text: opts.text ?? "book me a flight",
-    allowControl: opts.allowControl ?? true,
+    mode: opts.mode ?? "open",
+    turnsRemaining: opts.turnsRemaining ?? MAIN_AGENT_LIMITS.maxTurns,
     systemSuffix: CALLER_SUFFIX,
     tools: opts.tools ?? {},
     models: createModelPair({ model }),
     branches: opts.branches ?? [],
     onContent: opts.onContent
-  }).then((outcome) => ({ outcome, session }));
+  }).then((result) => ({ ...splitTurns(result), session }));
 }
 
 /**
@@ -146,12 +164,13 @@ function runPair(
     taskId: TASK_ID,
     round: opts.round ?? 0,
     text: opts.text ?? "book me a flight",
-    allowControl: opts.allowControl ?? true,
+    mode: opts.mode ?? "open",
+    turnsRemaining: opts.turnsRemaining ?? MAIN_AGENT_LIMITS.maxTurns,
     systemSuffix: CALLER_SUFFIX,
     tools: opts.tools ?? {},
     models,
     branches: opts.branches ?? []
-  });
+  }).then((result) => splitTurns(result).outcome);
 }
 
 /** Capture the first `doGenerate` options a run sees. */
@@ -698,11 +717,13 @@ describe("runTurn — delegating", () => {
     expect(seen[0]?.tools?.map((t) => t.name)).toContain("echo");
   });
 
-  it("fails the attempt when the step budget runs out mid-tool-use", async () => {
+  it("fails the attempt when the turn budget runs out mid-tool-use", async () => {
     // A model that only ever reasons never lands on a decision. Nothing forces
-    // it any more, so the bound has to come from `MAX_STEPS` — and an undecided
-    // round is an attempt failure, not a hang and not an empty reply.
-    const looping: MockStep[] = Array.from({ length: MAX_STEPS + 2 }, () => ({
+    // it any more, so the bound has to come from `turnsRemaining` — and an
+    // undecided round is an attempt failure, not a hang and not an empty reply.
+    // There is no per-round allowance: a round may spend the whole remainder.
+    const remaining = 5;
+    const looping: MockStep[] = Array.from({ length: remaining + 2 }, () => ({
       toolCall: { toolName: "echo", input: { text: "ping" } }
     }));
     const { model, seen } = capturing(...looping);
@@ -711,10 +732,10 @@ describe("runTurn — delegating", () => {
         () => model,
         () => mockModel(finalReply("the fallback answered"))
       ),
-      { tools: ECHO_TOOL }
+      { tools: ECHO_TOOL, turnsRemaining: remaining }
     );
 
-    expect(seen).toHaveLength(MAX_STEPS);
+    expect(seen).toHaveLength(remaining);
     expect(outcome).toEqual({
       status: "replied",
       reply: "the fallback answered"
@@ -787,40 +808,91 @@ describe("runTurn — delegating", () => {
   });
 });
 
-describe("runTurn — the final round", () => {
-  it("does not declare the delegate tool at all", async () => {
+// The round the budget forced. Its defining property is that there is exactly one
+// thing left to do, and the tool set — not the prompt — is what guarantees it.
+describe("runTurn — the budget-spent round", () => {
+  it("declares only final_reply: no delegate, and no work tools either", async () => {
     const { model, seen } = capturing(finalReply("the answer"));
-    await run(model, { allowControl: false, tools: ECHO_TOOL });
-    const names = seen[0]?.tools?.map((t) => t.name) ?? [];
-    expect(names).toContain("echo");
-    expect(names).not.toContain(DELEGATE_TOOL_NAME);
-  });
-
-  it("still declares final_reply, or the round could not end", async () => {
-    const { model, seen } = capturing(finalReply("the answer"));
-    await run(model, { allowControl: false, tools: ECHO_TOOL });
-    expect(seen[0]?.tools?.map((t) => t.name)).toContain("final_reply");
+    await run(model, { mode: "final", tools: ECHO_TOOL });
+    expect(seen[0]?.tools?.map((t) => t.name)).toEqual(["final_reply"]);
     expect(seen[0]?.toolChoice).toEqual({ type: "required" });
   });
 
-  it("tells the model it must answer now", async () => {
-    const { model, seen } = capturing(finalReply("the answer"));
-    await run(model, { allowControl: false });
-    expect(JSON.stringify(seen[0]?.prompt)).toContain("No further delegation");
+  it("costs exactly one turn, spent beyond the budget rather than out of it", async () => {
+    // The answer has to come from somewhere once the budget is gone. Charging it
+    // to a budget already at zero would leave nothing to answer with, so it is a
+    // deliberate one-turn overrun — and exactly one, since a `final` round has no
+    // tool to loop on.
+    const { turns } = await run(mockModel(finalReply("the answer")), {
+      mode: "final",
+      tools: ECHO_TOOL
+    });
+    expect(turns).toBe(1);
   });
 
-  it("still gives the model its work tools", async () => {
+  it("tells the model its budget is spent, naming the numbers", async () => {
+    const { model, seen } = capturing(finalReply("the answer"));
+    await run(model, { mode: "final" });
+    const prompt = JSON.stringify(seen[0]?.prompt);
+    expect(prompt).toContain("Your budget is spent");
+    expect(prompt).toContain(String(MAIN_AGENT_LIMITS.maxTurns));
+  });
+
+  it("still produces a real answer at the ceiling", async () => {
+    // The whole point: a spent budget returns the work rather than dropping it.
     const { outcome } = await run(
-      mockModel(
-        { toolCall: { toolName: "echo", input: { text: "ping" } } },
-        finalReply("looked it up, then answered")
-      ),
-      { allowControl: false, tools: ECHO_TOOL }
+      mockModel(finalReply("here is what I found")),
+      {
+        mode: "final"
+      }
     );
     expect(outcome).toEqual({
       status: "replied",
-      reply: "looked it up, then answered"
+      reply: "here is what I found"
     });
+  });
+});
+
+describe("runTurn — what a round costs", () => {
+  it("reports the steps it spent", async () => {
+    const { turns } = await run(
+      mockModel(
+        { toolCall: { toolName: "echo", input: { text: "ping" } } },
+        { toolCall: { toolName: "echo", input: { text: "ping" } } },
+        finalReply("done")
+      ),
+      { tools: ECHO_TOOL }
+    );
+    expect(turns).toBe(3);
+  });
+
+  it("sums both model attempts, not just the winner's", async () => {
+    // A round that burned the primary and recovered on the fallback spent both.
+    // Counting only the survivor would forgive the expensive half of a bad round
+    // — precisely the round most worth charging for.
+    const { model: primary } = capturing(
+      { toolCall: { toolName: "echo", input: { text: "ping" } } },
+      { toolCall: { toolName: "echo", input: { text: "ping" } } }
+    );
+    const result = await runTurn({
+      session: new FakeSession(),
+      taskId: TASK_ID,
+      round: 0,
+      text: "book me a flight",
+      mode: "open",
+      turnsRemaining: 2,
+      systemSuffix: CALLER_SUFFIX,
+      tools: ECHO_TOOL,
+      models: modelPair(
+        () => primary,
+        () => mockModel(finalReply("the fallback answered"))
+      ),
+      branches: []
+    });
+
+    expect(result.status).toBe("replied");
+    // 2 from the exhausted primary + 1 from the fallback that answered.
+    expect(result.turns).toBe(3);
   });
 });
 
@@ -1050,7 +1122,8 @@ describe("runTurn — degrading to the durable work", () => {
       taskId: TASK_ID,
       round: 1,
       text: "unused",
-      allowControl: true,
+      mode: "open",
+      turnsRemaining: MAIN_AGENT_LIMITS.maxTurns,
       systemSuffix: CALLER_SUFFIX,
       tools: {},
       models,
@@ -1058,7 +1131,8 @@ describe("runTurn — degrading to the durable work", () => {
     });
     expect(outcome).toEqual({
       status: "replied",
-      reply: "In short: the finding, explained."
+      reply: "In short: the finding, explained.",
+      turns: 1
     });
   });
 });

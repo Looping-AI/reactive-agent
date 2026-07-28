@@ -161,10 +161,11 @@ One `generateText` call with two layers of tools, and the difference between the
 is the design:
 
 - **Work tools** — `recall`, `browser_*`, `arc_*`, and the Session's own `set_context` —
-  carry an `execute` and run _inside_ the round's loop, bounded by `MAX_STEPS`.
-  They never end a round. **Every** round gets them, including the one that writes
-  the final reply: looking something up before answering is ordinary work, not a
-  special phase.
+  carry an `execute` and run _inside_ the round's loop, bounded by whatever is left
+  of the Task's turn budget. They never end a round. Every round gets them except
+  the one the budget forced (below): looking something up before answering is
+  ordinary work, not a special phase, right until there is nothing left to spend
+  on it.
 - **Control tools** — [`delegate`](src/agent/subtasks/delegate.ts) and
   [`final_reply`](src/agent/final-reply.ts) — have no `execute`. The call _is_ the
   round's output: the loop halts on it (there is nothing to continue from), and for
@@ -187,11 +188,34 @@ were wrong in practice: a question about the agent's own history got shipped to 
 memoryless subagent that could not see it, and material that came back could only
 ever be turned into prose, never acted on. The model still chooses its own ending.
 
-The one constraint is the budget. `MAX_TURN_ROUNDS` (8) bounds the loop, and the
-last round — or any round of a Task that has already spent `MAX_CHUNKS_PER_TASK`
-chunk steps — is handed `allowControl: false`: `delegate` is not declared at all,
-so `final_reply` is the only ending left and the round must answer from what it
-has. That is the whole termination argument.
+The one constraint is the budget, and it is spent in exactly two currencies:
+**turns** (what a Task costs) and **wall clock** (how far it can run away).
+`MAIN_AGENT_LIMITS` is 20 turns and 60 minutes for the whole Task. A round that
+still has both gets `mode: "open"` — `delegate`, `final_reply`, and every work
+tool, free to spend whatever is left. A round with neither gets `mode: "final"`:
+**no work tools and no `delegate`**, only the answer. That is the whole
+termination argument, and it is the same move the subagent runner makes one level
+down with `summarizeBudget`.
+
+Turns are counted across every round _and_ across the primary→fallback attempt
+inside one, because a fallback attempt is real spend. Rounds are not a budget:
+each open round spends at least one turn, so rounds can never outnumber turns, and
+a round that dithered through twenty of them cost exactly what twenty rounds
+would. Neither are chunks — see **Platform constraints** below.
+
+Time is budgeted separately because turns do not imply it. A round waiting on slow
+subtasks burns hours while `turnsUsed` barely moves, and a turn count is no proxy
+for elapsed time when one turn is a reasoning model plus an HTTP round trip. The
+deadline is read inside a `deadline:<round>` step so its answer is cached with the
+round — `mode` is a step input, and a replay that re-read the clock would
+reconstruct a different one.
+
+> **Escalation and the clock.** The deadline runs from the Task's first durable
+> step. When `escalate` lands (see **Escalation** below), a Task suspended on
+> `step.waitForEvent(...)` must **rebase** `startedAtMs` on resume, or a human's
+> thinking time is charged to the agent and a Task that asked a question is dead
+> before the answer arrives. Turns need no such care — waiting costs none, which
+> is one more reason they are the primary budget.
 
 Failure is graded rather than fatal. Both models producing nothing usable fails
 the _Task_ only when there is no durable work behind it; with completed branches
@@ -245,6 +269,13 @@ tool declared alongside `delegate`, and another `case` in the Workflow's loop th
 posts an `input-required` Task and suspends on `step.waitForEvent(...)` before
 continuing to the next round. Suspending mid-Task is the reason this pipeline is a
 Workflow at all.
+
+One thing it must not forget: **rebase `startedAtMs` when the wait returns.** The
+Task's wall clock runs from its first durable step, so a Task that asks a question
+at minute 5 and gets an answer at minute 90 would resume already past its deadline
+and be forced to answer with nothing — charging a human's thinking time to the
+agent. The turn budget needs no equivalent: waiting spends none, which is part of
+why turns are the primary budget and time only the runaway guard.
 
 ### Subtask contract and lifecycle
 
@@ -339,24 +370,50 @@ no wrangler binding (it must only stay exported from `src/index.ts` so
 `ctx.exports` can resolve it by class name). It has no Session, no durable memory,
 no recall, and no access to parent history beyond the supplied references.
 
-**One resumable runner, driven in durable chunks.** Every recipe — from a
-single-shot default Subtask to a thousand-turn game — runs the same agentic loop
-(`runResumableChunk`, [`src/subagent/run.ts`](src/subagent/run.ts)), customized
-only by the recipe's `limits` (`maxTurns`/`turnsPerChunk`/`chunkSoftMs`) and
-`historyWindow`. `executeChunk(request, chunk, runtime)` advances one chunk: up to
-`turnsPerChunk` model turns (or `chunkSoftMs`, or until a tool emits progress),
-checkpointing rolling state to a `run_state` row after every turn, then returning
-either a terminal result or a `done: false` yield. The Workflow runs each chunk as
-its own retryable `step.do` (`execute:<id>`, then `execute:<id>:chunk:<n>`) and
-loops until done — so no step approaches the platform step timeout, and a crash
-loses at most the in-flight turn. The general recipe sets
-`maxTurns === turnsPerChunk`, so it finishes on chunk 0, byte-identical to the
-pre-resumable pipeline. Domain behavior lives entirely in **tool families**; a
-long recipe keeps only a small rolling context window and persists durable state
-(hypotheses, plans, external-session ids) to its **workspace** — a file store
+**One resumable runner, driven in durable chunks.** Every recipe runs the same
+agentic loop (`runResumableChunk`, [`src/subagent/run.ts`](src/subagent/run.ts)),
+customized only by its `limits` and `historyWindow`.
+
+`RecipeLimits` is `maxTurns` and `maxWallMs` and nothing else — the same two
+currencies the main agent is budgeted in, one level down, defaulting to
+`SUBAGENT_LIMITS` (20 turns / 30 min). A Recipe declares only the fields it wants
+to differ and inherits the rest; `historyWindow` is required outright. One rule
+governs which is which: **`config.ts` declares a baseline ⇒ merge; it does not ⇒
+require.** `validateRecipe` is the single boundary that applies it, so a Recipe
+can never widen its own limits — the baseline does not come from the declaration.
+
+`executeChunk(request, chunk, runtime)` advances one chunk, checkpointing rolling
+state to a `run_state` row after every turn and returning either a terminal result
+or a `done: false` yield. It ends on whichever comes first: the turn budget, the
+run's `maxWallMs`, the chunk's `CHUNK_SOFT_MS`, or a tool emitting progress. Only
+the first two are budgets, and reaching either is not a kill — the runner spends
+the ceiling on one final no-tools call asking the model to report from the work so
+far (`summarizeBudget`), so the branch completes with output rather than being
+dropped. For a recipe with slow turns, `maxWallMs` is what actually binds.
+
+The Workflow runs each chunk as its own retryable `step.do` (`execute:<id>`, then
+`execute:<id>:chunk:<n>`) and loops until done — so no step approaches the platform
+step timeout, and a crash loses at most the in-flight turn. A run that fits its
+budget finishes on chunk 0; only a slow one is sliced. Domain behavior lives
+entirely in **tool families**; a long recipe keeps only a small rolling context
+window and persists durable state (hypotheses, plans, external-session ids) to its
+**workspace** — a file store
 ([`src/subagent/workspace.ts`](src/subagent/workspace.ts)) backed by
 `@cloudflare/shell`'s `Workspace` over the facet's own SQLite, wiped with the
 child on `deleteSubAgent`.
+
+### Platform constraints ([`src/platform.ts`](src/platform.ts))
+
+Chunking is not configuration and no Recipe can reach it. `platform.ts` states
+what the Workflows runtime imposes — a ~10-minute step timeout, ~10,000 steps per
+instance — and the two numbers derived from them: `CHUNK_SOFT_MS` (4 min) and
+`MAX_CHUNKS_PER_BRANCH` (40).
+
+Keeping this separate is a lesson, not tidiness. There used to be a
+`turnsPerChunk`, whose job was keeping a step under the timeout. But a timeout
+measures **time**, and a turn count is only ever a proxy for it — one that was
+wrong by 2-3× in practice (see **Known unknowns**). `CHUNK_SOFT_MS` measures the
+right thing directly, and `turnsPerChunk` is gone rather than relocated.
 
 Retry safety rests on two mechanisms:
 
@@ -410,7 +467,7 @@ Retry safety rests on two mechanisms:
   never produces a terminal result — so nothing lands in the fingerprint cache and
   no fabricated failure can replay on a retry; the parent resolves the row with
   `cancelRunning` plus the tool families' `abort` hooks. Without this a long recipe
-  would keep playing until its next chunk boundary (`chunkSoftMs`, minutes).
+  would keep playing until its next chunk boundary (`CHUNK_SOFT_MS`, minutes).
 - A branch failed by the Workflow (`fail:<id>`) also runs its child's `abort` hooks
   before the sweep, so an abandoned run does not leak external state.
 - Internal diagnostics stay on the row and in logs — the composition model is told
@@ -564,22 +621,34 @@ traffic. They are characteristics, not known bugs; none is a correctness hole.
    crashes but **choices**: read the AI Gateway logs for rounds that answered when
    they should have delegated. A model that ignores `required` outright would show
    up as rounds failing with `round produced no decision`.
-2. **Chunk-step timing and the resumable runner.** A chunk runs at most
-   `turnsPerChunk` model turns bounded by `chunkSoftMs` (~4 min for the ARC
-   recipe), well under the platform's default 10-minute step timeout, and it
-   checkpoints after every turn — so unlike the old whole-loop step, a timeout or
-   crash resumes from the last turn instead of replaying the chunk. What stays
-   unverified without production traffic is whether the chat models sustain
-   coherent tool-driven play over hundreds of turns (dithering, malformed calls,
-   context drift) — the metrics footer (turns / model calls / wall-clock) and AI
-   Gateway logs make it observable; tune `limits`/`historyWindow`/soul with
-   evidence. `MAX_CHUNKS_PER_BRANCH` (80) bounds a single branch against the
-   10,000 step-per-instance ceiling, and `MAX_CHUNKS_PER_TASK` (120), checked
-   between rounds, stops a Task that delegates repeatedly from multiplying it. The
-   ARC recipe's 1,000 turns at 25 per chunk is 40 nominal chunks, leaving an equal
-   margin for the level-up progress events that end a chunk early — a _very_ busy
-   game could still hit the cap, which fails that branch with its metrics footer
-   and hands the next round an honest gap to disclose. Tune with real metrics.
+2. **Chunk-step timing and the resumable runner.** A chunk is bounded by
+   `CHUNK_SOFT_MS` (4 min), well under the platform's default 10-minute step
+   timeout, and it checkpoints after every turn — so unlike the old whole-loop
+   step, a timeout or crash resumes from the last turn instead of replaying the
+   chunk. What stays unverified without production traffic is whether the chat
+   models spend a 20-turn budget coherently (dithering, malformed calls, context
+   drift) — the metrics footer (turns / model calls / wall-clock) and AI Gateway
+   logs make it observable; tune `limits`/`historyWindow`/soul with evidence.
+
+   `MAX_CHUNKS_PER_BRANCH` remains as a backstop against the 10,000
+   step-per-instance ceiling, but reaching it is a bug rather than a budget — it
+   _fails_ the branch instead of letting it report. Two assertions in
+   `test/agent/subtasks/subtask-types.spec.ts` hold it unreachable: it exceeds
+   every recipe's `maxTurns` (a yielding chunk always advanced at least one turn,
+   so a run takes at most `maxTurns` chunks however short they are), and the
+   worst-case step product stays under the ceiling. Together they are what let a
+   separate whole-Task chunk budget stop existing.
+
+   **This is the mistake worth not repeating.** The ARC recipe originally budgeted
+   1,000 turns and reasoned that 25 turns per chunk made 40 nominal chunks, half
+   the cap. That arithmetic assumed a turn averages under 10 seconds. Real turns —
+   a reasoning model plus an HTTP round trip — are 2-3× slower, so `chunkSoftMs`,
+   not the turn allowance, was the stop that actually fired. Runs took 70-100
+   chunks, blew the cap, and were killed instead of reporting, after hours of
+   unattended play. **A chunk count derived from `maxTurns / turnsPerChunk` is not
+   a bound**, which is why no such quantity exists any more: time bounds time, and
+   turns bound cost.
+
 3. **Non-idempotent game moves across a crash.** The ARC API has no read-only
    "current frame" endpoint, so `arc_act` writes a **write-ahead intent** to the
    workspace before sending an action and clears it after. A crash in that window
@@ -656,6 +725,7 @@ traffic. They are characteristics, not known bugs; none is a correctness hole.
 | [`src/agent/recall.ts`](src/agent/recall.ts)                                 | Episodic recall: embed + upsert compacted-away messages to Vectorize; semantic search.                                                                                                                              |
 | [`src/a2a/inbound.ts`](src/a2a/inbound.ts)                                   | Inbound A2A message → text (`textOf` / `inboundText`, size-bounded) — the one place touching the `@a2a-js/sdk` message shape.                                                                                       |
 | [`src/agent/history.ts`](src/agent/history.ts)                               | `<turn>` provenance parsing + deterministic Session-message ids (the exactly-once append seam).                                                                                                                     |
-| [`src/config.ts`](src/config.ts)                                             | Model ids, AI Gateway slug, `MAX_STEPS` / `MAX_SUBTASKS` bounds, Session/compaction tuning.                                                                                                                         |
+| [`src/config.ts`](src/config.ts)                                             | Model ids, AI Gateway slug, the two budgets (`MAIN_AGENT_LIMITS` / `SUBAGENT_LIMITS`), `MAX_SUBTASKS`, Session/compaction tuning.                                                                                   |
+| [`src/platform.ts`](src/platform.ts)                                         | What the Workflows runtime imposes and the two numbers derived from it (`CHUNK_SOFT_MS`, `MAX_CHUNKS_PER_BRANCH`). Not configuration; no Recipe can reach it.                                                       |
 | [`src/reactive-agent/manifest.ts`](src/reactive-agent/manifest.ts)           | AgentCard identity + advertised skills.                                                                                                                                                                             |
 | [`scripts/generate-keys.mjs`](scripts/generate-keys.mjs)                     | Ed25519 JWK keypair generator.                                                                                                                                                                                      |

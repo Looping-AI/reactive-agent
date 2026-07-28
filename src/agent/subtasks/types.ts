@@ -187,12 +187,21 @@ export interface DecompositionProposal {
  * round: nothing was persisted and nothing was published. Transient platform
  * faults are not results: they throw so the enclosing Workflow step can retry
  * (mirrors {@link RecipeExecutionResult}).
+ *
+ * `turns` is what this round cost, which the Workflow meters against the Task's
+ * budget. The idempotent recovery paths — a round replayed from durable rows
+ * rather than re-inferred — report **0**, because they ran no model and genuinely
+ * cannot know. That is exact on a clean replay, where the Workflow's own cached
+ * step return already carries the original number, and under-counts by one round
+ * when a step crashed mid-flight and re-ran. Accepted rather than fixed: a
+ * replying round writes no durable row at all, so nothing exists to hang a
+ * per-round count on, and the wall clock bounds the crash-loop case anyway.
  */
 export type TurnTaskResult =
-  | { status: "replied"; reply: string }
-  | { status: "delegated"; reply: string; subtasks: Subtask[] }
-  | { status: "failed"; error: string }
-  | { status: "canceled" };
+  | { status: "replied"; reply: string; turns: number }
+  | { status: "delegated"; reply: string; subtasks: Subtask[]; turns: number }
+  | { status: "failed"; error: string; turns: number }
+  | { status: "canceled"; turns: number };
 
 /**
  * One branch's outcome as a later round sees it — a plain, RPC-safe subset of the

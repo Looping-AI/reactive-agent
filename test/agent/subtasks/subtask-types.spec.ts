@@ -22,6 +22,9 @@ import {
   validateSubtaskParams
 } from "@/agent/subtasks/subtask-types";
 import { SUBTASK_TYPE_SPECS } from "@/recipes";
+import { validateRecipe } from "@/recipes/validation";
+import { MAIN_AGENT_LIMITS, MAX_SUBTASKS } from "@/config";
+import { MAX_CHUNKS_PER_BRANCH, STEPS_PER_INSTANCE } from "@/platform";
 import { GENERAL_RECIPE, GENERAL_TYPE } from "@/recipes/general/recipe";
 import { ARC_GAME_RECIPE, ARC_GAME_TYPE } from "@/recipes/arc-game/recipe";
 
@@ -59,6 +62,38 @@ describe("the type set", () => {
     expect(rendered).toContain(`\`${ARC_GAME_TYPE}\``);
     expect(rendered).toContain("arc_open_scorecard");
     expect(rendered).toContain("arc_list_games");
+  });
+
+  // `MAX_CHUNKS_PER_BRANCH` is a platform backstop, not a budget: the Workflow
+  // *fails* a branch that reaches it. These two assertions are what hold it
+  // unreachable, and they live over the whole manifest because a new recipe is
+  // exactly where either would be broken.
+  describe("the per-branch chunk cap stays unreachable", () => {
+    it("exceeds every recipe's turn budget", () => {
+      // A yielding chunk always advanced at least one turn, so a run takes at
+      // most `maxTurns` chunks no matter how short they are — and they do get
+      // short: `CHUNK_SOFT_MS` and progress events both end one early. That is
+      // how an earlier 1,000-turn recipe produced 70-100 chunks against a
+      // 40-chunk estimate and was killed at the cap instead of reporting. Hold
+      // this and a branch always ends through the graceful budget summary.
+      for (const spec of SUBTASK_TYPE_SPECS) {
+        const { maxTurns } = validateRecipe(spec.recipe).limits;
+        expect(maxTurns).toBeLessThan(MAX_CHUNKS_PER_BRANCH);
+      }
+    });
+
+    it("keeps the worst-case step count under the Workflows instance ceiling", () => {
+      // Per round: the deadline probe, the turn, up to MAX_SUBTASKS + 1 wave
+      // scans, and every branch running to the cap plus its failure step. Rounds
+      // are bounded by the main agent's turn budget, since an open round always
+      // spends at least one turn. This product is what lets a separate whole-Task
+      // chunk budget not exist.
+      const perRound =
+        2 + (MAX_SUBTASKS + 1) + MAX_SUBTASKS * (MAX_CHUNKS_PER_BRANCH + 1);
+      // maxTurns open rounds plus the forced-answer round, matching the loop.
+      const worstCase = (MAIN_AGENT_LIMITS.maxTurns + 1) * perRound + 3;
+      expect(worstCase).toBeLessThan(STEPS_PER_INSTANCE);
+    });
   });
 });
 

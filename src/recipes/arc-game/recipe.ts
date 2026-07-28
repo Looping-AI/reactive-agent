@@ -7,13 +7,18 @@ import { ARC_GAME_SOUL } from "./soul";
 export const ARC_GAME_TYPE = "arc-game";
 
 /**
- * Recipe for playing an ARC-AGI-3 game. Runs on the repo's default model pair,
- * but — unlike the general recipe — it is a **long, resumable** execution:
+ * Recipe for playing an ARC-AGI-3 game. Runs on the repo's default model pair and
+ * the baseline budget; what distinguishes it is its tool families, its soul, and
+ * its context discipline — not its limits.
  *
- * - `maxTurns` far exceeds `turnsPerChunk`, so the run spans many durable
- *   Workflow chunks (each a fresh, retryable step well under the ~10-min step
- *   timeout) rather than one bounded call.
- * - `chunkSoftMs` ends a chunk early on wall-clock, keeping every step short.
+ * It used to be "the long recipe", budgeted at 1,000 turns on the reasoning that
+ * 25 turns per chunk made 40 durable chunks. That arithmetic assumed a turn under
+ * ten seconds. A turn here is a reasoning model plus an ARC HTTP round trip, so
+ * real runs took 70-100 chunks, blew the per-branch cap, and were *failed* after
+ * hours of unattended play rather than being asked to report. The budget is now
+ * time and turns, both enforced directly, and a play ends through the graceful
+ * summary — a terminal report with the metrics footer.
+ *
  * - `historyWindow` is small: the model keeps only recent turns in context and
  *   persists durable state (rules, plans) to the workspace instead (see the
  *   memory discipline in {@link ARC_GAME_SOUL}). Note it counts *assistant
@@ -34,15 +39,9 @@ export const ARC_GAME_RECIPE: ResolvedRecipe = {
   soul: ARC_GAME_SOUL,
   toolFamilies: ["workspace", "arc-game"],
   enabled: true,
-  // Long, but deliberately bounded: 1k turns → terminal "budget exhausted" with
-  // full metrics. 25 turns/chunk keeps a chunk well under the step timeout, and
-  // the resulting 40 nominal chunks sit inside `MAX_CHUNKS_PER_BRANCH` (80) with
-  // room for the level-up progress events that end a chunk early.
-  limits: {
-    maxTurns: 1_000,
-    turnsPerChunk: 25,
-    chunkSoftMs: 4 * 60_000
-  },
+  // The baseline. A game would happily use more, which is exactly why the number
+  // is not the game's to choose.
+  limits: {},
   // Counts assistant messages (tool calls), so an inspect + act + note cycle spends
   // three or four of these per game action; 12 left the model unable to see more
   // than a couple of moves back, which it answered by re-inspecting.

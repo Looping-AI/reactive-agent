@@ -1,5 +1,6 @@
 import type { RecipeExecutionRequest } from "@/agent/subtasks/types";
-import type { ResolvedRecipe } from "@/recipes/types";
+import type { ValidatedRecipe } from "@/recipes/types";
+import { resolveLimits } from "@/recipes/validation";
 
 /**
  * Canonical JSON of the fields that define an execution's identity, rebuilt as
@@ -7,9 +8,17 @@ import type { ResolvedRecipe } from "@/recipes/types";
  * insertion order). Array order is semantic and preserved: the parent builds
  * references and dependency results from ordinal-ordered rows, so a retry of
  * the same execution is byte-identical.
+ *
+ * Limits are canonicalized **merged**, not as declared: a Recipe's `limits` is a
+ * sparse override, so `{}` and an explicit restatement of the baseline are the
+ * same execution and must fingerprint alike. It also means changing
+ * `SUBAGENT_LIMITS` changes every fingerprint — which is correct, since it
+ * changes what every execution actually does. `resolveLimits` rather than
+ * `validateRecipe`: this runs before the Recipe is validated, and must not throw.
  */
 export function canonicalRequest(request: RecipeExecutionRequest): string {
-  const recipe: ResolvedRecipe = {
+  const limits = resolveLimits(request.recipe.limits);
+  const recipe: ValidatedRecipe = {
     key: request.recipe.key,
     version: request.recipe.version,
     primaryModelId: request.recipe.primaryModelId,
@@ -17,11 +26,7 @@ export function canonicalRequest(request: RecipeExecutionRequest): string {
     soul: request.recipe.soul,
     toolFamilies: request.recipe.toolFamilies,
     enabled: request.recipe.enabled,
-    limits: {
-      maxTurns: request.recipe.limits.maxTurns,
-      turnsPerChunk: request.recipe.limits.turnsPerChunk,
-      chunkSoftMs: request.recipe.limits.chunkSoftMs
-    },
+    limits: { maxTurns: limits.maxTurns, maxWallMs: limits.maxWallMs },
     historyWindow: request.recipe.historyWindow,
     reportMetrics: request.recipe.reportMetrics
   };

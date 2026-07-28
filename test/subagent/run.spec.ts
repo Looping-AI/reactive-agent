@@ -83,6 +83,8 @@ describe("runResumableChunk", () => {
     progress?: ProgressEvent[];
     abortSignal?: AbortSignal;
     models?: ModelPair;
+    now?: () => number;
+    chunkSoftMs?: number;
   }): ChunkRunDeps {
     return {
       system: "sys",
@@ -91,12 +93,14 @@ describe("runResumableChunk", () => {
       tools: over.tools ?? {},
       limits: {
         maxTurns: over.limits?.maxTurns ?? 8,
-        turnsPerChunk: over.limits?.turnsPerChunk ?? 8,
-        chunkSoftMs: over.limits?.chunkSoftMs ?? 10 * 60_000
+        // Far past the fixed clock below, so the wall clock never binds unless a
+        // case sets out to exercise it.
+        maxWallMs: over.limits?.maxWallMs ?? 60 * 60_000
       },
+      chunkSoftMs: over.chunkSoftMs ?? 10 * 60_000,
       historyWindow: 64,
       reportMetrics: over.reportMetrics ?? false,
-      now: () => 1000,
+      now: over.now ?? (() => 1000),
       progress: over.progress ?? [],
       checkpoint: () => {},
       abortSignal: over.abortSignal
@@ -177,7 +181,7 @@ describe("runResumableChunk", () => {
         state,
         deps({
           model,
-          limits: { maxTurns: 4, turnsPerChunk: 2 },
+          limits: { maxTurns: 4 },
           abortSignal: AbortSignal.abort()
         })
       );
@@ -216,31 +220,48 @@ describe("runResumableChunk", () => {
   });
 
   it("yields across chunks and resumes, then summarizes at the turn budget", async () => {
-    // 4 tool-call turns then a final report; budget is 4 turns, 2 per chunk.
+    // 4 tool-call turns then a final report, against a 4-turn budget. What ends
+    // chunk 0 early is `chunkSoftMs` — the step-timeout guard, the only thing
+    // that slices a run now that no turn-per-chunk allowance exists. The clock
+    // advances a minute per read, so the 90s soft limit trips after 2 turns.
+    let clock = 0;
     const model = mockModel(CALL_ECHO, CALL_ECHO, CALL_ECHO, CALL_ECHO, {
       text: "final report"
     });
     const d = deps({
       model,
       tools: ECHO,
-      limits: { maxTurns: 4, turnsPerChunk: 2 }
+      limits: { maxTurns: 4 },
+      chunkSoftMs: 90_000,
+      now: () => (clock += 60_000)
     });
 
-    // Chunk 0: runs 2 turns, then yields (not done).
+    // Chunk 0 yields on the soft limit rather than completing.
     const first = await runResumableChunk(null, d);
     expect(first.outcome.done).toBe(false);
-    expect(first.state.turns).toBe(2);
+    expect(first.state.turns).toBeGreaterThan(0);
+    expect(first.state.turns).toBeLessThan(4);
 
-    // Chunk 1: resumes from the checkpoint, hits the 4-turn budget, and the
-    // budget-exhaustion summary produces the terminal result.
-    const second = await runResumableChunk(first.state, d);
-    expect(second.outcome.done).toBe(true);
-    if (!second.outcome.done) return;
-    expect(second.outcome.result.status).toBe("completed");
-    if (second.outcome.result.status === "completed") {
-      expect(second.outcome.result.resultParts[0].text).toBe("final report");
+    // Drive the rest the way the Workflow does, resuming from each checkpoint,
+    // until the 4-turn budget forces the summary that terminates the run.
+    let state = first.state;
+    let chunks = 1;
+    let result;
+    for (; chunks < 10; chunks++) {
+      const next = await runResumableChunk(state, d);
+      state = next.state;
+      if (next.outcome.done) {
+        result = next.outcome.result;
+        break;
+      }
     }
-    expect(second.state.turns).toBe(4);
+
+    expect(chunks).toBeGreaterThan(1); // it really did span chunks
+    expect(result?.status).toBe("completed");
+    if (result?.status === "completed") {
+      expect(result.resultParts[0].text).toBe("final report");
+    }
+    expect(state.turns).toBe(4);
   });
 
   it("resumes at the turn ceiling straight into the summary, running no extra turn", async () => {
@@ -281,6 +302,101 @@ describe("runResumableChunk", () => {
     expect(echoCalls).toBe(0);
   });
 
+  // The wall clock is the budget that stops a *slow* run — the one whose turn
+  // counter still looks healthy after hours, because a turn here is a reasoning
+  // model plus an HTTP round trip rather than the fast turn a turn budget assumes.
+  describe("wall-clock budget", () => {
+    it("summarizes on entry when the deadline passed, running no extra turn", async () => {
+      let echoCalls = 0;
+      const spyTools: ToolSet = {
+        echo: tool({
+          description: "echo",
+          inputSchema: z.object({}),
+          execute: async () => {
+            echoCalls += 1;
+            return "ok";
+          }
+        })
+      };
+      // The model would happily emit another tool call — proving the guard, not
+      // the model, is what stopped the run.
+      const model = mockModel(CALL_ECHO, { text: "final report" });
+      const d = deps({
+        model,
+        tools: spyTools,
+        // Turns are nowhere near spent: only time is.
+        limits: { maxTurns: 1_000, maxWallMs: 20 * 60_000 },
+        now: () => 21 * 60_000
+      });
+      const resumed: ChunkRunState = {
+        messages: [{ role: "user", content: "Do the work." }],
+        turns: 37,
+        llmCalls: 40,
+        startedAtMs: 0
+      };
+
+      const out = await runResumableChunk(resumed, d);
+
+      expect(out.outcome.done).toBe(true);
+      if (!out.outcome.done) return;
+      expect(out.outcome.result.status).toBe("completed");
+      if (out.outcome.result.status === "completed") {
+        expect(out.outcome.result.resultParts[0].text).toBe("final report");
+      }
+      // The ceiling yields a report, not a dropped run — and costs no tool turn.
+      expect(out.state.turns).toBe(37);
+      expect(echoCalls).toBe(0);
+    });
+
+    it("ends the in-flight chunk at the deadline rather than at chunkSoftMs", async () => {
+      // Clock advances a minute per read, so the run crosses its 3-minute
+      // deadline mid-chunk while the turn budget (1,000) and chunkSoftMs (10m)
+      // have plenty of room left.
+      let clock = 0;
+      const model = mockModel(
+        CALL_ECHO,
+        CALL_ECHO,
+        CALL_ECHO,
+        CALL_ECHO,
+        CALL_ECHO,
+        { text: "final report" }
+      );
+      const d = deps({
+        model,
+        tools: ECHO,
+        limits: { maxTurns: 1_000, maxWallMs: 3 * 60_000 },
+        now: () => (clock += 60_000)
+      });
+
+      const out = await runResumableChunk(null, d);
+
+      // Terminal via the summary, well short of both the turn and chunk budgets.
+      expect(out.outcome.done).toBe(true);
+      expect(out.state.turns).toBeLessThan(10);
+    });
+
+    it("leaves a run under both budgets alone", async () => {
+      const model = mockModel(CALL_ECHO, { text: "final report" });
+      const out = await runResumableChunk(
+        null,
+        deps({
+          model,
+          tools: ECHO,
+          limits: { maxTurns: 8, maxWallMs: 20 * 60_000 },
+          now: () => 1000
+        })
+      );
+
+      expect(out.outcome.done).toBe(true);
+      if (!out.outcome.done) return;
+      expect(out.outcome.result.status).toBe("completed");
+      if (out.outcome.result.status === "completed") {
+        expect(out.outcome.result.resultParts[0].text).toBe("final report");
+      }
+      expect(out.state.turns).toBe(2);
+    });
+  });
+
   it("ends a chunk as soon as a tool emits a progress event", async () => {
     const progress: ProgressEvent[] = [];
     const tools: ToolSet = {
@@ -302,7 +418,7 @@ describe("runResumableChunk", () => {
       deps({
         model,
         tools,
-        limits: { maxTurns: 20, turnsPerChunk: 20 },
+        limits: { maxTurns: 20 },
         progress
       })
     );
@@ -319,7 +435,7 @@ describe("runResumableChunk", () => {
     const d = deps({
       model: mockModel(CALL_ECHO, CALL_ECHO, { text: "done" }),
       tools: ECHO,
-      limits: { maxTurns: 8, turnsPerChunk: 8 }
+      limits: { maxTurns: 8 }
     });
     d.checkpoint = (s) => {
       saved.push({ ...s });
