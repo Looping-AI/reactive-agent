@@ -878,9 +878,9 @@ export class ReactiveAgent extends Agent<Env> {
   // workflow, which cannot touch this SQLite directly, calls these via DO RPC.
   //
   // The Task-returning methods return {@link PlainTask} — the SDK `Task`
-  // narrowed to what survives Cloudflare's RPC types. See {@link file://../a2a/task.ts}.
-  // `unknown`-bearing extension `metadata`); returning the raw SDK `Task` would
-  // collapse the generated DO-stub types to `never`. See {@link file://../a2a/task.ts}.
+  // narrowed to what survives Cloudflare's RPC types. Returning the raw SDK
+  // `Task` breaks the generated DO-stub types (under v1.0 it blows past
+  // TypeScript's instantiation-depth limit). See {@link file://../a2a/task.ts}.
 
   async beginTask(input: {
     messageId: string;
@@ -988,7 +988,7 @@ function toSubtaskNode(s: Subtask): SubtaskNode {
 /**
  * Resolve the per-caller agent DO stub, keyed by the verified `identity.key`. Pure
  * routing — the DO's methods are honestly typed now that its `Task` returns are
- * {@link Task}, so callers reach the agent directly with no cast.
+ * {@link PlainTask}, so callers reach the agent directly with no cast.
  */
 export function getAgent(
   identity: GatewayIdentity
