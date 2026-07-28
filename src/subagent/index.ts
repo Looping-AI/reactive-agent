@@ -1,6 +1,7 @@
 import { Agent } from "agents";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
+import { CHUNK_SOFT_MS } from "@/platform";
 import { createModelPair, type ModelPair } from "@/agent/model";
 import { buildRecipeTools } from "@/agent/tools";
 import { RecipeValidationError, validateRecipe } from "@/recipes/validation";
@@ -239,6 +240,7 @@ export class RecipeSubagent extends Agent<Env> {
         models,
         tools,
         limits: recipe.limits,
+        chunkSoftMs: CHUNK_SOFT_MS,
         historyWindow: recipe.historyWindow,
         reportMetrics: recipe.reportMetrics,
         now: () => Date.now(),

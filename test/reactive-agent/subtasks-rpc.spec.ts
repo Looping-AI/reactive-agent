@@ -4,6 +4,8 @@ import type { LanguageModel } from "ai";
 import type { ReactiveAgent } from "@/reactive-agent";
 import { RecipeSubagent, subagentName, FINGERPRINT_MISMATCH } from "@/subagent";
 import { createModelPair, type ModelPair } from "@/agent/model";
+import type { RoundMode } from "@/agent/turn";
+import { MAIN_AGENT_LIMITS } from "@/config";
 import {
   finalReplyMessageId,
   roundAckMessageId,
@@ -162,14 +164,15 @@ function seed(instance: ReactiveAgent, drafts: SubtaskDraft[], round = 0) {
 /** Run one round with the standard inputs; only what a test cares about varies. */
 function turn(
   instance: ReactiveAgent,
-  over: { round?: number; text?: string; allowControl?: boolean } = {}
+  over: { round?: number; text?: string; mode?: RoundMode } = {}
 ) {
   return instance.runTaskTurn({
     taskId: TASK_ID,
     text: over.text ?? "book me a flight",
     identity: IDENTITY,
     round: over.round ?? 0,
-    allowControl: over.allowControl ?? true
+    mode: over.mode ?? "open",
+    turnsRemaining: MAIN_AGENT_LIMITS.maxTurns
   });
 }
 
@@ -313,7 +316,11 @@ describe("runTaskTurn — answering", () => {
 
       const result = await turn(instance);
 
-      expect(result).toEqual({ status: "replied", reply: "the answer" });
+      expect(result).toEqual({
+        status: "replied",
+        reply: "the answer",
+        turns: 1
+      });
       // No subtask was created for a request the agent answered itself.
       expect(await instance.listSubtasks(TASK_ID)).toEqual([]);
       const stored = await instance
@@ -333,8 +340,13 @@ describe("runTaskTurn — answering", () => {
       const again = await turn(instance, { round: 1 });
 
       // Re-answering could produce different words for a reply the user may
-      // already have received.
-      expect(again).toEqual({ status: "replied", reply: "first answer" });
+      // already have received. The recovery path charges nothing, because it ran
+      // no model — see `TurnTaskResult` for where that under-counts.
+      expect(again).toEqual({
+        status: "replied",
+        reply: "first answer",
+        turns: 0
+      });
       expect(models.generations()).toBe(0);
     });
   });
@@ -352,7 +364,8 @@ describe("runTaskTurn — answering", () => {
 
       expect(result).toEqual({
         status: "replied",
-        reply: "composed answer"
+        reply: "composed answer",
+        turns: 1
       });
       const stored = await instance
         .getSession(IDENTITY)
@@ -402,7 +415,12 @@ describe("runTaskTurn — answering", () => {
       const result = await turn(instance, { round: 1 });
 
       // The branch work is done and durable — deliver it rather than failing.
-      expect(result).toEqual({ status: "replied", reply: "the finding" });
+      // Both models were still spent getting here, and both are charged.
+      expect(result).toEqual({
+        status: "replied",
+        reply: "the finding",
+        turns: 2
+      });
     });
   });
 

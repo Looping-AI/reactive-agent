@@ -11,7 +11,7 @@ import type { ResolvedRecipe } from "@/recipes/types";
 import {
   CHAT_MODEL_ID,
   CHAT_FALLBACK_MODEL_ID,
-  DEFAULT_MAX_TURNS
+  SUBAGENT_LIMITS
 } from "@/config";
 
 describe("validateRecipe", () => {
@@ -21,10 +21,13 @@ describe("validateRecipe", () => {
     ...overrides
   });
 
-  it("passes a valid recipe through unchanged without mutating the input", () => {
+  it("resolves the budget but changes nothing else, and never mutates the input", () => {
     const recipe = custom({});
     const before = structuredClone(recipe);
-    expect(validateRecipe(recipe)).toEqual(before);
+    const validated = validateRecipe(recipe);
+    // The one field validation is *supposed* to change: a sparse declaration
+    // becomes the budget the runner actually enforces.
+    expect(validated).toEqual({ ...before, limits: SUBAGENT_LIMITS });
     expect(recipe).toEqual(before);
   });
 
@@ -88,29 +91,62 @@ describe("validateRecipe", () => {
     );
   });
 
-  it("clamps turnsPerChunk to maxTurns and substitutes non-positive limits", () => {
-    const validated = validateRecipe(
-      custom({
-        limits: { maxTurns: 100, turnsPerChunk: 250, chunkSoftMs: -5 }
-      })
-    );
-    expect(validated.limits.maxTurns).toBe(100);
-    expect(validated.limits.turnsPerChunk).toBe(100); // clamped down to maxTurns
-    expect(validated.limits.chunkSoftMs).toBeGreaterThan(0); // substituted default
+  // The budget merges per field: a Recipe states what it wants to differ and
+  // inherits the rest, so `{}` and a full restatement mean the same execution.
+  it("merges a partial budget over the baseline", () => {
+    const validated = validateRecipe(custom({ limits: { maxTurns: 100 } }));
+    expect(validated.limits).toEqual({
+      maxTurns: 100,
+      maxWallMs: SUBAGENT_LIMITS.maxWallMs
+    });
   });
 
-  it("substitutes a code default for a non-integer maxTurns", () => {
-    const validated = validateRecipe(
-      custom({ limits: { maxTurns: 0, turnsPerChunk: 4, chunkSoftMs: 1000 } })
+  it("inherits the whole baseline from an empty budget", () => {
+    expect(validateRecipe(custom({ limits: {} })).limits).toEqual(
+      SUBAGENT_LIMITS
     );
-    expect(validated.limits.maxTurns).toBe(DEFAULT_MAX_TURNS);
-    // turnsPerChunk (4) is still <= the substituted default, so it survives.
-    expect(validated.limits.turnsPerChunk).toBe(4);
   });
 
-  it("substitutes a code default for a non-positive historyWindow", () => {
-    expect(
-      validateRecipe(custom({ historyWindow: 0 })).historyWindow
-    ).toBeGreaterThan(0);
+  // Defense-in-depth for a future DB-sourced Recipe: a bad value must degrade to
+  // the baseline rather than reach the runner. Per field, so one bad number does
+  // not take a good one down with it.
+  it.each([
+    ["zero", 0],
+    ["negative", -5],
+    ["fractional", 2.5]
+  ])("falls back to the baseline for a %s maxTurns", (_label, maxTurns) => {
+    const validated = validateRecipe(
+      custom({ limits: { maxTurns, maxWallMs: 60_000 } })
+    );
+    expect(validated.limits.maxTurns).toBe(SUBAGENT_LIMITS.maxTurns);
+    expect(validated.limits.maxWallMs).toBe(60_000); // the good field survives
   });
+
+  // The wall clock is what actually stops a slow branch, so a Recipe must not be
+  // able to disable it by supplying a useless value.
+  it("falls back to the baseline for a non-positive maxWallMs", () => {
+    const validated = validateRecipe(
+      custom({ limits: { maxTurns: 100, maxWallMs: 0 } })
+    );
+    expect(validated.limits.maxWallMs).toBe(SUBAGENT_LIMITS.maxWallMs);
+  });
+
+  // historyWindow has no baseline in config, so the rule flips: config declares a
+  // default ⇒ merge; it does not ⇒ require. Substituting one would guess at how
+  // much context a domain needs, which is the domain's to know.
+  it.each([
+    ["zero", 0],
+    ["negative", -1],
+    ["fractional", 12.5]
+  ])(
+    "refuses a %s historyWindow rather than defaulting it",
+    (_l, historyWindow) => {
+      expect(() => validateRecipe(custom({ historyWindow }))).toThrow(
+        RecipeValidationError
+      );
+      expect(() => validateRecipe(custom({ historyWindow }))).toThrow(
+        /historyWindow/
+      );
+    }
+  );
 });

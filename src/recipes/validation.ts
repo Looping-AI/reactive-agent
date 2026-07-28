@@ -1,12 +1,9 @@
 import {
   CHAT_MODEL_ID,
   CHAT_FALLBACK_MODEL_ID,
-  DEFAULT_MAX_TURNS,
-  DEFAULT_TURNS_PER_CHUNK,
-  DEFAULT_CHUNK_SOFT_MS,
-  DEFAULT_HISTORY_WINDOW
+  SUBAGENT_LIMITS
 } from "@/config";
-import type { RecipeLimits, ResolvedRecipe } from "./types";
+import type { RecipeLimits, ResolvedRecipe, ValidatedRecipe } from "./types";
 
 /**
  * The capability boundary every Recipe passes through, whatever declared it.
@@ -14,8 +11,9 @@ import type { RecipeLimits, ResolvedRecipe } from "./types";
  * The domains live in sibling folders, each owning its soul and configuration.
  * This module imports none of them — it owns only what code must be able to say
  * about *any* Recipe: which models and tool families it may select, and how a
- * malformed one is made safe or refused. A domain cannot widen its own limits by
- * declaring them, because the check does not come from the declaration.
+ * malformed one is made safe or refused. A domain cannot widen its *capabilities*
+ * by declaring them, because the allowlists do not come from the declaration. Its
+ * budget is the deliberate exception — see {@link resolveLimits}.
  */
 
 /**
@@ -41,21 +39,28 @@ export const KNOWN_TOOL_FAMILIES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Clamp a Recipe-supplied limit to a positive integer, substituting a code
- * default for a missing, non-integer, or non-positive value. Defense-in-depth for
- * a future DB-sourced Recipe: limits drive the runner's loop bounds, so a bad
- * value must degrade to a safe default rather than spin or stall.
+ * Merge a Recipe's declared budget over {@link SUBAGENT_LIMITS}, per field. A
+ * positive integer wins; anything else — missing, null, zero, fractional — falls
+ * back to the baseline rather than reaching the runner.
+ *
+ * The baseline is a default, not a ceiling: a Recipe may declare a budget larger
+ * than {@link SUBAGENT_LIMITS} and it is honored — sizing its own branch is what
+ * declaring `limits` is for, so nothing here clamps. What the merge does buy, as
+ * defense-in-depth for a future DB-sourced Recipe, is that a corrupt or absent
+ * value cannot reach the runner as a zero, fractional, or missing budget.
+ *
+ * Exported separately from {@link validateRecipe} because it must never throw.
+ * The execution fingerprint is computed *before* a Recipe is validated — that
+ * ordering is what lets a disabled or malformed Recipe become a cached terminal
+ * failure instead of an exception — so the fingerprint needs the merge alone.
  */
-function normalizeLimits(limits: RecipeLimits): RecipeLimits {
-  const positiveInt = (n: number, fallback: number): number =>
-    Number.isInteger(n) && n > 0 ? n : fallback;
-  const maxTurns = positiveInt(limits?.maxTurns, DEFAULT_MAX_TURNS);
-  const turnsPerChunk = Math.min(
-    positiveInt(limits?.turnsPerChunk, DEFAULT_TURNS_PER_CHUNK),
-    maxTurns
-  );
-  const chunkSoftMs = positiveInt(limits?.chunkSoftMs, DEFAULT_CHUNK_SOFT_MS);
-  return { maxTurns, turnsPerChunk, chunkSoftMs };
+export function resolveLimits(limits: Partial<RecipeLimits>): RecipeLimits {
+  const positiveInt = (n: number | undefined, fallback: number): number =>
+    typeof n === "number" && Number.isInteger(n) && n > 0 ? n : fallback;
+  return {
+    maxTurns: positiveInt(limits?.maxTurns, SUBAGENT_LIMITS.maxTurns),
+    maxWallMs: positiveInt(limits?.maxWallMs, SUBAGENT_LIMITS.maxWallMs)
+  };
 }
 
 /**
@@ -75,12 +80,15 @@ export class RecipeValidationError extends Error {}
  * re-applied by the subagent on its inbound request, so Recipe data can never
  * select arbitrary models or tools.
  *
- * A missing soul is *not* normalized. Substituting a generic one would run the
- * work under an identity nobody declared — the model would answer, plausibly, as
- * something other than what the Recipe is for — so a blank soul fails the Recipe
- * outright. Every Recipe states its own; there is no house default.
+ * The split between what is normalized and what is refused follows one rule:
+ * **`config.ts` declares a baseline ⇒ merge; it does not ⇒ require.** `limits`
+ * merge. A soul and a `historyWindow` do not: substituting a generic soul would
+ * run the work under an identity nobody declared — the model would answer,
+ * plausibly, as something other than what the Recipe is for — and how much context
+ * a domain needs is likewise a property of the domain, not something a house
+ * default can guess. Both fail the Recipe outright.
  */
-export function validateRecipe(recipe: ResolvedRecipe): ResolvedRecipe {
+export function validateRecipe(recipe: ResolvedRecipe): ValidatedRecipe {
   if (!recipe.enabled) {
     throw new RecipeValidationError(
       `recipe "${recipe.key}" (v${recipe.version}) is disabled`
@@ -91,13 +99,15 @@ export function validateRecipe(recipe: ResolvedRecipe): ResolvedRecipe {
       `recipe "${recipe.key}" (v${recipe.version}) has no soul`
     );
   }
+  if (!Number.isInteger(recipe.historyWindow) || recipe.historyWindow <= 0) {
+    throw new RecipeValidationError(
+      `recipe "${recipe.key}" (v${recipe.version}) has no usable historyWindow ` +
+        `(got ${recipe.historyWindow}); every recipe states its own`
+    );
+  }
   const toolFamilies = [...new Set(recipe.toolFamilies)].filter((family) =>
     KNOWN_TOOL_FAMILIES.has(family)
   );
-  const historyWindow =
-    Number.isInteger(recipe.historyWindow) && recipe.historyWindow > 0
-      ? recipe.historyWindow
-      : DEFAULT_HISTORY_WINDOW;
   return {
     ...recipe,
     primaryModelId: SUBAGENT_MODEL_ALLOWLIST.has(recipe.primaryModelId)
@@ -107,7 +117,6 @@ export function validateRecipe(recipe: ResolvedRecipe): ResolvedRecipe {
       ? recipe.fallbackModelId
       : CHAT_FALLBACK_MODEL_ID,
     toolFamilies,
-    limits: normalizeLimits(recipe.limits),
-    historyWindow
+    limits: resolveLimits(recipe.limits)
   };
 }

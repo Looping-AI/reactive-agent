@@ -61,6 +61,15 @@ describe("fingerprintRequest", () => {
       }
     ],
     [
+      "the wall-clock limit",
+      {
+        recipe: {
+          ...makeRequest().recipe,
+          limits: { ...makeRequest().recipe.limits, maxWallMs: 999_000 }
+        }
+      }
+    ],
+    [
       "the history window",
       { recipe: { ...makeRequest().recipe, historyWindow: 3 } }
     ],

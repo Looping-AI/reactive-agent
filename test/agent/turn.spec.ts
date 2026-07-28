@@ -9,7 +9,8 @@ import {
   type RunTurnArgs
 } from "@/agent/turn";
 import { createModelPair, type ModelPair } from "@/agent/model";
-import { MAX_STEPS, MAX_SUBTASKS } from "@/config";
+import { newTurnBudget } from "@/agent/budget";
+import { MAIN_AGENT_LIMITS, MAX_SUBTASKS } from "@/config";
 import {
   deterministicSessionMessage,
   finalReplyMessageId,
@@ -84,24 +85,34 @@ function branch(over: Partial<CompositionBranch> = {}): CompositionBranch {
   };
 }
 
+/**
+ * What a round cost is not on its outcome — it is on the {@link TurnBudget} the
+ * caller handed in, which the round charged as it worked. Tests read it the same
+ * way production does, so these helpers create one and report `spent` alongside.
+ */
+type RunOpts = Partial<Omit<RunTurnArgs, "models" | "budget">> & {
+  session?: FakeSession;
+  /** Turns this round may spend. Defaults to a whole Task's worth. */
+  allowance?: number;
+};
+
 /** Drive one round with a scripted primary model. */
-function run(
-  model: LanguageModel,
-  opts: Partial<Omit<RunTurnArgs, "models">> & { session?: FakeSession } = {}
-) {
+function run(model: LanguageModel, opts: RunOpts = {}) {
   const session = opts.session ?? new FakeSession();
+  const budget = newTurnBudget(opts.allowance ?? MAIN_AGENT_LIMITS.maxTurns);
   return runTurn({
     session,
     taskId: TASK_ID,
     round: opts.round ?? 0,
     text: opts.text ?? "book me a flight",
-    allowControl: opts.allowControl ?? true,
+    mode: opts.mode ?? "open",
+    budget,
     systemSuffix: CALLER_SUFFIX,
     tools: opts.tools ?? {},
     models: createModelPair({ model }),
     branches: opts.branches ?? [],
     onContent: opts.onContent
-  }).then((outcome) => ({ outcome, session }));
+  }).then((outcome) => ({ outcome, turns: budget.spent, session }));
 }
 
 /**
@@ -137,21 +148,25 @@ function neverCalled(): ModelPair & { calls(): number } {
   };
 }
 
-function runPair(
-  models: ModelPair,
-  opts: Partial<Omit<RunTurnArgs, "models">> & { session?: FakeSession } = {}
-) {
+/** Like {@link run}, but with both model slots scripted. Reports the cost too. */
+function runPairCosted(models: ModelPair, opts: RunOpts = {}) {
+  const budget = newTurnBudget(opts.allowance ?? MAIN_AGENT_LIMITS.maxTurns);
   return runTurn({
     session: opts.session ?? new FakeSession(),
     taskId: TASK_ID,
     round: opts.round ?? 0,
     text: opts.text ?? "book me a flight",
-    allowControl: opts.allowControl ?? true,
+    mode: opts.mode ?? "open",
+    budget,
     systemSuffix: CALLER_SUFFIX,
     tools: opts.tools ?? {},
     models,
     branches: opts.branches ?? []
-  });
+  }).then((outcome) => ({ outcome, turns: budget.spent }));
+}
+
+function runPair(models: ModelPair, opts: RunOpts = {}) {
+  return runPairCosted(models, opts).then((r) => r.outcome);
 }
 
 /** Capture the first `doGenerate` options a run sees. */
@@ -698,11 +713,13 @@ describe("runTurn — delegating", () => {
     expect(seen[0]?.tools?.map((t) => t.name)).toContain("echo");
   });
 
-  it("fails the attempt when the step budget runs out mid-tool-use", async () => {
+  it("fails the attempt when the turn budget runs out mid-tool-use", async () => {
     // A model that only ever reasons never lands on a decision. Nothing forces
-    // it any more, so the bound has to come from `MAX_STEPS` — and an undecided
-    // round is an attempt failure, not a hang and not an empty reply.
-    const looping: MockStep[] = Array.from({ length: MAX_STEPS + 2 }, () => ({
+    // it any more, so the bound has to come from `turnsRemaining` — and an
+    // undecided round is an attempt failure, not a hang and not an empty reply.
+    // There is no per-round allowance: a round may spend the whole remainder.
+    const remaining = 5;
+    const looping: MockStep[] = Array.from({ length: remaining + 2 }, () => ({
       toolCall: { toolName: "echo", input: { text: "ping" } }
     }));
     const { model, seen } = capturing(...looping);
@@ -711,10 +728,10 @@ describe("runTurn — delegating", () => {
         () => model,
         () => mockModel(finalReply("the fallback answered"))
       ),
-      { tools: ECHO_TOOL }
+      { tools: ECHO_TOOL, allowance: remaining }
     );
 
-    expect(seen).toHaveLength(MAX_STEPS);
+    expect(seen).toHaveLength(remaining);
     expect(outcome).toEqual({
       status: "replied",
       reply: "the fallback answered"
@@ -787,40 +804,145 @@ describe("runTurn — delegating", () => {
   });
 });
 
-describe("runTurn — the final round", () => {
-  it("does not declare the delegate tool at all", async () => {
+// The round the budget forced. Its defining property is that there is exactly one
+// thing left to do, and the tool set — not the prompt — is what guarantees it.
+describe("runTurn — the budget-spent round", () => {
+  it("declares only final_reply: no delegate, and no work tools either", async () => {
     const { model, seen } = capturing(finalReply("the answer"));
-    await run(model, { allowControl: false, tools: ECHO_TOOL });
-    const names = seen[0]?.tools?.map((t) => t.name) ?? [];
-    expect(names).toContain("echo");
-    expect(names).not.toContain(DELEGATE_TOOL_NAME);
-  });
-
-  it("still declares final_reply, or the round could not end", async () => {
-    const { model, seen } = capturing(finalReply("the answer"));
-    await run(model, { allowControl: false, tools: ECHO_TOOL });
-    expect(seen[0]?.tools?.map((t) => t.name)).toContain("final_reply");
+    await run(model, { mode: "final", tools: ECHO_TOOL });
+    expect(seen[0]?.tools?.map((t) => t.name)).toEqual(["final_reply"]);
     expect(seen[0]?.toolChoice).toEqual({ type: "required" });
   });
 
-  it("tells the model it must answer now", async () => {
-    const { model, seen } = capturing(finalReply("the answer"));
-    await run(model, { allowControl: false });
-    expect(JSON.stringify(seen[0]?.prompt)).toContain("No further delegation");
+  it("costs exactly one turn, spent beyond the budget rather than out of it", async () => {
+    // The answer has to come from somewhere once the budget is gone. Charging it
+    // to a budget already at zero would leave nothing to answer with, so it is a
+    // deliberate one-turn overrun — and exactly one, since a `final` round has no
+    // tool to loop on.
+    const { turns } = await run(mockModel(finalReply("the answer")), {
+      mode: "final",
+      tools: ECHO_TOOL
+    });
+    expect(turns).toBe(1);
   });
 
-  it("still gives the model its work tools", async () => {
+  it("tells the model its budget is spent, naming the numbers", async () => {
+    const { model, seen } = capturing(finalReply("the answer"));
+    await run(model, { mode: "final" });
+    const prompt = JSON.stringify(seen[0]?.prompt);
+    expect(prompt).toContain("Your budget is spent");
+    expect(prompt).toContain(String(MAIN_AGENT_LIMITS.maxTurns));
+  });
+
+  it("still produces a real answer at the ceiling", async () => {
+    // The whole point: a spent budget returns the work rather than dropping it.
     const { outcome } = await run(
-      mockModel(
-        { toolCall: { toolName: "echo", input: { text: "ping" } } },
-        finalReply("looked it up, then answered")
-      ),
-      { allowControl: false, tools: ECHO_TOOL }
+      mockModel(finalReply("here is what I found")),
+      {
+        mode: "final"
+      }
     );
     expect(outcome).toEqual({
       status: "replied",
-      reply: "looked it up, then answered"
+      reply: "here is what I found"
     });
+  });
+});
+
+describe("runTurn — what a round costs", () => {
+  it("reports the steps it spent", async () => {
+    const { turns } = await run(
+      mockModel(
+        { toolCall: { toolName: "echo", input: { text: "ping" } } },
+        { toolCall: { toolName: "echo", input: { text: "ping" } } },
+        finalReply("done")
+      ),
+      { tools: ECHO_TOOL }
+    );
+    expect(turns).toBe(3);
+  });
+
+  it("sums both model attempts, not just the winner's", async () => {
+    // A round that burned the primary and recovered on the fallback spent both.
+    // Counting only the survivor would forgive the expensive half of a bad round
+    // — precisely the round most worth charging for.
+    //
+    // Note this case reads the same whether the two attempts share an allowance
+    // or each get their own (the primary takes all 2, the fallback's floor gives
+    // it 1 either way), which is exactly why it never caught the overshoot the
+    // review found. The two cases below are the ones that pin the cap.
+    const { model: primary } = capturing(
+      { toolCall: { toolName: "echo", input: { text: "ping" } } },
+      { toolCall: { toolName: "echo", input: { text: "ping" } } }
+    );
+    const { outcome, turns } = await runPairCosted(
+      modelPair(
+        () => primary,
+        () => mockModel(finalReply("the fallback answered"))
+      ),
+      { allowance: 2, tools: ECHO_TOOL }
+    );
+
+    expect(outcome.status).toBe("replied");
+    // 2 from the exhausted primary + 1 from the fallback that answered.
+    expect(turns).toBe(3);
+  });
+
+  // The allowance belongs to the round, not to each attempt — which is now what
+  // the type says rather than something the code has to remember. Both slots read
+  // the same mutable budget, so the fallback cannot be handed turns the primary
+  // already burned.
+  it("splits the allowance across both attempts rather than giving each the whole thing", async () => {
+    // Both slots would loop forever if allowed to. Six scripted steps each, an
+    // allowance of three: the pair together must not exceed it.
+    const looping = () =>
+      mockModel(
+        ...Array.from({ length: 6 }, () => ({
+          toolCall: { toolName: "echo", input: { text: "ping" } }
+        }))
+      );
+    const { turns } = await runPairCosted(modelPair(looping, looping), {
+      allowance: 3,
+      tools: ECHO_TOOL
+    });
+
+    // The primary spends all three; the fallback still gets the one step that
+    // keeps it able to reach an ending. One over, never double.
+    expect(turns).toBe(4);
+  });
+
+  it("lets a failed primary leave the fallback a usable remainder", async () => {
+    // The complement: a primary that fails *cheaply* must not eat the round.
+    // Two of the four turns are left, and the fallback gets exactly those.
+    const looping = () =>
+      mockModel(
+        ...Array.from({ length: 6 }, () => ({
+          toolCall: { toolName: "echo", input: { text: "ping" } }
+        }))
+      );
+    const { turns } = await runPairCosted(
+      // Primary narrates instead of calling a control tool: one step, then fail.
+      modelPair(() => mockModel({ text: "just narrating" }), looping),
+      { allowance: 4, tools: ECHO_TOOL }
+    );
+
+    expect(turns).toBe(4);
+  });
+
+  it("costs two when a final round has to fall back", async () => {
+    // One step per attempt, and the fallback genuinely needs its own: with none
+    // it could not produce the answer the ceiling exists to extract. Bounded at
+    // two, and worth stating rather than leaving "one turn" claimed.
+    const { outcome, turns } = await runPairCosted(
+      modelPair(
+        () => mockModel({ text: "just narrating" }),
+        () => mockModel(finalReply("the fallback answered"))
+      ),
+      { allowance: 0, mode: "final", tools: ECHO_TOOL }
+    );
+
+    expect(outcome.status).toBe("replied");
+    expect(turns).toBe(2);
   });
 });
 
@@ -1050,7 +1172,8 @@ describe("runTurn — degrading to the durable work", () => {
       taskId: TASK_ID,
       round: 1,
       text: "unused",
-      allowControl: true,
+      mode: "open",
+      budget: newTurnBudget(MAIN_AGENT_LIMITS.maxTurns),
       systemSuffix: CALLER_SUFFIX,
       tools: {},
       models,

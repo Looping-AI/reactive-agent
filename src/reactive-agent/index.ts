@@ -22,7 +22,8 @@ import { callerContext, scorecardContext, soulPrompt } from "@/agent/prompt";
 import { makeArcClient } from "@/recipes/arc-game/client";
 import { buildTools } from "@/agent/tools";
 import { archiveMessages } from "@/agent/recall";
-import { runTurn } from "@/agent/turn";
+import { runTurn, type RoundMode } from "@/agent/turn";
+import { newTurnBudget, type TurnBudget } from "@/agent/budget";
 import {
   finalReplyMessageId,
   roundAckMessageId,
@@ -45,7 +46,8 @@ import type {
   SubtaskNode,
   SubtaskScan,
   SubtaskStatus,
-  TurnTaskResult
+  TurnTaskResult,
+  TurnVerdict
 } from "@/agent/subtasks/types";
 import { FINGERPRINT_MISMATCH, RecipeSubagent, subagentName } from "@/subagent";
 import {
@@ -306,6 +308,29 @@ export class ReactiveAgent extends Agent<Env> {
    * One main-agent round: answer the user, or delegate a durable 1..8-node
    * Subtask DAG and return the acknowledgment the user sees while it runs.
    *
+   * This is the RPC boundary, so it is where the round's cost becomes a field. The
+   * budget is created here, handed to {@link decideRound} to be spent, and read
+   * back exactly once — so no branch of the round has to remember to report a
+   * number, and none can report the wrong one. See {@link TurnTaskResult}.
+   */
+  async runTaskTurn(input: {
+    taskId: string;
+    text: string;
+    identity: GatewayIdentity;
+    round: number;
+    mode: RoundMode;
+    /** What the Task has left. Bounds this round; see {@link TurnBudget}. */
+    turnsRemaining: number;
+    push?: TurnPushContext;
+  }): Promise<TurnTaskResult> {
+    const budget = newTurnBudget(input.turnsRemaining);
+    const verdict = await this.decideRound(input, budget);
+    return { ...verdict, turns: budget.spent };
+  }
+
+  /**
+   * The round itself, charging `budget` as it goes.
+   *
    * Idempotent, and the recovery order is the contract:
    *
    * 1. A canceled Task stops here.
@@ -330,16 +355,24 @@ export class ReactiveAgent extends Agent<Env> {
    * Returns a typed `failed` result when both models produce unusable output and
    * no durable work exists to fall back on (the Workflow routes it to failed
    * delivery); throws only on a transient fault, for the step to retry.
+   *
+   * The first three paths cost nothing, and cost nothing *structurally*: they
+   * return before `runTurn` is ever called, so the budget they hand back is
+   * untouched. See {@link TurnTaskResult} for why a zero is right on a replay and
+   * where it under-counts.
    */
-  async runTaskTurn(input: {
-    taskId: string;
-    text: string;
-    identity: GatewayIdentity;
-    round: number;
-    allowControl: boolean;
-    push?: TurnPushContext;
-  }): Promise<TurnTaskResult> {
-    const { taskId, text, identity, round, allowControl, push } = input;
+  private async decideRound(
+    input: {
+      taskId: string;
+      text: string;
+      identity: GatewayIdentity;
+      round: number;
+      mode: RoundMode;
+      push?: TurnPushContext;
+    },
+    budget: TurnBudget
+  ): Promise<TurnVerdict> {
+    const { taskId, text, identity, round, mode, push } = input;
     const session = this.getSession(identity);
 
     if (await this.isTaskCanceled(taskId)) return { status: "canceled" };
@@ -371,7 +404,8 @@ export class ReactiveAgent extends Agent<Env> {
       taskId,
       round,
       text,
-      allowControl,
+      mode,
+      budget,
       systemSuffix:
         callerContext(identity) +
         scorecardContext(this.db.scorecards.listOpen()),
@@ -382,7 +416,8 @@ export class ReactiveAgent extends Agent<Env> {
     });
     if (outcome.status === "failed") return outcome;
 
-    // Cancelled while the model worked: persist nothing and publish nothing.
+    // Cancelled while the model worked: persist nothing and publish nothing. The
+    // turns stay charged — the model ran, whatever became of its output.
     if (await this.isTaskCanceled(taskId)) return { status: "canceled" };
 
     if (outcome.status === "replied") {

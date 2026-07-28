@@ -3,6 +3,10 @@
  * mirror the looping-gateway admin agent; swap the ids here to change models.
  */
 
+// Type-only, and outward-flowing like every other `recipes/` type: the shape is
+// owned by the domain layer, the baseline value is owned here.
+import type { RecipeLimits } from "@/recipes/types";
+
 /** Workers AI model used by the agent tool loop. Must support function calling. */
 export const CHAT_MODEL_ID = "@cf/moonshotai/kimi-k2.7-code";
 
@@ -30,67 +34,57 @@ export const MAX_OUTPUT_TOKENS = 16_384;
  */
 export const REASONING_EFFORT = "medium" as const;
 
-/** Upper bound on tool-loop steps in a single turn (bounds the `generateText` loop). */
-export const MAX_STEPS = 8;
-
 /**
- * Default recipe execution limits (see `ResolvedRecipe.limits`). The default
- * recipe runs `maxTurns === turnsPerChunk === MAX_STEPS`, so it always completes
- * in a single durable chunk — byte-identical to the pre-resumable-runner
- * behavior. Long-running recipes (e.g. game play) raise `maxTurns` far above
- * `turnsPerChunk` so the run spans many chunks, each a fresh, retryable Workflow
- * step well under the platform's ~10-minute step timeout.
- */
-export const DEFAULT_MAX_TURNS = MAX_STEPS;
-export const DEFAULT_TURNS_PER_CHUNK = MAX_STEPS;
-export const DEFAULT_CHUNK_SOFT_MS = 4 * 60_000;
-
-/**
- * Default number of most-recent turns kept verbatim in a resumable run's rolling
- * model context. Large enough that a single-chunk (`MAX_STEPS`) run never prunes;
- * long recipes keep it small and lean on the workspace for durable memory.
- */
-export const DEFAULT_HISTORY_WINDOW = 64;
-
-/**
- * Hard cap on durable chunk steps the Workflow will run for one Subtask branch
- * before failing it. Bounds `runBranch`'s chunk loop against the Cloudflare
- * Workflows per-instance step ceiling (10,000 on the paid plan).
+ * The execution budget, in the only two currencies that mean anything:
+ * **turns** (what it costs) and **wall clock** (how long it can run away for).
+ * Two levels — the main agent for a whole Task, and one subagent branch — and
+ * nothing else in this repo is a budget.
  *
- * Sized against the longest recipe: ARC game play is `maxTurns / turnsPerChunk`
- * = 40 nominal chunks, plus one early-ended chunk per level-up progress event —
- * so 80 leaves an equal margin of progress-ended chunks. Even the worst fan-out
- * (8 concurrent branches at the cap) is 640 steps, well under the ceiling.
- */
-export const MAX_CHUNKS_PER_BRANCH = 80;
-
-/**
- * Whole-Task budget on durable chunk steps, checked **between** rounds (see
- * {@link MAX_TURN_ROUNDS}). Without it, a Task that delegated in every round
- * could multiply {@link MAX_CHUNKS_PER_BRANCH} by the round count and approach
- * the per-instance step ceiling. Once a Task has spent this much execution, the
- * main agent is offered no control tools and must answer from what it has.
- */
-export const MAX_CHUNKS_PER_TASK = 120;
-
-/**
- * Upper bound on main-agent rounds per parent Task. Each round is one inference
- * that either answers the user (terminal) or delegates a wave of Subtasks; the
- * last round is offered no control tools at all, so it must answer.
+ * Rounds, chunks and steps are *mechanics*: a round is the delegate/answer loop,
+ * a chunk is a durable slice sized by the Workers step timeout (see
+ * {@link file://./platform.ts}). None of them is tunable and none of them belongs
+ * here. Presenting them as budgets is what made an overnight runaway look, to
+ * every cap in the codebase, like a healthy Task.
  *
- * Bounds the Workflow's round loop the way {@link MAX_SUBTASKS} bounds a single
- * round's fan-out.
+ * Reaching either ceiling at either level does the same thing: one final call
+ * with **no tools** — "you have spent your budget, answer now from what you
+ * have". A ceiling yields an answer; it never drops the work.
  */
-export const MAX_TURN_ROUNDS = 8;
+
+/** What bounds the MAIN agent across every round of one Task. */
+export const MAIN_AGENT_LIMITS = {
+  /**
+   * Tool-loop steps summed across every round *and* across the primary→fallback
+   * attempt within a round — a fallback attempt is real spend.
+   */
+  maxTurns: 20,
+  /**
+   * Measured from the Task's first durable step. Note for whoever implements
+   * escalation: this must be **rebased** after a `step.waitForEvent(...)`
+   * returns, or a human's thinking time is charged to the agent and a Task that
+   * asks a question at minute 5 is dead before the answer arrives. Turns need no
+   * such care — waiting costs none.
+   */
+  maxWallMs: 60 * 60_000
+} as const;
+
+/**
+ * The baseline every subagent branch runs under. A Recipe may override either
+ * field — to any positive integer, larger included — and inherits the baseline for
+ * whatever it does not validly declare; see `resolveLimits` in
+ * {@link file://./recipes/validation.ts}. A default, not a ceiling.
+ */
+export const SUBAGENT_LIMITS: RecipeLimits = {
+  maxTurns: 20,
+  maxWallMs: 30 * 60_000
+};
 
 /**
  * Upper bound on Subtasks per **round** — a Core Invariant: a delegating round
  * emits 1..8 Subtasks, which is also what bounds its fan-out (all
- * dependency-ready Subtasks run concurrently, with no other concurrency cap). A
- * Task that delegates in every round can therefore hold up to
- * `MAX_TURN_ROUNDS * MAX_SUBTASKS` rows.
+ * dependency-ready Subtasks run concurrently, with no other concurrency cap).
  *
- * Enforced at both ends: the delegation schema constrains the model's output,
+ * Not a budget but a shape: it is what the delegation schema offers the model,
  * and the data layer re-checks it as the durable guard.
  */
 export const MAX_SUBTASKS = 8;

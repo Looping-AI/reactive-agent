@@ -1,7 +1,10 @@
 import type { LanguageModel, ModelMessage, StepResult, ToolSet } from "ai";
 import { generateText, isStepCount } from "ai";
 import { MAX_OUTPUT_TOKENS } from "@/config";
+import { CHUNK_SOFT_MS } from "@/platform";
+import { stepAllowance } from "@/agent/budget";
 import { isTransientAiError } from "@/agent/inference";
+import { validateRecipe } from "@/recipes/validation";
 import type { ModelPair } from "@/agent/model";
 import type {
   ProgressEvent,
@@ -14,10 +17,10 @@ import { renderSubagentPrompt } from "./prompt";
 
 /**
  * The resumable execution runner — ONE loop for every Recipe, from a single-shot
- * default Subtask to a thousand-turn game. It runs the model/tool loop in durable
- * **chunks**: each call advances up to `turnsPerChunk` turns (or `chunkSoftMs`
- * wall-clock, or until a tool emits progress), checkpoints its rolling state after
- * every turn, and returns either a terminal result or a "not done" yield. The
+ * general Subtask to a long game. It runs the model/tool loop in durable
+ * **chunks**: each call advances as far as `chunkSoftMs` allows (or until the run
+ * spends its budget, or until a tool emits progress), checkpoints its rolling state
+ * after every turn, and returns either a terminal result or a "not done" yield. The
  * facet persists the state between chunks and the Workflow runs each chunk as its
  * own durable, retryable step — so no single step ever approaches the platform
  * step timeout, and a crash loses at most the in-flight turn.
@@ -46,7 +49,15 @@ export interface ChunkRunDeps {
   seedPrompt: string;
   models: ModelPair;
   tools: ToolSet;
+  /** The run's budget: turns and wall clock. Nothing else. */
   limits: RecipeLimits;
+  /**
+   * How long this chunk may run before it checkpoints and yields a fresh durable
+   * step — the Workers step-timeout guard, not a budget, and identical for every
+   * Recipe (`CHUNK_SOFT_MS` in `platform.ts`). Injected rather than imported so
+   * the runner stays testable with a fake clock.
+   */
+  chunkSoftMs: number;
   historyWindow: number;
   reportMetrics: boolean;
   now: () => number;
@@ -121,6 +132,22 @@ function metricsFooter(state: ChunkRunState, now: number): string {
   );
 }
 
+/**
+ * Has this execution spent its whole-run budget? Turns and wall-clock are one
+ * predicate because they mean the same thing to the runner — the run is over and
+ * owes a report — and because checking only turns is what let a slow-turning
+ * recipe run for hours while its turn counter looked healthy.
+ *
+ * `startedAtMs` rides in the checkpoint, so the deadline survives chunk
+ * boundaries, step retries and isolate restarts without any storage of its own.
+ */
+function budgetSpent(state: ChunkRunState, deps: ChunkRunDeps): boolean {
+  return (
+    state.turns >= deps.limits.maxTurns ||
+    deps.now() - state.startedAtMs >= deps.limits.maxWallMs
+  );
+}
+
 function completed(
   state: ChunkRunState,
   deps: ChunkRunDeps,
@@ -174,12 +201,14 @@ export async function runResumableChunk(
   // Already canceled before this chunk started: don't call a model at all.
   if (deps.abortSignal?.aborted) return yielded();
 
-  // A retry can resume from a checkpoint taken on the final allowed turn
-  // (turns >= maxTurns) before the chunk returned — e.g. summarizeBudget's own
+  // The durable enforcement point for the whole-run budget: it reads persisted
+  // state before any model call, so every chunk re-checks it however the previous
+  // one ended. It also covers the retry that resumes from a checkpoint taken on
+  // the final allowed turn before the chunk returned — e.g. summarizeBudget's own
   // call threw a transient fault and the Workflow step retried. The budget is
   // already spent, so summarize now instead of running another unbudgeted,
   // side-effecting turn (which `stopWhen`'s `Math.max(1, …)` would otherwise force).
-  if (state.turns >= deps.limits.maxTurns) {
+  if (budgetSpent(state, deps)) {
     return summarizeBudget(state, deps);
   }
 
@@ -194,17 +223,29 @@ export async function runResumableChunk(
     await deps.checkpoint(state);
   };
 
-  const stopWhen = [
-    // The entry guard above guarantees `maxTurns - state.turns >= 1` here, so the
-    // `Math.max(1, …)` is defensive only — it keeps `isStepCount` from ever seeing
-    // a non-positive count for any future caller.
-    isStepCount(
-      Math.max(
-        1,
-        Math.min(deps.limits.turnsPerChunk, deps.limits.maxTurns - state.turns)
-      )
-    ),
-    () => deps.now() - chunkStartMs >= deps.limits.chunkSoftMs,
+  /**
+   * Four boundaries, and only the first two are budgets. A chunk ends on
+   * whichever comes first; the run ends only on a budget.
+   *
+   * Rebuilt per attempt rather than once per chunk, and that is the whole point:
+   * `isStepCount` counts within one `generateText` call, so a `stopWhen` shared
+   * with the fallback would hand it the turn allowance the primary already spent.
+   * `onStepEnd` has moved `state.turns` by then, so recomputing here charges the
+   * fallback for what the run has actually used.
+   */
+  const boundaries = () => [
+    // The turn budget — all of what is left of it. There is deliberately no
+    // per-chunk turn allowance: a turn count cannot bound a step's *duration*,
+    // which is the only thing the step timeout cares about, so the wall-clock
+    // predicate below owns that job alone.
+    isStepCount(stepAllowance(deps.limits.maxTurns, state.turns)),
+    // The run-wide deadline. Without it the entry guard would only observe the
+    // deadline at the next chunk boundary, up to `chunkSoftMs` past it.
+    () => deps.now() - state.startedAtMs >= deps.limits.maxWallMs,
+    // Not a budget: the platform's step timeout, which needs this chunk to
+    // checkpoint and hand back a fresh step long before ~10 minutes.
+    () => deps.now() - chunkStartMs >= deps.chunkSoftMs,
+    // Not a budget either: publish progress to the user promptly.
     () => deps.progress.length > 0
   ];
 
@@ -220,7 +261,7 @@ export async function runResumableChunk(
         instructions: deps.system,
         messages: state.messages,
         tools: deps.tools,
-        stopWhen,
+        stopWhen: boundaries(),
         maxOutputTokens: MAX_OUTPUT_TOKENS,
         // Primary → fallback recovery is manual; SDK backoff would only add latency.
         maxRetries: 0,
@@ -299,19 +340,24 @@ export async function runResumableChunk(
 
   if (a.kind === "completed") return completed(state, deps, a.text, a.modelId);
 
-  // The chunk yielded. If the turn budget is spent, force a final summary so the
+  // The chunk yielded. If the run budget is spent, force a final summary so the
   // run still returns useful output; otherwise ask the Workflow for another chunk.
-  if (state.turns >= deps.limits.maxTurns) {
+  if (budgetSpent(state, deps)) {
     return summarizeBudget(state, deps);
   }
   return yielded();
 }
 
 /**
- * The turn budget is exhausted mid-loop: run one final no-tools call asking the
- * model to produce its answer/report from the work so far. Primary → fallback,
- * same transient/deterministic split. This is what makes "uncapped but bounded"
- * safe — the ceiling yields a report instead of a dropped run.
+ * The run budget — turns or wall-clock — is exhausted mid-loop: run one final
+ * no-tools call asking the model to produce its answer/report from the work so
+ * far. Primary → fallback, same transient/deterministic split. This is what makes
+ * "uncapped but bounded" safe — the ceiling yields a report instead of a dropped
+ * run.
+ *
+ * The message deliberately does not name *which* budget ran out. The model can
+ * do nothing differently either way, and the one instruction that matters —
+ * report now, take no more actions — is the same.
  */
 async function summarizeBudget(
   state: ChunkRunState,
@@ -322,7 +368,7 @@ async function summarizeBudget(
     {
       role: "user",
       content:
-        "You have reached your turn budget and can take no more actions. " +
+        "You have reached your execution budget and can take no more actions. " +
         "Write your final answer or report now, based on the work so far."
     }
   ];
@@ -374,7 +420,8 @@ async function summarizeBudget(
         }
       }
       // Even the summary failed: return a plain budget-exhausted notice.
-      const text = "Reached the turn budget without producing a final report.";
+      const text =
+        "Reached the execution budget without producing a final report.";
       return completed(state, deps, text, a.modelId);
     }
   }
@@ -383,7 +430,7 @@ async function summarizeBudget(
     : completed(
         state,
         deps,
-        "Reached the turn budget.",
+        "Reached the execution budget.",
         deps.models.fallbackId()
       );
 }
@@ -398,10 +445,10 @@ export interface RecipeRunDeps {
 
 /**
  * Run one recipe execution to a terminal result, driving {@link runResumableChunk}
- * chunk by chunk in memory. The general recipe finishes in a single chunk
- * (`maxTurns === turnsPerChunk`); a long recipe loops until done. Used by tests
- * and any caller wanting the whole outcome; the facet drives chunks durably
- * instead, for crash-safety across the Workflow.
+ * chunk by chunk in memory. A run that fits its budget finishes in one chunk;
+ * otherwise it loops until the budget yields a summary. Used by tests and any
+ * caller wanting the whole outcome; the facet drives chunks durably instead, for
+ * crash-safety across the Workflow.
  *
  * Throws only on a transient platform fault (as {@link runResumableChunk} does).
  */
@@ -413,16 +460,15 @@ export async function runRecipeExecution(
     return { status: "failed", error: "empty subtask prompt", modelId: null };
   }
 
-  const { system, prompt } = renderSubagentPrompt(request);
+  const recipe = validateRecipe(request.recipe);
+  const { system, prompt } = renderSubagentPrompt({ ...request, recipe });
   const now = deps.now ?? Date.now;
 
   let state: ChunkRunState | null = null;
-  // Bounded by maxTurns / turnsPerChunk (+1) — a chunk always advances ≥1 turn
-  // unless it completes, so this can never spin.
-  const maxChunks =
-    Math.ceil(
-      request.recipe.limits.maxTurns / request.recipe.limits.turnsPerChunk
-    ) + 2;
+  // A chunk always advances ≥1 turn unless it completes, so `maxTurns` chunks is
+  // the ceiling and this can never spin. Turn-derived on purpose: `maxWallMs` and
+  // `chunkSoftMs` only ever end a run *sooner*, so neither can loosen the bound.
+  const maxChunks = recipe.limits.maxTurns + 2;
 
   for (let chunk = 0; chunk < maxChunks; chunk++) {
     const chunkDeps: ChunkRunDeps = {
@@ -430,9 +476,10 @@ export async function runRecipeExecution(
       seedPrompt: prompt,
       models: deps.models,
       tools: deps.tools,
-      limits: request.recipe.limits,
-      historyWindow: request.recipe.historyWindow,
-      reportMetrics: request.recipe.reportMetrics,
+      limits: recipe.limits,
+      chunkSoftMs: CHUNK_SOFT_MS,
+      historyWindow: recipe.historyWindow,
+      reportMetrics: recipe.reportMetrics,
       now,
       progress: [],
       checkpoint: () => {}
