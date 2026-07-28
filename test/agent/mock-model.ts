@@ -14,12 +14,31 @@ const USAGE = {
 
 export interface MockStep {
   /**
-   * Assistant text for this step. On its own → finishReason "stop" (final reply).
-   * Alongside `toolCall` → the intermediate content emitted before a tool call.
+   * Assistant text for this step. On its own → finishReason "stop", which for the
+   * main-agent round is a *failed* attempt: prose is not an ending there, so use
+   * {@link finalReply} to script an answer. Alongside `toolCall` → the
+   * intermediate content emitted before a tool call.
    */
   text?: string;
   /** Emit a tool call (finishReason "tool-calls"); may accompany `text`. */
   toolCall?: { toolName: string; input?: unknown };
+}
+
+/**
+ * A step where the main agent answers the user — the `final_reply` control call.
+ *
+ * Scripting a bare `{ text }` instead reproduces the bug this tool exists to catch
+ * (a model narrating rather than acting) and fails the attempt, which is what the
+ * error-path specs use it for.
+ */
+export function finalReply(
+  text: string,
+  opts: { text?: string } = {}
+): MockStep {
+  return {
+    ...(opts.text !== undefined ? { text: opts.text } : {}),
+    toolCall: { toolName: "final_reply", input: { text } }
+  };
 }
 
 function stepResult(step: MockStep) {

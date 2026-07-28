@@ -28,7 +28,7 @@ import type {
   DecompositionProposal
 } from "@/agent/subtasks/types";
 import { FakeSession } from "../helpers/fake-session";
-import { mockModel, type MockStep } from "./mock-model";
+import { finalReply, mockModel, type MockStep } from "./mock-model";
 
 const TASK_ID = "task-1";
 const CALLER_SUFFIX = "\n\nCalling agent instance: Ada.";
@@ -530,9 +530,9 @@ describe("joinSuccessfulBranches", () => {
 });
 
 describe("runTurn — answering directly", () => {
-  it("treats plain text as the final reply", async () => {
+  it("takes the final_reply call's text as the reply", async () => {
     const { outcome } = await run(
-      mockModel({ text: "You told me you prefer aisle seats." })
+      mockModel(finalReply("You told me you prefer aisle seats."))
     );
     expect(outcome).toEqual({
       status: "replied",
@@ -540,8 +540,18 @@ describe("runTurn — answering directly", () => {
     });
   });
 
+  it("fails the attempt when the model narrates instead of calling final_reply", async () => {
+    // The regression this whole control-tool design exists for: a model that says
+    // it will do something and emits no call must not have that narration shipped
+    // to the user as if it were an answer.
+    const { outcome } = await run(
+      mockModel({ text: "Sure, I'll start the game and report back." })
+    );
+    expect(outcome.status).toBe("failed");
+  });
+
   it("persists the answer under the final-reply id, with no ack", async () => {
-    const { session } = await run(mockModel({ text: "the answer" }));
+    const { session } = await run(mockModel(finalReply("the answer")));
     expect(session.messages.map((m) => m.id)).toEqual([
       taskUserMessageId(TASK_ID),
       finalReplyMessageId(TASK_ID)
@@ -554,7 +564,7 @@ describe("runTurn — answering directly", () => {
     const { outcome } = await run(
       mockModel(
         { toolCall: { toolName: "echo", input: { text: "ping" } } },
-        { text: "answered after looking" }
+        finalReply("answered after looking")
       ),
       { tools: ECHO_TOOL }
     );
@@ -566,7 +576,7 @@ describe("runTurn — answering directly", () => {
 
   it("answers from branch results without delegating again", async () => {
     const { outcome, session } = await run(
-      mockModel({ text: "Here is what I found." }),
+      mockModel(finalReply("Here is what I found.")),
       { round: 1, branches: [branch()] }
     );
     expect(outcome).toEqual({
@@ -699,7 +709,7 @@ describe("runTurn — delegating", () => {
     const outcome = await runPair(
       modelPair(
         () => model,
-        () => mockModel({ text: "the fallback answered" })
+        () => mockModel(finalReply("the fallback answered"))
       ),
       { tools: ECHO_TOOL }
     );
@@ -711,18 +721,25 @@ describe("runTurn — delegating", () => {
     });
   });
 
-  it("never forces the choice", async () => {
-    // The whole point: no `toolChoice` pinning in either direction. A round that
-    // wants to answer may, and a round that wants to delegate may.
+  it("requires a tool call without pinning which one", async () => {
+    // Both endings are control tools and `toolChoice` is "required", so prose is
+    // not an outcome — but nothing pins a *specific* tool in either direction. A
+    // round that wants to answer may, and a round that wants to delegate may.
     const { model, seen } = capturing(
       { toolCall: { toolName: "echo", input: { text: "ping" } } },
       delegates()
     );
     await run(model, { tools: ECHO_TOOL });
     expect(seen.map((o) => o.toolChoice)).toEqual([
-      { type: "auto" },
-      { type: "auto" }
+      { type: "required" },
+      { type: "required" }
     ]);
+    // Every step offers both endings plus the work tools — the model chooses.
+    for (const call of seen) {
+      expect(call.tools?.map((t) => t.name)).toEqual(
+        expect.arrayContaining(["echo", "delegate", "final_reply"])
+      );
+    }
   });
 
   it("streams intermediate content while reasoning", async () => {
@@ -772,15 +789,22 @@ describe("runTurn — delegating", () => {
 
 describe("runTurn — the final round", () => {
   it("does not declare the delegate tool at all", async () => {
-    const { model, seen } = capturing({ text: "the answer" });
+    const { model, seen } = capturing(finalReply("the answer"));
     await run(model, { allowControl: false, tools: ECHO_TOOL });
     const names = seen[0]?.tools?.map((t) => t.name) ?? [];
     expect(names).toContain("echo");
     expect(names).not.toContain(DELEGATE_TOOL_NAME);
   });
 
+  it("still declares final_reply, or the round could not end", async () => {
+    const { model, seen } = capturing(finalReply("the answer"));
+    await run(model, { allowControl: false, tools: ECHO_TOOL });
+    expect(seen[0]?.tools?.map((t) => t.name)).toContain("final_reply");
+    expect(seen[0]?.toolChoice).toEqual({ type: "required" });
+  });
+
   it("tells the model it must answer now", async () => {
-    const { model, seen } = capturing({ text: "the answer" });
+    const { model, seen } = capturing(finalReply("the answer"));
     await run(model, { allowControl: false });
     expect(JSON.stringify(seen[0]?.prompt)).toContain("No further delegation");
   });
@@ -789,7 +813,7 @@ describe("runTurn — the final round", () => {
     const { outcome } = await run(
       mockModel(
         { toolCall: { toolName: "echo", input: { text: "ping" } } },
-        { text: "looked it up, then answered" }
+        finalReply("looked it up, then answered")
       ),
       { allowControl: false, tools: ECHO_TOOL }
     );
@@ -1001,8 +1025,8 @@ describe("runTurn — degrading to the durable work", () => {
     // outcomes and says what it could not do.
     const outcome = await runPair(
       modelPair(
-        () => mockModel({ text: "I could not reach that service." }),
-        () => mockModel({ text: "unused" })
+        () => mockModel(finalReply("I could not reach that service.")),
+        () => mockModel(finalReply("unused"))
       ),
       {
         round: 1,
@@ -1019,7 +1043,7 @@ describe("runTurn — degrading to the durable work", () => {
     // The old single-node bypass returned the subtask's text verbatim; a research
     // result is material, not an answer.
     const models = createModelPair({
-      model: mockModel({ text: "In short: the finding, explained." })
+      model: mockModel(finalReply("In short: the finding, explained."))
     });
     const outcome = await runTurn({
       session: new FakeSession(),
@@ -1112,8 +1136,10 @@ describe("runTurn — replay safety", () => {
 
   it("keeps the first attempt's answer when a re-run infers a different one", async () => {
     const session = new FakeSession();
-    await run(mockModel({ text: "first answer" }), { session });
-    const second = await run(mockModel({ text: "second answer" }), { session });
+    await run(mockModel(finalReply("first answer")), { session });
+    const second = await run(mockModel(finalReply("second answer")), {
+      session
+    });
     expect(second.outcome).toEqual({
       status: "replied",
       reply: "first answer"

@@ -1,5 +1,6 @@
 import type { LanguageModel, ModelMessage, StepResult, ToolSet } from "ai";
 import { generateText, isStepCount } from "ai";
+import { MAX_OUTPUT_TOKENS } from "@/config";
 import { isTransientAiError } from "@/agent/inference";
 import type { ModelPair } from "@/agent/model";
 import type {
@@ -220,6 +221,7 @@ export async function runResumableChunk(
         messages: state.messages,
         tools: deps.tools,
         stopWhen,
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
         // Primary → fallback recovery is manual; SDK backoff would only add latency.
         maxRetries: 0,
         abortSignal: deps.abortSignal,
@@ -234,6 +236,14 @@ export async function runResumableChunk(
     }
     if (deps.abortSignal?.aborted) return { kind: "aborted" };
     if (result.finishReason === "length") {
+      // Its own warning, not just a diagnostic string: hitting the output ceiling
+      // is a tuning signal about MAX_OUTPUT_TOKENS, distinct from the model
+      // producing bad output, and the two are indistinguishable once folded into
+      // the "recipe exhausted" message.
+      console.warn("[recipe-runner] model output truncated", {
+        model: modelId,
+        maxOutputTokens: MAX_OUTPUT_TOKENS
+      });
       return {
         kind: "failed",
         diagnostic: "truncated (finish_reason=length)",
@@ -329,6 +339,7 @@ async function summarizeBudget(
         instructions: deps.system,
         messages,
         stopWhen: isStepCount(1),
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
         maxRetries: 0,
         abortSignal: deps.abortSignal
       });

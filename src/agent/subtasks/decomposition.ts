@@ -44,13 +44,24 @@ export class DecompositionValidationError extends Error {
   }
 }
 
-const nonBlank = (label: string) =>
+/**
+ * A required string that is not whitespace.
+ *
+ * Written as a `.regex()` rather than the equivalent `.refine()`, deliberately.
+ * Both are enforced by the SDK (which validates tool input with the zod schema),
+ * but a refinement is **invisible to the model**: custom checks do not survive
+ * JSON-Schema conversion, so the rule would be one the model is held to without
+ * ever being shown it — and a whitespace-only value then throws out of
+ * `generateText` as an `InvalidToolInputError` rather than never being emitted.
+ * `/\S/` converts to `"pattern": "\\S"` next to `"minLength": 1`, so the
+ * constraint reaches the model as part of the tool schema, on every field, with
+ * no per-field `.describe()` needed to restate it.
+ */
+export const nonBlank = (label: string) =>
   z
     .string()
     .min(1)
-    .refine((s) => s.trim().length > 0, {
-      message: `${label} must not be blank`
-    });
+    .regex(/\S/, { message: `${label} must not be blank` });
 
 const subtaskProposalSchema = z.object({
   localKey: nonBlank("localKey"),

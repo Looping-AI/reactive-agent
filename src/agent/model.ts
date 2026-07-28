@@ -6,7 +6,8 @@ import {
   AI_GATEWAY_ID,
   CHAT_MODEL_ID,
   CHAT_FALLBACK_MODEL_ID,
-  EMBEDDING_MODEL_ID
+  EMBEDDING_MODEL_ID,
+  REASONING_EFFORT
 } from "@/config";
 
 // Lazily construct the provider on first use rather than at module load.
@@ -69,11 +70,17 @@ export interface ModelOverrides {
 
 /**
  * Per-model Workers-AI settings: pin the gateway id (so per-call metadata does
- * not drop the gateway route) and attach correlation metadata when supplied.
- * Returns `undefined` when there is no metadata so the provider default applies.
+ * not drop the gateway route), attach correlation metadata when supplied, and set
+ * the reasoning budget.
+ *
+ * Always returns a settings object, even with no metadata: `reasoning_effort` has
+ * to reach the binding on every call, and an `undefined` return would drop it.
  */
 function chatSettings(metadata?: GatewayMetadata) {
-  return metadata ? { gateway: { id: AI_GATEWAY_ID, metadata } } : undefined;
+  return {
+    gateway: { id: AI_GATEWAY_ID, ...(metadata ? { metadata } : {}) },
+    reasoning_effort: REASONING_EFFORT
+  };
 }
 
 /** The primary/fallback models (lazily memoized) plus their ids for logging. */

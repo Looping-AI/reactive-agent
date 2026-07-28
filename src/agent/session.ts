@@ -3,6 +3,7 @@ import { generateText } from "ai";
 import { Session } from "agents/experimental/memory/session";
 import type { SessionMessage } from "agents/experimental/memory/session";
 import { createCompactFunction } from "agents/experimental/memory/utils";
+import { MAX_OUTPUT_TOKENS } from "@/config";
 import { sessionText } from "./history";
 
 /**
@@ -125,7 +126,15 @@ export function buildAgentSession(
 ): Session {
   const compact = archivingCompaction(
     createCompactFunction({
-      summarize: (prompt) => generateText({ model, prompt }).then((r) => r.text)
+      // Bounded like every other call: an unbounded summary is not the risk, a
+      // silently truncated one is — it becomes this caller's memory of everything
+      // that scrolled out, with no way to tell it was cut short.
+      summarize: (prompt) =>
+        generateText({
+          model,
+          prompt,
+          maxOutputTokens: MAX_OUTPUT_TOKENS
+        }).then((r) => r.text)
     }),
     opts.onArchive
   );
