@@ -314,6 +314,7 @@ describe("the delegate tool's schema, as converted for the provider", () => {
   interface WireSchema {
     type?: string;
     description?: string;
+    pattern?: string;
     properties?: Record<string, WireSchema>;
     items?: WireSchema;
     additionalProperties?: boolean | WireSchema;
@@ -372,5 +373,30 @@ describe("the delegate tool's schema, as converted for the provider", () => {
     expect(paramsWireSchema().properties?.game_id?.description).toContain(
       "arc_list_games"
     );
+  });
+
+  it("shows the model the not-blank rule on every field that enforces it", () => {
+    // The same class of gap as `params` above, one level subtler: a `.refine()`
+    // is enforced by the SDK's validation but converts to nothing, so a
+    // whitespace-only value would fail the call over a rule the schema never
+    // stated. Expressed as a pattern, it is on the wire — no `.describe()`
+    // needed to restate it, and none of these fields has one.
+    const root = asSchema(delegateTool.inputSchema).jsonSchema as WireSchema;
+    const subtask = root.properties?.subtasks?.items;
+    const nonBlankFields: [string, WireSchema | undefined][] = [
+      ["reply", root.properties?.reply],
+      ["localKey", subtask?.properties?.localKey],
+      ["prompt", subtask?.properties?.prompt],
+      ["dependsOn entry", subtask?.properties?.dependsOn?.items]
+    ];
+    for (const [label, field] of nonBlankFields) {
+      expect(field, `delegate schema exposes no ${label}`).toBeDefined();
+      // A pattern that a whitespace-only string cannot satisfy.
+      expect(field?.pattern, label).toBeDefined();
+      expect(new RegExp(field!.pattern!).test("   "), label).toBe(false);
+      expect(new RegExp(field!.pattern!).test("do the thing"), label).toBe(
+        true
+      );
+    }
   });
 });
