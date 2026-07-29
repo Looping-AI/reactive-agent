@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
 import type { GatewayIdentity } from "@/a2a/verify";
+import { renderTypeCapabilities } from "./subtasks/subtask-types";
 
 /**
  * The agent's soul — its frozen identity + operating rules. Kept as an array of
@@ -21,27 +22,21 @@ const BROWSER_CAPABILITY =
   "You can read live web pages with the `browser_*` tools — use `browser_markdown` to read a page and `browser_extract` to pull out specific fields.";
 
 /**
- * ARC-AGI-3: subagents play, and nobody manages a scorecard. The card used to be
- * this agent's to open, choose and close, which made every play depend on it
- * getting bookkeeping right for a lifecycle the API already manages. It is now
- * leased by the recipe and invisible here, so all that is left to state is how to
- * ask for a game and where the score turns up.
+ * The frozen soul as a single system-prompt string.
+ *
+ * Two kinds of capability get appended. The browser one is declared here because
+ * it is gated on a *binding*, not on a domain. Everything a delegable Subtask
+ * type contributes — ARC-AGI-3 today — is declared by the type itself and
+ * rendered from the manifest, so this module names no domain and adding one never
+ * edits it (see {@link file://./subtasks/subtask-types.ts renderTypeCapabilities}).
  */
-const ARC_CAPABILITY = [
-  "You can run ARC-AGI-3 games, played for you by subagents:",
-  "- `arc_list_games` shows the available games with their exact ids and tags describing how each is played.",
-  "- To have a game played, delegate a subtask of type `arc-game` with param `game_id` (an exact id from `arc_list_games`). That is the whole contract — there is no scorecard for you to open, choose, or close.",
-  "- To have several games played, delegate one `arc-game` subtask per game; they run concurrently.",
-  "- Each play's report ends with that game's score, read from the scorecard once the play finishes. Report that score rather than inventing one — and if a report carries no score line, say the score was unavailable."
-].join("\n");
-
-/** The frozen soul as a single system-prompt string. */
 export function soulPrompt(): string {
   const lines = [...SOUL];
   if (env.BROWSER) {
     lines.push(BROWSER_CAPABILITY);
   }
-  lines.push(ARC_CAPABILITY);
+  const capabilities = renderTypeCapabilities();
+  if (capabilities) lines.push(capabilities);
   return lines.join("\n");
 }
 

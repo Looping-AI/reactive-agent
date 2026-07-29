@@ -9,6 +9,15 @@ describe("SOUL", () => {
   it("tells the model to record durable facts via set_context", () => {
     expect(SOUL.some((line) => line.includes("set_context"))).toBe(true);
   });
+
+  it("names no domain of its own", () => {
+    // The soul is the frozen identity, true of every request. What the agent can
+    // do with ARC is declared by the `arc-game` type and rendered from the
+    // manifest, so text reaching soulPrompt() below can only have come from there.
+    for (const domain of ["ARC", "arc-game", "arc_", "game_id"]) {
+      expect(SOUL.join("\n")).not.toContain(domain);
+    }
+  });
 });
 
 describe("callerContext", () => {

@@ -6,6 +6,8 @@ import {
   joinSuccessfulBranches,
   renderTurnMessages,
   runTurn,
+  ROUND_CONTRACT,
+  TURN_INSTRUCTIONS,
   type RunTurnArgs
 } from "@/agent/turn";
 import { createModelPair, type ModelPair } from "@/agent/model";
@@ -181,6 +183,23 @@ function capturing(...steps: MockStep[]) {
   };
   return { model, seen };
 }
+
+describe("TURN_INSTRUCTIONS", () => {
+  it("is the domain-free round contract plus whatever the types declare", () => {
+    // The contract is true of every request; how to delegate a *particular* type
+    // is that type's to say, and is collected from the recipe manifest. ARC advice
+    // was written by hand here once, in a second copy that drifted out of step
+    // with the one in the soul.
+    // The type *keys* do appear in it — the enum is interpolated from the
+    // manifest. What must not is anything written about a domain by hand.
+    for (const domain of ["ARC", "arc_", "game_id"]) {
+      expect(ROUND_CONTRACT).not.toContain(domain);
+    }
+    expect(TURN_INSTRUCTIONS.startsWith(ROUND_CONTRACT)).toBe(true);
+    expect(TURN_INSTRUCTIONS).toContain("## Playing an ARC-AGI-3 game");
+    expect(TURN_INSTRUCTIONS).toContain(FINAL_REPLY_TOOL_NAME);
+  });
+});
 
 describe("renderTurnMessages — reference catalog", () => {
   it("marks referenceable turns with the index the model selects them by", () => {

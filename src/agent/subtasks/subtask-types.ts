@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { SUBTASK_TYPE_SPECS } from "@/recipes";
 import type {
+  DelegationNames,
   ResolvedRecipe,
   SubtaskParams,
   SubtaskTypeSpec
@@ -17,7 +18,7 @@ import type {
  * lives here is only what is true of *every* type.
  */
 
-export type { SubtaskParams, SubtaskTypeSpec };
+export type { DelegationNames, SubtaskParams, SubtaskTypeSpec };
 
 /** Every known type, keyed by its `key`. */
 export const SUBTASK_TYPES: ReadonlyMap<string, SubtaskTypeSpec> = new Map(
@@ -148,4 +149,30 @@ export function renderSubtaskTypes(): string {
     const help = spec.paramsHelp ? ` — ${spec.paramsHelp}` : "";
     return `- \`${spec.key}\`: ${spec.description}${help}`;
   }).join("\n");
+}
+
+/**
+ * The prompt text the manifest contributes to the main agent, in manifest order:
+ * every type's {@link SubtaskTypeSpec.capability} for the soul, and every type's
+ * {@link SubtaskTypeSpec.delegationGuidance} for the round contract.
+ *
+ * Both return `""` when no type declares the field, and that case is the one
+ * worth naming: it is what lets each call site append unconditionally instead of
+ * emitting a separator around nothing. Types that declare neither — `general`
+ * does — contribute nothing and cost nothing.
+ */
+export function renderTypeCapabilities(): string {
+  const blocks: string[] = [];
+  for (const spec of SUBTASK_TYPE_SPECS) {
+    if (spec.capability) blocks.push(spec.capability);
+  }
+  return blocks.join("\n\n");
+}
+
+export function renderDelegationGuidance(names: DelegationNames): string {
+  const sections: string[] = [];
+  for (const spec of SUBTASK_TYPE_SPECS) {
+    if (spec.delegationGuidance) sections.push(spec.delegationGuidance(names));
+  }
+  return sections.join("\n\n");
 }

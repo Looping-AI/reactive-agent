@@ -33,7 +33,11 @@ import {
   isCatalogEligible,
   type ReferenceCatalogEntry
 } from "./subtasks/catalog";
-import { SUBTASK_TYPE_KEYS } from "./subtasks/subtask-types";
+import {
+  renderDelegationGuidance,
+  SUBTASK_TYPE_KEYS,
+  type DelegationNames
+} from "./subtasks/subtask-types";
 import {
   DELEGATE_TOOL_NAME,
   delegateCallInput,
@@ -88,8 +92,12 @@ import type { CompositionBranch, SubtaskDraft } from "./subtasks/types";
  * index only** — see {@link renderTurnMessages}.
  */
 
-/** Prompt suffix teaching the round contract. Appended to the soul + caller context. */
-export const TURN_INSTRUCTIONS = `
+/**
+ * The round contract itself: how a round ends, and what `delegate` takes. True of
+ * every request, and it names no domain — what any individual Subtask type needs
+ * said about it is that type's to declare (see {@link TURN_INSTRUCTIONS}).
+ */
+export const ROUND_CONTRACT = `
 
 # Answering this request
 
@@ -163,28 +171,30 @@ If some work failed or was skipped, say plainly what you could not do, in one
 short sentence, without diagnostics or blame — then give them everything you did
 manage. Never present a partial answer as complete, and never invent a result for
 work that failed. If more work is genuinely needed, delegate again instead of
-guessing.
+guessing.`;
 
-## Playing an ARC-AGI-3 game
+/**
+ * Prompt suffix teaching the round contract. Appended to the soul + caller
+ * context.
+ *
+ * The contract, then whatever the delegable types have to say about being
+ * delegated — each declared by the type that owns it and collected from the
+ * manifest, so no domain is named in this file. Composed at module load, like the
+ * type enum interpolated above it; the guidance is a pure function of the
+ * manifest and cannot change between rounds.
+ */
+export const TURN_INSTRUCTIONS =
+  ROUND_CONTRACT +
+  guidanceSuffix({
+    delegateTool: DELEGATE_TOOL_NAME,
+    finalReplyTool: FINAL_REPLY_TOOL_NAME
+  });
 
-If the user asks for an ARC-AGI-3 game to be played (e.g. "play game ls20"),
-delegate **exactly one** subtask with "type": "arc-game", no dependencies and no
-other subtasks.
-
-That subtask must carry "params": { "game_id": "<id>" }, an exact id from
-\`arc_list_games\`. The param is what starts the play, and the "prompt" is never a
-substitute for it: a subtask whose "game_id" is missing is rejected and the whole
-call fails. Restate the request in the "prompt" as well (e.g. "Play the ARC-AGI-3
-game ls20."), so the subagent knows what it was asked for.
-
-If the request does not name a game, or names it loosely — a title, a level, "the
-one with the puzzles" — call \`arc_list_games\` first and delegate the id that
-matches. Never invent an id or pass through the user's wording as one. If nothing
-in the list matches well enough to choose, ask the user which game they mean with
-\`${FINAL_REPLY_TOOL_NAME}\` rather than guessing.
-
-This runs long — acknowledge in your "reply" that you have started playing and will
-report back, without promising a time.`;
+/** The rendered guidance as a suffix: its own separator, or nothing at all. */
+function guidanceSuffix(names: DelegationNames): string {
+  const guidance = renderDelegationGuidance(names);
+  return guidance ? `\n\n${guidance}` : "";
+}
 
 /**
  * Appended when the Task has spent its budget (see {@link RoundMode}). Neither

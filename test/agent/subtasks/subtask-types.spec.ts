@@ -15,7 +15,9 @@ import {
   SUBTASK_TYPES,
   SUBTASK_TYPE_KEYS,
   SubtaskParamsError,
+  renderDelegationGuidance,
   renderSubtaskTypes,
+  renderTypeCapabilities,
   resolveRecipeForType,
   subtaskParamProperties,
   subtaskTypeSpec,
@@ -186,6 +188,62 @@ describe("subtaskParamProperties", () => {
     // A blank id is refused here too, not just downstream: it would otherwise
     // reach the ARC API and fail there with no useful diagnostic.
     expect(subtaskParamProperties().game_id.safeParse("").success).toBe(false);
+  });
+});
+
+describe("the prompt text the manifest contributes", () => {
+  const NAMES = { delegateTool: "delegate", finalReplyTool: "final_reply" };
+
+  it("renders every declared block, and only those, in manifest order", () => {
+    const capabilities = renderTypeCapabilities();
+    const guidance = renderDelegationGuidance(NAMES);
+    const declared = SUBTASK_TYPE_SPECS.filter((s) => s.capability);
+    const guided = SUBTASK_TYPE_SPECS.filter((s) => s.delegationGuidance);
+
+    expect(declared.length).toBeGreaterThan(0);
+    expect(guided.length).toBeGreaterThan(0);
+    for (const spec of declared)
+      expect(capabilities).toContain(spec.capability);
+    for (const spec of guided) {
+      expect(guidance).toContain(spec.delegationGuidance!(NAMES));
+    }
+    // `general` declares neither: a catch-all needs no introduction beyond its
+    // one-line description, and every round would pay for one.
+    const general = subtaskTypeSpec(GENERAL_TYPE);
+    expect(general?.capability).toBeUndefined();
+    expect(general?.delegationGuidance).toBeUndefined();
+  });
+
+  it("carries its own separators and no stray ones", () => {
+    // Both call sites splice these into a prompt, so a leading or trailing blank
+    // line is theirs to add — a skipped type must cost nothing at all.
+    for (const rendered of [
+      renderTypeCapabilities(),
+      renderDelegationGuidance(NAMES)
+    ]) {
+      expect(rendered).toBe(rendered.trim());
+      expect(rendered).not.toContain("\n\n\n");
+    }
+  });
+
+  it("gives guidance the control-tool names rather than letting it hardcode them", () => {
+    // The whole reason guidance is a function: a domain may say "ask the user
+    // with `final_reply`" without importing anything from `agent/`.
+    const renamed = renderDelegationGuidance({
+      delegateTool: "hand_off",
+      finalReplyTool: "answer_now"
+    });
+    expect(renamed).toContain("answer_now");
+    expect(renamed).not.toContain("final_reply");
+  });
+
+  it("keeps every guidance section a section — its own `## ` heading", () => {
+    // Guidance is concatenated into a markdown prompt; a block that opens with
+    // prose would read as a continuation of whatever preceded it.
+    for (const spec of SUBTASK_TYPE_SPECS) {
+      if (!spec.delegationGuidance) continue;
+      expect(spec.delegationGuidance(NAMES).startsWith("## ")).toBe(true);
+    }
   });
 });
 
