@@ -75,19 +75,28 @@ export interface ControlTool {
    */
   readonly precedence: number;
   /**
-   * Turn this tool's calls from one attempt into the round's decision, or throw a
-   * {@link ControlCallError} describing what is wrong with them.
+   * Pick the one call that counts out of **every** call the attempt made to this
+   * tool, or throw a {@link ControlCallError} if a repeat is itself the error.
    *
-   * Takes **every** call the attempt made to this tool, not one input, because what
-   * a repeat means is the tool's own business: a second `delegate` would start a
-   * second batch of durable work and is refused, while a repeated `final_reply` is
-   * just the model restating its answer and the last one stands.
+   * Separate from {@link ControlTool.parse} because what a repeat means is the
+   * tool's own business — a second `delegate` would start a second batch of durable
+   * work and is refused, while a repeated `final_reply` is just the model restating
+   * its answer and the last one stands — and the round needs that answer *before* it
+   * has a decision: the call it shows back to the model in a repair has to be the
+   * same one validation rejected, not whichever happened to come first.
    *
-   * Inputs are `unknown` on purpose. Nothing has checked them yet — that is this
-   * method's job, and typing them as anything else would be the assumption that
+   * Never called with an empty array: a tool with no calls did not end the round.
+   */
+  select(inputs: readonly unknown[]): unknown;
+  /**
+   * Turn the selected call into the round's decision, or throw a
+   * {@link ControlCallError} describing what is wrong with it.
+   *
+   * The input is `unknown` on purpose. Nothing has checked it yet — that is this
+   * method's job, and typing it as anything else would be the assumption that
    * caused the hole this interface exists to close.
    */
-  parse(inputs: readonly unknown[]): TurnDecision;
+  parse(input: unknown): TurnDecision;
 }
 
 /**
@@ -111,10 +120,11 @@ export function controlTools(opts: {
       name: FINAL_REPLY_TOOL_NAME,
       tool: finalReplyTool,
       precedence: 0,
-      parse(inputs) {
-        // The last call of a repeated set: a model that restated its answer meant
-        // the restatement.
-        const parsed = finalReplyInputSchema.safeParse(inputs.at(-1));
+      // The last call of a repeated set: a model that restated its answer meant
+      // the restatement.
+      select: (inputs) => inputs.at(-1),
+      parse(input) {
+        const parsed = finalReplyInputSchema.safeParse(input);
         if (!parsed.success) {
           throw new ControlCallError(
             `${FINAL_REPLY_TOOL_NAME} input is invalid — ${issues(parsed.error)}`
@@ -130,14 +140,17 @@ export function controlTools(opts: {
       name: DELEGATE_TOOL_NAME,
       tool: delegateTool,
       precedence: 1,
-      parse(inputs) {
+      select(inputs) {
         if (inputs.length > 1) {
           throw new ControlCallError(
             `${DELEGATE_TOOL_NAME} was called ${inputs.length} times in one turn. ` +
               `Delegate once, with every subtask this round needs in that single call.`
           );
         }
-        const parsed = decompositionProposalSchema.safeParse(inputs[0]);
+        return inputs[0];
+      },
+      parse(input) {
+        const parsed = decompositionProposalSchema.safeParse(input);
         if (!parsed.success) {
           throw new ControlCallError(
             `${DELEGATE_TOOL_NAME} input is invalid — ${issues(parsed.error)}`

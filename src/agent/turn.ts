@@ -582,8 +582,15 @@ async function attempt(
       .sort((a, b) => b.control.precedence - a.control.precedence)[0];
 
     if (reached) {
+      // The call that counts, per the tool — a repeated `final_reply` means its
+      // last one. Held outside the `try` so a rejection shows the model *that*
+      // call and not whichever came first, which it may already have moved past.
+      // Only a `select` that throws leaves it unresolved, and that error is about
+      // the repeats themselves, so the first call represents them as well as any.
+      let subject: unknown = reached.inputs[0];
       try {
-        return { ok: true, decision: reached.control.parse(reached.inputs) };
+        subject = reached.control.select(reached.inputs);
+        return { ok: true, decision: reached.control.parse(subject) };
       } catch (error) {
         // The model ended the round but the call cannot be used. Repairable: it is
         // handed this error and asked again, rather than costing the whole slot.
@@ -592,7 +599,7 @@ async function attempt(
           error,
           rejected: {
             toolName: reached.control.name,
-            input: reached.inputs[0]
+            input: subject
           }
         };
       }

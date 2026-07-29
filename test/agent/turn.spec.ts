@@ -1305,6 +1305,35 @@ describe("runTurn — repairing a rejected control call", () => {
     expect(primary.calls()).toBe(2);
   });
 
+  it("shows back the repeated call that was actually rejected, not the first", async () => {
+    // `final_reply` takes the *last* of a repeated set — the restatement is what
+    // the model meant. So the restatement is what the rejection is about, and
+    // showing it the earlier call would ask it to fix something it moved past.
+    const primary = scripted(
+      {
+        toolCalls: [
+          { toolName: FINAL_REPLY_TOOL_NAME, input: { text: "a first draft" } },
+          { toolName: FINAL_REPLY_TOOL_NAME, input: { text: "   " } }
+        ]
+      },
+      finalReply("a real answer")
+    );
+
+    const outcome = await runPair(
+      modelPair(primary.factory, () => mockModel(finalReply("fallback")))
+    );
+
+    expect(outcome).toEqual({ status: "replied", reply: "a real answer" });
+    const call = primary.seen[1].prompt.at(-2);
+    expect(call?.content).toContainEqual(
+      expect.objectContaining({
+        type: "tool-call",
+        toolName: FINAL_REPLY_TOOL_NAME,
+        input: { text: "   " }
+      })
+    );
+  });
+
   it("lets the more committal ending win when two arrive together", async () => {
     const outcome = await runPair(
       modelPair(
