@@ -8,7 +8,13 @@ import { generateText, hasToolCall, isStepCount } from "ai";
 import type { SessionMessage } from "agents/experimental/memory/session";
 import { MAIN_AGENT_LIMITS, MAX_OUTPUT_TOKENS, MAX_SUBTASKS } from "@/config";
 import { stepAllowance, type TurnBudget } from "./budget";
-import { FINAL_REPLY_TOOL_NAME, finalReplyTool } from "./final-reply";
+import {
+  controlToolSet,
+  controlTools,
+  type ControlTool,
+  type TurnDecision
+} from "./control";
+import { FINAL_REPLY_TOOL_NAME } from "./final-reply";
 import {
   buildIntermediateContentHandler,
   isTransientAiError,
@@ -27,21 +33,15 @@ import {
   isCatalogEligible,
   type ReferenceCatalogEntry
 } from "./subtasks/catalog";
-import { resolveDecomposition } from "./subtasks/decomposition";
 import { SUBTASK_TYPE_KEYS } from "./subtasks/subtask-types";
 import {
   DELEGATE_TOOL_NAME,
   delegateCallInput,
   delegateCallOutput,
-  delegateTool,
   delegateToolCallId
 } from "./subtasks/delegate";
 import type { ModelPair } from "./model";
-import type {
-  CompositionBranch,
-  DecompositionProposal,
-  SubtaskDraft
-} from "./subtasks/types";
+import type { CompositionBranch, SubtaskDraft } from "./subtasks/types";
 
 /**
  * One **round** of the main agent: a single inference over the agent's continuous
@@ -61,11 +61,13 @@ import type {
  *   the budget forced — looking something up before answering is ordinary work,
  *   not a special phase, right up until there is nothing left to spend on it
  *   (see {@link RoundMode}).
- * - **Control tools** — {@link delegateTool} and {@link finalReplyTool} — have no
- *   `execute`. The call *is* the round's output: the loop halts on it, and for
- *   `delegate` the Workflow performs it durably. A future `escalate` (ask the
- *   human) is the same shape: another variant of {@link TurnDecision}, another
- *   `case` in the Workflow's switch.
+ * - **Control tools** — `delegate` and `final_reply` — have no `execute`. The call
+ *   *is* the round's output: the loop halts on it, and for `delegate` the Workflow
+ *   performs it durably. Because the loop halts, the SDK never validates their
+ *   input either, so each one checks its own and the round repairs what it rejects
+ *   — see {@link file://./control.ts control.ts}. A future `escalate` (ask the
+ *   human) is the same shape: another entry there, another variant of
+ *   {@link TurnDecision}, another `case` in the Workflow's switch.
  *
  * Nothing forces the *choice*, and that is deliberate. An earlier design pinned
  * `toolChoice` to a specific tool to force delegation in one phase and forbid it in
@@ -165,11 +167,24 @@ guessing.
 
 ## Playing an ARC-AGI-3 game
 
-If the user asks you to play an ARC-AGI-3 game (e.g. "play game ls20"), delegate
-**exactly one** subtask with "type": "arc-game", no dependencies and no other
-subtasks. Put the game the user named verbatim in its "prompt" (e.g. "Play the
-ARC-AGI-3 game ls20."). This runs long — acknowledge in your "reply" that you have
-started playing and will report back, without promising a time.`;
+If the user asks for an ARC-AGI-3 game to be played (e.g. "play game ls20"),
+delegate **exactly one** subtask with "type": "arc-game", no dependencies and no
+other subtasks.
+
+That subtask must carry "params": { "game_id": "<id>" }, an exact id from
+\`arc_list_games\`. The param is what starts the play, and the "prompt" is never a
+substitute for it: a subtask whose "game_id" is missing is rejected and the whole
+call fails. Restate the request in the "prompt" as well (e.g. "Play the ARC-AGI-3
+game ls20."), so the subagent knows what it was asked for.
+
+If the request does not name a game, or names it loosely — a title, a level, "the
+one with the puzzles" — call \`arc_list_games\` first and delegate the id that
+matches. Never invent an id or pass through the user's wording as one. If nothing
+in the list matches well enough to choose, ask the user which game they mean with
+\`${FINAL_REPLY_TOOL_NAME}\` rather than guessing.
+
+This runs long — acknowledge in your "reply" that you have started playing and will
+report back, without promising a time.`;
 
 /**
  * Appended when the Task has spent its budget (see {@link RoundMode}). Neither
@@ -371,11 +386,6 @@ export function joinSuccessfulBranches(branches: CompositionBranch[]): string {
   return incomplete ? `${body}\n\n${PARTIAL_NOTE}` : body;
 }
 
-/** What one round decided. A future `escalate` is another variant here. */
-export type TurnDecision =
-  | { kind: "reply"; text: string }
-  | { kind: "delegate"; proposal: DecompositionProposal };
-
 /**
  * How much rope this round gets, decided by the Workflow from the Task's spent
  * budget.
@@ -442,8 +452,28 @@ export type RunTurnOutcome =
   | { status: "delegated"; reply: string; drafts: SubtaskDraft[] }
   | { status: "failed"; error: string };
 
+/**
+ * A control call the round refused, kept so it can be handed back to the model
+ * verbatim. `input` is whatever the model actually sent — unvalidated by
+ * definition, since failing validation is why it is here.
+ */
+interface RejectedCall {
+  toolName: string;
+  input: unknown;
+}
+
+/**
+ * What one attempt produced.
+ *
+ * The two failure shapes are the whole point of the split. `rejected` present means
+ * the model reached an ending and got its *shape* wrong — repairable, and by the
+ * same model, which now has something specific to fix. `rejected` absent means the
+ * attempt produced no ending at all, which no amount of feedback can address and
+ * which is what the fallback slot exists for.
+ */
 type Attempt =
-  { ok: true; decision: TurnDecision } | { ok: false; error: unknown };
+  | { ok: true; decision: TurnDecision }
+  | { ok: false; error: unknown; rejected?: RejectedCall };
 
 /**
  * One attempt against a single model: let it work, and take whichever ending it
@@ -454,16 +484,14 @@ type Attempt =
  * model still gets its turn.
  *
  * The model uses its work tools freely — answering well can genuinely need a
- * lookup or a recall — and the loop ends by calling one of the two control tools.
- * Neither has an `execute`, so there is nothing to continue from and the loop halts
- * on the call. A `delegate` alongside a `final_reply` is an acknowledgment paired
- * with the work it acknowledges: delegating wins.
+ * lookup or a recall — and the loop ends by calling a control tool. None has an
+ * `execute`, so there is nothing to continue from and the loop halts on the call.
+ * Two endings in one step are resolved by {@link ControlTool.precedence}.
  *
- * Every deterministic failure collapses to `{ ok: false }`: the SDK rejects a call
- * whose input violates the schema (`InvalidToolInputError`) or names an unknown
- * tool (`NoSuchToolError`), and a run that ended without a control call — burning
- * the turn budget mid-tool-use, or answering in prose despite
- * `toolChoice: "required"` — is caught below.
+ * Every control call is then parsed by the tool that owns it, because nothing else
+ * has: an execute-less tool's input never passes through the SDK's validation (see
+ * {@link file://./control.ts control.ts}). A parse failure comes back as `rejected`
+ * — a repairable failure, not a dead attempt.
  *
  * Charges the budget as it goes, whether it succeeds or not: a failed attempt cost
  * exactly as much as a successful one, and a call that died on its fourth step
@@ -471,17 +499,12 @@ type Attempt =
  */
 async function attempt(
   args: RunTurnArgs,
+  control: ControlTool[],
   model: () => LanguageModel,
   instructions: string,
   messages: ModelMessage[]
 ): Promise<Attempt> {
   const final = args.mode === "final";
-  // `final_reply` is declared on every round, including the one that may not
-  // delegate — otherwise the final round would have no legal way to end.
-  const controlTools: ToolSet = {
-    [FINAL_REPLY_TOOL_NAME]: finalReplyTool,
-    ...(final ? {} : { [DELEGATE_TOOL_NAME]: delegateTool })
-  };
   // A `final` round is handed nothing to work with, only the way out. Leaving the
   // work tools on would invite it to spend a budget it has already spent — and
   // the composing round has every branch result in its messages already, so the
@@ -512,7 +535,7 @@ async function attempt(
       // the two endings are the thing every round has to reach. Work tool names
       // are compile-time constants and none collides with a control name, so the
       // spread order costs nothing.
-      tools: { ...controlTools, ...workTools },
+      tools: { ...controlToolSet(control), ...workTools },
       // Every ending is a control call, so the model must always call something.
       // Work tools stay freely available — `required` constrains the *shape* of a
       // step's output, not which tool is chosen.
@@ -520,8 +543,9 @@ async function attempt(
       maxOutputTokens: MAX_OUTPUT_TOKENS,
       stopWhen: [
         isStepCount(stepBudget),
-        hasToolCall(DELEGATE_TOOL_NAME),
-        hasToolCall(FINAL_REPLY_TOOL_NAME)
+        // Halt on any ending this round declares, so a new control tool needs no
+        // change here.
+        ...control.map((c) => hasToolCall(c.name))
       ],
       // We do our own primary → fallback recovery, so disable the SDK's
       // per-model backoff (it would only add latency and duplicate the fallback).
@@ -534,41 +558,34 @@ async function attempt(
       }
     });
 
-    const delegates = result.toolCalls.filter(
-      (c) => c.toolName === DELEGATE_TOOL_NAME
-    );
-    if (delegates.length > 1) {
-      return {
-        ok: false,
-        error: new Error(
-          `model called ${DELEGATE_TOOL_NAME} ${delegates.length} times in one turn`
-        )
-      };
-    }
-    if (delegates.length === 1) {
-      // Already schema-validated by the SDK against the tool's `inputSchema`.
-      // Delegating wins over a `final_reply` emitted in the same step: the reply
-      // is the acknowledgment for the work, not an answer instead of it.
-      return {
-        ok: true,
-        decision: {
-          kind: "delegate",
-          proposal: delegates[0].input as DecompositionProposal
-        }
-      };
-    }
+    // The most committal ending the model reached, and every call it made to that
+    // tool. Ranking by precedence rather than by position keeps "which ending
+    // wins" a property the tools declare, not a chain of ifs here.
+    const reached = control
+      .map((c) => ({
+        control: c,
+        inputs: result.toolCalls
+          .filter((call) => call.toolName === c.name)
+          .map((call) => call.input as unknown)
+      }))
+      .filter((c) => c.inputs.length > 0)
+      .sort((a, b) => b.control.precedence - a.control.precedence)[0];
 
-    const replies = result.toolCalls.filter(
-      (c) => c.toolName === FINAL_REPLY_TOOL_NAME
-    );
-    if (replies.length >= 1) {
-      // Schema-validated too, including the non-blank refinement — so the last
-      // call of a repeated set is a complete reply, not an empty one.
-      const { text } = replies[replies.length - 1].input as { text: string };
-      return {
-        ok: true,
-        decision: { kind: "reply", text: text.trim() }
-      };
+    if (reached) {
+      try {
+        return { ok: true, decision: reached.control.parse(reached.inputs) };
+      } catch (error) {
+        // The model ended the round but the call cannot be used. Repairable: it is
+        // handed this error and asked again, rather than costing the whole slot.
+        return {
+          ok: false,
+          error,
+          rejected: {
+            toolName: reached.control.name,
+            input: reached.inputs[0]
+          }
+        };
+      }
     }
 
     // No control call. Either the model ran out of steps mid-tool-use, or it
@@ -595,6 +612,89 @@ async function attempt(
 }
 
 /**
+ * How many times one model may be shown its own rejected control call and asked
+ * again, before the round gives up on that slot.
+ *
+ * Repair belongs to the **slot**, not the round. A rejected call is not evidence
+ * that a model is unavailable — it is a model that understood the request and got
+ * the shape wrong, which is the one failure it can actually fix once it is shown
+ * the rejection. Falling straight through to the fallback instead spends a whole
+ * second model on a fresh guess that has no idea the first one failed: that is how
+ * two slots produced the identical missing-`game_id` error and killed a round
+ * either of them could have repaired.
+ *
+ * The fallback keeps its real job — covering a primary that could not answer at
+ * all — and is still reached once repairs run out, since a model that cannot get
+ * the shape right in four tries has earned a second opinion.
+ */
+const MAX_REPAIR_ATTEMPTS = 3;
+
+/**
+ * The id a repaired exchange is anchored on, derived from the Task and round like
+ * every other id here. Suffixed per repair, so several rejected calls can sit in
+ * one attempt's messages without colliding.
+ */
+function controlCallId(taskId: string, round: number): string {
+  return `task:${taskId}:round:${round}:control`;
+}
+
+/**
+ * A rejected control call paired with its rejection, as the exchange the model has
+ * to see in order to fix it.
+ *
+ * This is deliberately the same shape the SDK produces for a work tool that failed
+ * — the call, then an `error-text` result carrying the reason. A work tool gets
+ * this for free and models already know how to read it; a control tool halts the
+ * loop before the SDK can, so the round builds it by hand. Nothing here is
+ * specific to which control tool was refused.
+ *
+ * Shaped as a real tool exchange rather than a prose "that was wrong" user turn,
+ * because that is what it is — and an assistant tool-call with no matching result
+ * is a malformed message list to every provider.
+ *
+ * Entirely ephemeral. These messages exist for the next `generateText` call and are
+ * never appended to the Session: the durable record of a round is the ending it
+ * landed on, and a call that was thrown out is not something a later round should
+ * be able to read back as history.
+ */
+function repairExchange(
+  toolCallId: string,
+  rejected: RejectedCall,
+  error: unknown
+): ModelMessage[] {
+  return [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool-call",
+          toolCallId,
+          toolName: rejected.toolName,
+          input: rejected.input
+        }
+      ]
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId,
+          toolName: rejected.toolName,
+          output: {
+            type: "error-text",
+            value:
+              `${String(error)}\n\n` +
+              `The round did not end and nothing was started. Call ${rejected.toolName} ` +
+              `again, keeping the parts that were fine and fixing only what the error names.`
+          }
+        }
+      ]
+    }
+  ];
+}
+
+/**
  * Run one round against the continuous Session: append the user turn (round 0),
  * let the model decide over the indexed history, validate any delegation against
  * this round's catalog, and persist what the user will see.
@@ -602,10 +702,16 @@ async function attempt(
  * Every append uses a deterministic id, so a Workflow-step re-run neither
  * duplicates the turn nor changes an already-delivered reply.
  *
+ * Two nested recoveries, and they answer different failures. Within a slot, a
+ * decomposition the catalog rejects is handed back to the *same* model as a failed
+ * tool result, up to {@link MAX_REPAIR_ATTEMPTS} times — a shape error is the one
+ * thing a model can fix once it sees it. Across slots, an attempt that produced no
+ * decision at all moves to the fallback model, which is what that slot is for.
+ *
  * Throws only on a transient platform fault (for the Workflow step to retry).
- * A deterministic double-model failure with durable work behind it degrades to
- * {@link joinSuccessfulBranches} rather than discarding completed branches; with
- * nothing behind it, it resolves to `{ status: "failed" }`.
+ * A deterministic failure that outlasts every repair on both slots, with durable
+ * work behind it, degrades to {@link joinSuccessfulBranches} rather than discarding
+ * completed branches; with nothing behind it, it resolves to `{ status: "failed" }`.
  */
 export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
   const { session, taskId, round, text, systemSuffix, models, branches } = args;
@@ -625,6 +731,12 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
     TURN_INSTRUCTIONS +
     (args.mode === "final" ? FINAL_ROUND_INSTRUCTIONS : "");
 
+  // This round's endings, built with the catalog a `delegate` is checked against.
+  const control = controlTools({
+    catalog,
+    delegable: args.mode !== "final"
+  });
+
   const diagnostics: string[] = [];
   const errors: unknown[] = [];
 
@@ -633,66 +745,89 @@ export async function runTurn(args: RunTurnArgs): Promise<RunTurnOutcome> {
       slot === "primary" ? models.primaryId() : models.fallbackId();
     const model = slot === "primary" ? models.primary : models.fallback;
 
-    // Both slots draw on the one `args.budget`, which each attempt reads on entry
-    // and charges as it works. A fallback attempt is spend, not a free retry.
-    const outcome = await attempt(args, model, system, messages);
-    if (!outcome.ok) {
-      errors.push(outcome.error);
-      diagnostics.push(`${slot} (${modelId}): ${String(outcome.error)}`);
-      console.warn("[turn] model attempt failed", {
-        taskId,
-        round,
-        model: modelId,
-        error: String(outcome.error)
-      });
-      continue;
-    }
+    // This slot's own view: the round's messages plus whatever repair exchange it
+    // accumulates. A fresh copy per slot, so a fallback that is reached is never
+    // handed the primary's rejected calls to be confused by.
+    const slotMessages = [...messages];
 
-    if (outcome.decision.kind === "reply") {
-      // A throw here is a storage fault: it propagates so the step retries.
-      const reply = await appendOnce(
+    for (let repair = 0; repair <= MAX_REPAIR_ATTEMPTS; repair += 1) {
+      // Both slots draw on the one `args.budget`, which each attempt reads on entry
+      // and charges as it works. A fallback attempt is spend, not a free retry —
+      // and so is a repair.
+      const outcome = await attempt(args, control, model, system, slotMessages);
+
+      if (!outcome.ok) {
+        errors.push(outcome.error);
+        const { rejected } = outcome;
+        diagnostics.push(
+          rejected
+            ? `${slot} (${modelId}, attempt ${repair + 1}): ${String(outcome.error)}`
+            : `${slot} (${modelId}): ${String(outcome.error)}`
+        );
+        console.warn(
+          rejected
+            ? "[turn] control call rejected"
+            : "[turn] model attempt failed",
+          {
+            taskId,
+            round,
+            model: modelId,
+            ...(rejected ? { tool: rejected.toolName, repair } : {}),
+            error: String(outcome.error)
+          }
+        );
+
+        // No rejected call means no ending to correct — the attempt produced
+        // nothing, which is the failure the fallback slot exists for.
+        //
+        // Otherwise repair, while this slot has both attempts and turns left. Past
+        // the allowance every attempt gets `stepAllowance`'s one-step floor, which
+        // is enough to reach an ending but not to reconsider one — so retrying
+        // there buys a worse call at a real cost.
+        if (
+          rejected &&
+          repair < MAX_REPAIR_ATTEMPTS &&
+          args.budget.spent < args.budget.allowance
+        ) {
+          slotMessages.push(
+            ...repairExchange(
+              `${controlCallId(taskId, round)}:repair:${repair}`,
+              rejected,
+              outcome.error
+            )
+          );
+          continue;
+        }
+        break;
+      }
+
+      if (outcome.decision.kind === "reply") {
+        // A throw here is a storage fault: it propagates so the step retries.
+        const reply = await appendOnce(
+          session,
+          deterministicSessionMessage(
+            finalReplyMessageId(taskId),
+            "assistant",
+            outcome.decision.text
+          )
+        );
+        return { status: "replied", reply };
+      }
+
+      const stored = await appendOnce(
         session,
         deterministicSessionMessage(
-          finalReplyMessageId(taskId),
+          roundAckMessageId(taskId, round),
           "assistant",
-          outcome.decision.text
+          outcome.decision.reply
         )
       );
-      return { status: "replied", reply };
+      return {
+        status: "delegated",
+        reply: stored,
+        drafts: outcome.decision.drafts
+      };
     }
-
-    let resolved: ReturnType<typeof resolveDecomposition>;
-    try {
-      // Validation failure counts as an attempt failure: the other model gets a
-      // chance to produce a usable graph before the round fails. Scoped tightly to
-      // the validation itself — a Session write is not a model problem, and must
-      // not be retried against the fallback or reported as bad model output.
-      resolved = resolveDecomposition(outcome.decision.proposal, catalog);
-    } catch (error) {
-      errors.push(error);
-      diagnostics.push(`${slot} (${modelId}): ${String(error)}`);
-      console.warn("[turn] invalid delegation", {
-        taskId,
-        round,
-        model: modelId,
-        error: String(error)
-      });
-      continue;
-    }
-
-    const stored = await appendOnce(
-      session,
-      deterministicSessionMessage(
-        roundAckMessageId(taskId, round),
-        "assistant",
-        resolved.reply
-      )
-    );
-    return {
-      status: "delegated",
-      reply: stored,
-      drafts: resolved.drafts
-    };
   }
 
   // A transient fault is not a decision failure — let the step retry rather than

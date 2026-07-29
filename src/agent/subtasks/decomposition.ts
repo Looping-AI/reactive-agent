@@ -48,14 +48,19 @@ export class DecompositionValidationError extends Error {
  * A required string that is not whitespace.
  *
  * Written as a `.regex()` rather than the equivalent `.refine()`, deliberately.
- * Both are enforced by the SDK (which validates tool input with the zod schema),
- * but a refinement is **invisible to the model**: custom checks do not survive
- * JSON-Schema conversion, so the rule would be one the model is held to without
- * ever being shown it — and a whitespace-only value then throws out of
- * `generateText` as an `InvalidToolInputError` rather than never being emitted.
+ * Both are enforced wherever this schema is actually run, but a refinement is
+ * **invisible to the model**: custom checks do not survive JSON-Schema conversion,
+ * so the rule would be one the model is held to without ever being shown it.
  * `/\S/` converts to `"pattern": "\\S"` next to `"minLength": 1`, so the
  * constraint reaches the model as part of the tool schema, on every field, with
  * no per-field `.describe()` needed to restate it.
+ *
+ * Being shown a rule is not the same as being held to it, and the difference used
+ * to be a hole. This schema reaches the model through a **control** tool, which has
+ * no `execute` — so the SDK's input validation never ran on it, and a blank value
+ * the model was shown the pattern for sailed through anyway. What enforces it is
+ * {@link file://../control.ts control.ts}, which parses every control call with its
+ * own schema before the round uses it.
  */
 export const nonBlank = (label: string) =>
   z

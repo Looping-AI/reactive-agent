@@ -35,12 +35,24 @@ export const FINAL_REPLY_TOOL_NAME = "final_reply";
  * text-only by design). The tool exists to constrain *generation*, not to become a
  * new shape in the transcript.
  */
+/**
+ * The call's input, exported as the zod schema rather than only as the tool's
+ * `inputSchema`, because the round has to run it itself.
+ *
+ * A tool with no `execute` never has its input validated by the SDK — the loop
+ * halts on the call and nothing checks it. That is what let a blank `text` through
+ * to the user despite {@link nonBlank}. The round now parses every control call
+ * with the tool's own schema before using it (see
+ * {@link file://./control.ts control.ts}), and needs the schema in hand to do it.
+ */
+export const finalReplyInputSchema = z.object({
+  text: nonBlank("text").describe(
+    "Your reply, in your own voice. This is shown to the user verbatim, so it must be the complete answer and must not be blank."
+  )
+});
+
 export const finalReplyTool = tool({
   description:
     "Answer the user and end this round. Use this whenever the request is yours to answer — anything about this conversation, your own history, memory, or tools, and anything you can settle with the tools available to you here, including work that has already come back to you.",
-  inputSchema: z.object({
-    text: nonBlank("text").describe(
-      "Your reply, in your own voice. This is shown to the user verbatim, so it must be the complete answer and must not be blank."
-    )
-  })
+  inputSchema: finalReplyInputSchema
 });
