@@ -77,38 +77,37 @@ export const subtasks = sqliteTable(
 );
 
 /**
- * ARC-AGI-3 scorecards the main agent has opened.
+ * ARC-AGI-3 scorecards, as a **recency ledger** rather than a lifecycle.
  *
- * The API has no endpoint that lists scorecards, so this table *is* the list —
- * `arc_list_scorecards` is a pure read of it. One row per `card_id`, inserted by
- * `arc_open_scorecard` and closed by `arc_close_scorecard`, which persists the
- * terminal aggregate as `summary_json`.
+ * The API auto-closes a card after ~15 minutes idle, so nothing here ever closes
+ * one and there is no open/closed state worth keeping: a card used recently is
+ * live, an older one is gone. `last_used_at` is that clock, bumped every time a
+ * play resolves onto the card, and the only column anything queries by — see
+ * `resolveScorecard` in `recipes/arc-game/scorecard.ts`.
  *
- * Rows are **never deleted** (no `cleanup()`, unlike {@link notifyTasks} and
- * {@link subtasks}): a closed card cannot be re-read from the API, so the stored
- * summary is the only lasting record of a score.
+ * Unlike the old shape, rows carry nothing irreplaceable (a score is read back
+ * from the API with `GET /api/scorecard/{card_id}`), so they are swept by the
+ * weekly cron exactly like {@link notifyTasks} and {@link subtasks}.
  *
  * Nothing here binds a card to a Subtask. A scorecard is not owned by one unit of
- * work — the main agent may hand the same card to several plays — so the card a
- * subagent uses travels in its prompt, not in a column.
+ * work — several concurrent plays share the live card — so the card a subagent
+ * uses travels in its resolved runtime, not in a column.
  */
 export const scorecards = sqliteTable(
   "scorecards",
   {
     /** The ARC-assigned card id (a uuid). */
     cardId: text("card_id").primaryKey(),
-    status: text("status").notNull().default("open"),
     /**
      * JSON cookie jar from `POST /api/scorecard/open`. The ARC API pins a card to
      * the session that opened it: without these cookies the card is invisible —
-     * RESET reports the game as not found and close 404s — so the jar is part of
-     * the card's identity, not an optimization.
+     * RESET reports the game as not found — so the jar is part of the card's
+     * identity, not an optimization.
      */
     cookiesJson: text("cookies_json").notNull().default("{}"),
     openedAt: integer("opened_at").notNull(),
-    closedAt: integer("closed_at"),
-    /** JSON `ScorecardSummary` from `POST /api/scorecard/close`; null until closed. */
-    summaryJson: text("summary_json")
+    /** Last time a play resolved onto this card — the reuse clock. */
+    lastUsedAt: integer("last_used_at").notNull()
   },
-  (table) => [index("idx_scorecards_opened_at").on(table.openedAt)]
+  (table) => [index("idx_scorecards_last_used_at").on(table.lastUsedAt)]
 );

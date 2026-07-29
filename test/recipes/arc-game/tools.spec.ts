@@ -109,16 +109,18 @@ function stubFetchCapturing(routes: Record<string, () => unknown>) {
 }
 
 describe("arc-game tool family", () => {
-  it("resets onto the card its params named and persists the session", async () => {
+  it("resets onto the leased card and persists the session", async () => {
     const hits = stubFetch({ "/api/cmd/RESET": () => FRAME() });
     const { ctx: c } = ctx("test-key", {
-      params: { card_id: "card-7", game_id: "ls20-abc" }
+      params: { game_id: "ls20-abc" },
+      runtime: { cardId: "card-7" }
     });
     const { tools } = buildArcGameTools(c);
 
     const out = await callTool(tools.arc_reset_game, {});
     expect(out).toContain("Started ls20-abc");
-    expect(out).toContain("card-7");
+    // The card is not the model's business, so it is not narrated back to it.
+    expect(out).not.toContain("card-7");
 
     const session = await c.workspace.readJson<ArcSession>("arc/session.json");
     expect(session?.cardId).toBe("card-7");
@@ -131,10 +133,11 @@ describe("arc-game tool family", () => {
     expect(hits).not.toContain("/api/scorecard/open");
   });
 
-  it("takes its ids from params, not from the model", async () => {
+  it("takes its ids from params and runtime, not from the model", async () => {
     const bodies = stubFetchCapturing({ "/api/cmd/RESET": () => FRAME() });
     const { ctx: c } = ctx("test-key", {
-      params: { card_id: "card-7", game_id: "ls20-abc" }
+      params: { game_id: "ls20-abc" },
+      runtime: { cardId: "card-7" }
     });
     const { tools } = buildArcGameTools(c);
 
@@ -144,6 +147,28 @@ describe("arc-game tool family", () => {
       game_id: "ls20-abc",
       card_id: "card-7"
     });
+  });
+
+  it("keeps a play on its own card when the lease has since rolled over", async () => {
+    // A play's later runs must land on the card its earlier runs did, or the
+    // scorecard splits one game across two cards.
+    const bodies = stubFetchCapturing({
+      "/api/cmd/RESET": () => FRAME({ state: "GAME_OVER" })
+    });
+    const { ctx: first } = ctx("test-key", {
+      params: { game_id: "ls20-abc" },
+      runtime: { cardId: "card-old" }
+    });
+    await callTool(buildArcGameTools(first).tools.arc_reset_game, {});
+
+    // Same workspace, new lease: the second RESET must still name the old card.
+    const second: typeof first = { ...first, runtime: { cardId: "card-new" } };
+    await callTool(buildArcGameTools(second).tools.arc_reset_game, {});
+
+    expect(bodies[1]).toMatchObject({ card_id: "card-old" });
+    const session =
+      await first.workspace.readJson<ArcSession>("arc/session.json");
+    expect(session?.cardId).toBe("card-old");
   });
 
   it("presents the parent's stored jar on the first RESET", async () => {

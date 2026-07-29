@@ -2,16 +2,16 @@
  * ARC-AGI-3 REST API + session types. The API plays a visual-reasoning game on a
  * 64×64 grid of color values 0–15; see https://docs.arcprize.org.
  *
- * Two lifecycles meet here, and they are owned by different agents:
+ * Two lifecycles meet here, and neither belongs to a model:
  *
- * - The **scorecard** is a container that aggregates many plays, opened and
- *   closed by the main agent and recorded in its DO SQLite (`db.scorecards`).
- *   Its terminal {@link ScorecardSummary} is the score the user is told.
+ * - The **scorecard** is a container that aggregates many plays. The API opens
+ *   one on request and auto-closes it after ~15 minutes idle, so nothing here
+ *   ever closes one: the parent leases the most recently used card and records it
+ *   in its DO SQLite (`db.scorecards`) purely to know how fresh it is.
  * - A **play** is one RESET→ACTION* run inside a scorecard, driven by a subagent.
  *   All state that must survive across durable chunks (cookies, guid, frames,
  *   metrics) lives in the workspace as {@link ArcSession}, written by the tool
- *   family. A subagent is told its `card_id` in its prompt; it never opens or
- *   closes one.
+ *   family. A subagent is handed a resolved card; it never opens or chooses one.
  */
 
 /** Game lifecycle state as the API reports it. */
@@ -54,12 +54,21 @@ export interface ScorecardRun {
   resets: number;
   score: number;
   state: GameState;
+  /** Actions spent on each level of this run. */
   level_actions?: number[];
+  /** The human baseline each level is scored against. */
   level_baseline_actions?: number[];
   level_scores?: number[];
 }
 
-/** One game's aggregate within a scorecard — every run played against it. */
+/**
+ * One game's aggregate within a scorecard — every run played against it.
+ *
+ * This is the **only** game-scoped part of the response: every top-level field of
+ * {@link ScorecardSummary} covers the whole card. Since several games share one
+ * card by design, reporting a card-level total as a game's own is a real
+ * mislabeling — so the renderer reads nothing but this entry.
+ */
 export interface ScorecardEnvironment {
   id: string;
   actions: number;
@@ -82,10 +91,17 @@ export interface ScorecardTagScore {
 }
 
 /**
- * The body `POST /api/scorecard/close` returns: the whole card's result, one
- * `environments` entry per game played and one `runs` entry per RESET within it.
- * There is no endpoint to re-read a closed card, so this is persisted verbatim on
- * the scorecard row and is the only lasting record of a score.
+ * A whole scorecard as `GET /api/scorecard/{card_id}` reports it: one
+ * `environments` entry per game played, one `runs` entry per RESET within it.
+ *
+ * This is a **read**, not a terminal event — it works while the card is still
+ * open, which is what lets a result be reported without anything ever closing a
+ * card. (It is the same shape the retired close call returned, which is why it
+ * carries a real per-game `score`.)
+ *
+ * The narrower `GET /api/scorecard/{card_id}/{game_id}` is deliberately *not*
+ * used: it reports no score at all, and its top-level totals are card-wide
+ * despite the game filter — verified against the live API.
  */
 export interface ScorecardSummary {
   card_id: string;
@@ -100,27 +116,25 @@ export interface ScorecardSummary {
   tags_scores?: ScorecardTagScore[];
 }
 
-/** Whether a scorecard is still accepting plays. */
-export type ScorecardStatus = "open" | "closed";
-
 /**
- * One scorecard as the main agent's DO SQLite records it (see `db/schema.ts`).
- * `summary` is null until the card is closed, and is the persisted
- * {@link ScorecardSummary} thereafter.
+ * One scorecard as the agent's DO SQLite records it (see `db/schema.ts`).
+ *
+ * There is no status: the API auto-closes an idle card, so liveness is inferred
+ * from {@link lastUsedAt} rather than tracked. A card is a lease, not an object
+ * with a lifecycle.
  */
 export interface Scorecard {
   cardId: string;
-  status: ScorecardStatus;
   /**
    * The jar `POST /api/scorecard/open` returned. The API pins the card to that
-   * session — every later RESET, ACTION, and close must echo these cookies, from
-   * whichever agent makes the call — so it is stored with the card, not held by
-   * whoever happened to open it.
+   * session — every later RESET, ACTION, and scorecard read must echo these
+   * cookies, from whichever agent makes the call — so it is stored with the card,
+   * not held by whoever happened to open it.
    */
   cookies: CookieJar;
   openedAt: number;
-  closedAt: number | null;
-  summary: ScorecardSummary | null;
+  /** Last time a play resolved onto this card; the reuse clock. */
+  lastUsedAt: number;
 }
 
 /** Session-affinity cookie jar (AWSALB*), echoed on every request of a session. */
@@ -146,7 +160,12 @@ export interface PlaySummary {
  * {@link plays} first, and `playIndex` keeps per-play progress keys distinct.
  */
 export interface ArcSession {
-  /** The scorecard this session plays on, as the subagent was told in its prompt. */
+  /**
+   * The scorecard this session plays on, pinned at the first RESET from the card
+   * the parent resolved. Pinned rather than re-read each chunk: if the lease rolls
+   * over onto a new card mid-execution, this play must finish on the card its
+   * runs already belong to.
+   */
   cardId: string;
   gameId: string;
   guid: string;

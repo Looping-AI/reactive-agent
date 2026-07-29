@@ -1,6 +1,5 @@
 import { env } from "cloudflare:workers";
 import type { GatewayIdentity } from "@/a2a/verify";
-import type { Scorecard } from "@/recipes/arc-game/types";
 
 /**
  * The agent's soul — its frozen identity + operating rules. Kept as an array of
@@ -22,19 +21,18 @@ const BROWSER_CAPABILITY =
   "You can read live web pages with the `browser_*` tools — use `browser_markdown` to read a page and `browser_extract` to pull out specific fields.";
 
 /**
- * ARC-AGI-3: you own the scorecard, subagents only play. The `arc-game` type's
- * params contract enforces that a play names a card and a game at all; whether
- * that card is a *sensible* one — not already busy, closed prematurely — is a
- * judgement no code path can make, so the scorecard lifecycle rules are stated
- * plainly here.
+ * ARC-AGI-3: subagents play, and nobody manages a scorecard. The card used to be
+ * this agent's to open, choose and close, which made every play depend on it
+ * getting bookkeeping right for a lifecycle the API already manages. It is now
+ * leased by the recipe and invisible here, so all that is left to state is how to
+ * ask for a game and where the score turns up.
  */
 const ARC_CAPABILITY = [
-  "You can run ARC-AGI-3 games. You own the **scorecard** — a container that collects the results of the games played on it — and subagents do the playing:",
-  "- `arc_list_games` shows the available games with their exact ids; `arc_open_scorecard` opens a card; `arc_list_scorecards` shows your cards and the scores of the closed ones; `arc_close_scorecard` ends a card and returns its final score.",
-  "- To have a game played, open a scorecard, then delegate a subtask of type `arc-game` with params `card_id` (the card you opened) and `game_id` (an exact id from `arc_list_games`). The subagent is given both; it cannot choose or look up either.",
-  "- Give two plays of the SAME game two different scorecards — sharing one card would have them playing the same game at the same time.",
-  "- Reuse the same scorecard across multiple games — there is no need to close and reopen one between plays. Close a card only when: (a) the user explicitly asks you to, (b) all levels of every game on the card are done and the user wants the final score, or (c) `arc_reset_game` fails in a way that bricks the card, in which case closing it and opening a fresh one is the remedy. Closing is otherwise final and irreversible — do not close prematurely.",
-  "- The score comes from closing the card. Report it to the user rather than inventing one."
+  "You can run ARC-AGI-3 games, played for you by subagents:",
+  "- `arc_list_games` shows the available games with their exact ids and tags describing how each is played.",
+  "- To have a game played, delegate a subtask of type `arc-game` with param `game_id` (an exact id from `arc_list_games`). That is the whole contract — there is no scorecard for you to open, choose, or close.",
+  "- To have several games played, delegate one `arc-game` subtask per game; they run concurrently.",
+  "- Each play's report ends with that game's score, read from the scorecard once the play finishes. Report that score rather than inventing one — and if a report carries no score line, say the score was unavailable."
 ].join("\n");
 
 /** The frozen soul as a single system-prompt string. */
@@ -45,23 +43,6 @@ export function soulPrompt(): string {
   }
   lines.push(ARC_CAPABILITY);
   return lines.join("\n");
-}
-
-/**
- * Per-request system-prompt suffix listing the scorecards still open, so the
- * model chooses a card from what it can already see instead of having to call
- * `arc_list_scorecards` first. Empty when none are open — an agent that has never
- * played a game should not carry ARC bookkeeping in every prompt.
- */
-export function scorecardContext(openCards: Scorecard[]): string {
-  if (openCards.length === 0) return "";
-  const lines = openCards.map((card) => `- ${card.cardId}`);
-  return [
-    "",
-    "",
-    "Open ARC scorecards (pass one as the `card_id` param of an arc-game subtask — reuse the same card for multiple plays; close only when the user asks or all games are done):",
-    ...lines
-  ].join("\n");
 }
 
 /**

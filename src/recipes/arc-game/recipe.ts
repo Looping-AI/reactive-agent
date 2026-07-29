@@ -50,23 +50,21 @@ export const ARC_GAME_RECIPE: ResolvedRecipe = {
 };
 
 /**
- * The arc-game type. Both params are ids the model quotes back from a tool result
- * it already saw, so the contract is checkable before anything runs: a play with
- * no scorecard or no game cannot succeed, and refusing it here costs no model
- * call. The API session pinned to `card_id` is resolved by the parent from the id
- * — never carried here.
+ * The arc-game type. Its one param is an id the model quotes back from a tool
+ * result it already saw, so the contract is checkable before anything runs: a
+ * play with no game cannot succeed, and refusing it here costs no model call.
+ *
+ * There is deliberately no `card_id`. Which scorecard a play runs on is not a
+ * choice — the API auto-closes an idle card, so the live card is whichever one
+ * was used recently — and the parent leases it per chunk (see
+ * {@link file://./scorecard.ts}), handing it to the execution as runtime state.
  */
 export const ARC_GAME_SPEC: SubtaskTypeSpec = {
   key: ARC_GAME_TYPE,
-  description: "Play one ARC-AGI-3 game on one of your open scorecards.",
+  description: "Play one ARC-AGI-3 game.",
   params: z.object({
-    card_id: z
-      .string()
-      .min(1)
-      .describe("A scorecard card id you opened with arc_open_scorecard"),
     game_id: z.string().min(1).describe("An exact game id from arc_list_games")
   }),
-  paramsHelp:
-    "requires params `card_id` (from `arc_open_scorecard`) and `game_id` (from `arc_list_games`)",
+  paramsHelp: "requires param `game_id` (an exact id from `arc_list_games`)",
   recipe: ARC_GAME_RECIPE
 };

@@ -18,8 +18,15 @@ import {
   type GatewayMetadata,
   type ModelPair
 } from "@/agent/model";
-import { callerContext, scorecardContext, soulPrompt } from "@/agent/prompt";
+import { callerContext, soulPrompt } from "@/agent/prompt";
 import { makeArcClient } from "@/recipes/arc-game/client";
+import {
+  gameScoreReport,
+  resolveScorecard,
+  type ArcScorecardDeps,
+  type ResolvedScorecard
+} from "@/recipes/arc-game/scorecard";
+import { ARC_GAME_FAMILY } from "@/recipes/arc-game/tools";
 import { buildTools } from "@/agent/tools";
 import { archiveMessages } from "@/agent/recall";
 import { runTurn, type RoundMode } from "@/agent/turn";
@@ -105,6 +112,8 @@ export class ReactiveAgent extends Agent<Env> {
   private session?: SessionLike;
   private models?: ModelPair;
   private _db?: AgentDB;
+  /** In-flight scorecard lease, shared by concurrent branches — see {@link leaseScorecard}. */
+  private leasingCard?: Promise<ResolvedScorecard>;
 
   /**
    * Test-only model injection. A **field**, not a constructor argument or RPC
@@ -131,10 +140,12 @@ export class ReactiveAgent extends Agent<Env> {
   }
 
   /**
-   * Cron handler: delete notify_tasks and their Subtasks older than 30 days.
-   * Both are keyed on their own `created_at` (written in the same Task
-   * lifecycle), so a parent Task and its Subtasks age out together. Runs
-   * Sunday 01:00 UTC.
+   * Cron handler: delete notify_tasks and their Subtasks older than 30 days,
+   * plus scorecards opened that long ago. The first two are keyed on their own
+   * `created_at` (written in the same Task lifecycle), so a parent Task and its
+   * Subtasks age out together; a scorecard is unrelated to either, and is swept
+   * simply because a card that old has been retired by the API for a month.
+   * Runs Sunday 01:00 UTC.
    */
   async cleanupOldTasks(
     _payload: Record<string, never>,
@@ -142,6 +153,7 @@ export class ReactiveAgent extends Agent<Env> {
   ): Promise<void> {
     this.db.tasks.cleanup();
     this.db.subtasks.cleanup();
+    this.db.scorecards.cleanup();
   }
 
   /**
@@ -208,13 +220,9 @@ export class ReactiveAgent extends Agent<Env> {
           hasArchive
         },
         browser: this.env.BROWSER,
-        // The ARC scorecard lifecycle is the main agent's: it opens a card,
-        // names it in the prompt of each play it delegates, and closes it for
-        // the score. The playing subagent only ever RESETs and acts.
-        arcScorecard: {
-          store: this.db.scorecards,
-          client: makeArcClient(this.env.ARC_API_KEY)
-        }
+        // Only the game catalogue. The scorecard a play runs on is leased by the
+        // recipe (see `resolveRuntime`) and never reaches this model.
+        arcGames: { client: makeArcClient(this.env.ARC_API_KEY) }
       })
     };
   }
@@ -406,9 +414,7 @@ export class ReactiveAgent extends Agent<Env> {
       text,
       mode,
       budget,
-      systemSuffix:
-        callerContext(identity) +
-        scorecardContext(this.db.scorecards.listOpen()),
+      systemSuffix: callerContext(identity),
       tools: await this.mainAgentTools(session, identity),
       models: this.modelPair({ taskId, round }),
       branches: this.compositionBranches(taskId),
@@ -608,7 +614,13 @@ export class ReactiveAgent extends Agent<Env> {
       return { done: false, status: "running", progress: outcome.progress };
     }
 
-    const persisted = this.persistResult(id, outcome.result);
+    const result = await this.enrichResult(
+      recipe.toolFamilies,
+      request,
+      runtime,
+      outcome.result
+    );
+    const persisted = this.persistResult(id, result);
     if (!persisted) {
       const current = this.requireSubtask(id);
       if (current.status === "pending" || current.status === "running") {
@@ -752,7 +764,7 @@ export class ReactiveAgent extends Agent<Env> {
       request,
       recipe: validated,
       name,
-      runtime: this.resolveRuntime(subtask)
+      runtime: await this.resolveRuntime(validated.toolFamilies)
     };
   }
 
@@ -782,24 +794,50 @@ export class ReactiveAgent extends Agent<Env> {
   }
 
   /**
-   * Resolve a Subtask's params into the session state its execution needs — the
-   * half of an execution's context the model cannot supply.
+   * Resolve the session state an execution needs and no model can supply.
    *
-   * Today that is one thing: an `arc-game` subtask names a scorecard, and the ARC
-   * API pins that card to the session that opened it, so the play is only
-   * possible with the jar stored on our own row. Read once here rather than
-   * refreshed mid-run: the jar is fixed when the card is opened and never
-   * rewritten, so every chunk resolves the same value.
+   * Today that is one thing: an `arc-game` play needs a live scorecard, and which
+   * card is live is a fact about the clock rather than a choice — so the card is
+   * leased here instead of being delegated as a param. Called once per **chunk**,
+   * not once per run: that repetition is load-bearing, because each call also
+   * restarts the card's reuse clock, which is what keeps a long play's card alive
+   * (see `resolveScorecard`).
    *
-   * A card that is unknown or already closed yields no jar; the resulting call
-   * fails against the API with a real diagnostic rather than being silently
-   * retried.
+   * Keyed on the tool family rather than the Subtask type, so a second type that
+   * plays ARC inherits this with no change here.
    */
-  private resolveRuntime(subtask: Subtask): SubtaskRuntime {
-    const cardId = subtask.params.card_id;
-    if (!cardId) return {};
-    const card = this.db.scorecards.get(cardId);
-    return card ? { cookies: card.cookies } : {};
+  private async resolveRuntime(
+    toolFamilies: string[]
+  ): Promise<SubtaskRuntime> {
+    if (!toolFamilies.includes(ARC_GAME_FAMILY)) return {};
+    const { cardId, cookies } = await this.leaseScorecard();
+    return { cardId, cookies };
+  }
+
+  /** The scorecard store + ARC client, as the scorecard policy consumes them. */
+  private arcScorecardDeps(): ArcScorecardDeps {
+    return {
+      store: this.db.scorecards,
+      client: makeArcClient(this.env.ARC_API_KEY)
+    };
+  }
+
+  /**
+   * Lease the live scorecard, collapsing concurrent leases onto one call.
+   *
+   * All of a round's ready Subtasks execute concurrently, and opening a card is a
+   * `fetch` — which opens the DO's input gate, so two branches starting together
+   * would each find no live card and each open one. Sharing the in-flight promise
+   * makes the common case exactly one card. Two isolates could still race to open
+   * two cards; that costs nothing but an unused card id, so it is left alone.
+   */
+  private leaseScorecard(): Promise<ResolvedScorecard> {
+    this.leasingCard ??= resolveScorecard(this.arcScorecardDeps()).finally(
+      () => {
+        this.leasingCard = undefined;
+      }
+    );
+    return this.leasingCard;
   }
 
   /** The validated tool families for a Subtask type, or none if the recipe is unusable. */
@@ -830,6 +868,49 @@ export class ReactiveAgent extends Agent<Env> {
         err: String(err)
       });
     }
+  }
+
+  /**
+   * Append what only the parent can know to a completed execution's report.
+   *
+   * Today that is the ARC score: nothing closes a scorecard any more, so the
+   * score is *read* from the card once the play that earned it is done — which
+   * only the parent can do, since it alone knows the leased card and holds the
+   * jar pinned to it. The score lands as an extra text part, and result parts are
+   * joined on delivery, so it reaches the user and any dependent Subtask with no
+   * other change.
+   *
+   * Never fails the execution: a play that succeeded is not retroactively broken
+   * by a rate-limited score read, so {@link gameScoreReport} swallows its own
+   * errors and a null simply leaves the report as the child wrote it. Safe to
+   * repeat on a Workflow step replay — the read is a GET and `complete()` is a
+   * guarded write.
+   */
+  private async enrichResult(
+    toolFamilies: string[],
+    request: RecipeExecutionRequest,
+    runtime: SubtaskRuntime,
+    result: RecipeExecutionResult
+  ): Promise<RecipeExecutionResult> {
+    const gameId = request.params.game_id;
+    if (
+      result.status !== "completed" ||
+      !toolFamilies.includes(ARC_GAME_FAMILY) ||
+      !runtime.cardId ||
+      !gameId
+    ) {
+      return result;
+    }
+    const score = await gameScoreReport(
+      this.arcScorecardDeps(),
+      runtime.cardId,
+      gameId
+    );
+    if (!score) return result;
+    return {
+      ...result,
+      resultParts: [...result.resultParts, { kind: "text", text: score }]
+    };
   }
 
   /** Persist a child's terminal outcome. Returns whether the guarded write applied. */

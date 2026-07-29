@@ -60,8 +60,9 @@ describe("the type set", () => {
     const rendered = renderSubtaskTypes();
     expect(rendered).toContain(`\`${GENERAL_TYPE}\``);
     expect(rendered).toContain(`\`${ARC_GAME_TYPE}\``);
-    expect(rendered).toContain("arc_open_scorecard");
     expect(rendered).toContain("arc_list_games");
+    // The card is leased by the recipe, so no type may advertise one.
+    expect(rendered).not.toContain("card_id");
   });
 
   // `MAX_CHUNKS_PER_BRANCH` is a platform backstop, not a budget: the Workflow
@@ -112,29 +113,31 @@ describe("validateSubtaskParams", () => {
 
   it("accepts the params an arc-game play requires", () => {
     expect(
-      validateSubtaskParams(ARC_GAME_TYPE, {
-        card_id: "card-1",
-        game_id: "ls20-abc"
-      })
-    ).toEqual({ card_id: "card-1", game_id: "ls20-abc" });
+      validateSubtaskParams(ARC_GAME_TYPE, { game_id: "ls20-abc" })
+    ).toEqual({ game_id: "ls20-abc" });
   });
 
-  it("rejects an arc-game subtask that names no scorecard", () => {
-    expect(() =>
-      validateSubtaskParams(ARC_GAME_TYPE, { game_id: "ls20-abc" })
-    ).toThrow(/card_id/);
+  it("drops a card named by the delegating model", () => {
+    // Which card a play runs on is leased per chunk, not chosen, so a `card_id`
+    // is a model inventing state it cannot know. Stripping it beats refusing the
+    // subtask: the play is still perfectly valid, and the invented id provably
+    // cannot reach the execution.
+    expect(
+      validateSubtaskParams(ARC_GAME_TYPE, {
+        game_id: "ls20-abc",
+        card_id: "card-1"
+      })
+    ).toEqual({ game_id: "ls20-abc" });
   });
 
   it("rejects an arc-game subtask that names no game", () => {
-    expect(() =>
-      validateSubtaskParams(ARC_GAME_TYPE, { card_id: "card-1" })
-    ).toThrow(/game_id/);
+    expect(() => validateSubtaskParams(ARC_GAME_TYPE, {})).toThrow(/game_id/);
   });
 
   it("rejects a blank id, which would fail at the API with no diagnostic", () => {
-    expect(() =>
-      validateSubtaskParams(ARC_GAME_TYPE, { card_id: "", game_id: "ls20-abc" })
-    ).toThrow(SubtaskParamsError);
+    expect(() => validateSubtaskParams(ARC_GAME_TYPE, { game_id: "" })).toThrow(
+      SubtaskParamsError
+    );
   });
 
   it("rejects an unknown type outright", () => {
@@ -168,21 +171,21 @@ describe("subtaskParamProperties", () => {
     // `validateSubtaskParams`, which is what actually refuses a bad subtask.
     const params = z.object(subtaskParamProperties());
     expect(params.safeParse({}).success).toBe(true);
-    expect(params.safeParse({ card_id: "card-1" }).success).toBe(true);
+    expect(params.safeParse({ game_id: "ls20-abc" }).success).toBe(true);
   });
 
   it("attributes each key to the type that declares it", () => {
-    const described = subtaskParamProperties().card_id.description;
+    const described = subtaskParamProperties().game_id.description;
     expect(described).toContain(ARC_GAME_TYPE);
     // The owning type's own words survive the prefix — that text is how the
     // model learns where to get the id.
-    expect(described).toContain("arc_open_scorecard");
+    expect(described).toContain("arc_list_games");
   });
 
   it("keeps the value contract of the declaring type", () => {
     // A blank id is refused here too, not just downstream: it would otherwise
     // reach the ARC API and fail there with no useful diagnostic.
-    expect(subtaskParamProperties().card_id.safeParse("").success).toBe(false);
+    expect(subtaskParamProperties().game_id.safeParse("").success).toBe(false);
   });
 });
 

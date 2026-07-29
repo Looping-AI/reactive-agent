@@ -29,8 +29,12 @@ export interface ArcClient {
   openScorecard(
     cookies: CookieJar
   ): Promise<{ cardId: string; cookies: CookieJar }>;
-  /** Closes the card and returns its terminal aggregate — the only time the API reports it. */
-  closeScorecard(
+  /**
+   * The whole card, with one `environments` entry per game played on it.
+   * Readable while the card is still open, which is what lets a result be
+   * reported without anything closing a card.
+   */
+  getScorecard(
     cardId: string,
     cookies: CookieJar
   ): Promise<{ summary: ScorecardSummary; cookies: CookieJar }>;
@@ -158,10 +162,10 @@ export function makeArcClient(
       return { cardId: data.card_id, cookies: next };
     },
 
-    async closeScorecard(cardId, cookies) {
+    async getScorecard(cardId, cookies) {
       const { data, cookies: next } = await request<ScorecardSummary>(
-        "/api/scorecard/close",
-        { method: "POST", body: { card_id: cardId } },
+        `/api/scorecard/${encodeURIComponent(cardId)}`,
+        { method: "GET" },
         cookies
       );
       return { summary: data, cookies: next };

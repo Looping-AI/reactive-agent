@@ -29,26 +29,34 @@ import {
  * workspace at {@link ARC_SESSION_PATH}, so the run resumes across chunks and
  * isolate eviction. The API key is closed over from `env`, never model input.
  *
- * This family **plays**; it does not manage scorecards. The card is opened and
- * closed by the main agent (`arc_open_scorecard` / `arc_close_scorecard`), which
- * names it in this subtask's prompt — so `card_id` and `game_id` arrive as tool
- * input, and nothing here ever opens, closes, or chooses a card. That is also why
- * reaching WIN or GAME_OVER no longer ends anything: the card outlives the play,
- * and {@link ArcSession.plays} lets the model try again on it.
+ * This family **plays**; it does not manage scorecards. The game arrives as a
+ * validated Subtask param and the card as parent-resolved runtime (leased by
+ * {@link file://./scorecard.ts}), so nothing here ever opens, closes, or chooses
+ * a card. That is also why reaching WIN or GAME_OVER no longer ends anything: the
+ * card outlives the play, and {@link ArcSession.plays} lets the model try again
+ * on it.
  *
  * Transient ARC faults surface to the model as tool errors (the SDK captures a
  * throwing tool as an in-band `tool-error` result, not a rejected generation);
  * the soul tells the model to give up and report after repeated failures, and the
  * turn budget bounds it.
  */
+/**
+ * This family's key in a Recipe's `toolFamilies`. Exported because it is also
+ * what tells the parent a Subtask needs a scorecard leased before it can run —
+ * see `resolveRuntime` in the ReactiveAgent DO.
+ */
+export const ARC_GAME_FAMILY = "arc-game";
+
 export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
   const { workspace, env, emitProgress, params, runtime } = ctx;
   const client = makeArcClient(env.ARC_API_KEY);
 
-  // The subtask type declares both of these, so they are settled before the
-  // model runs — it cannot pick a different game or play on someone else's card.
+  // Both settled before the model runs — it cannot pick a different game, and it
+  // cannot see, choose, or name a card at all. The game is the type's declared
+  // param; the card is the lease the parent resolved for this chunk.
   const gameId = params.game_id;
-  const cardId = params.card_id;
+  const cardId = runtime.cardId as string;
 
   const load = (): Promise<ArcSession | null> =>
     workspace.readJson<ArcSession>(ARC_SESSION_PATH);
@@ -65,19 +73,29 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
       inputSchema: z.object({}),
       execute: async () => {
         const previous = await load();
+        // Once a play has started, its own card wins over the current lease: a
+        // lease that rolled over mid-execution must not strand this play's later
+        // runs on a different card from its earlier ones.
+        const playCardId = previous?.cardId ?? cardId;
         // The ARC API pins a scorecard to the session that opened it, so the
         // first RESET must present the jar the parent stored with the card;
         // afterwards this session's own jar carries the play forward.
         const { frame, cookies } = await client.reset(
-          { gameId, cardId },
+          { gameId, cardId: playCardId },
           previous?.cookies ?? runtime.cookies ?? {}
         );
-        const session = nextSession(previous, gameId, cardId, frame, cookies);
+        const session = nextSession(
+          previous,
+          gameId,
+          playCardId,
+          frame,
+          cookies
+        );
         await save(session);
         const prefix =
           session.plays.length === 0
-            ? `Started ${gameId} on scorecard ${cardId}.`
-            : `Restarted ${gameId} (play ${session.playIndex + 1}) on scorecard ${cardId}.`;
+            ? `Started ${gameId}.`
+            : `Restarted ${gameId} (play ${session.playIndex + 1}).`;
         return describeState(session, prefix);
       }
     }),
@@ -286,8 +304,9 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
   };
 
   // No `abort` hook: the only external state this family used to hold was the
-  // scorecard, and that now belongs to the main agent. A play left unfinished is
-  // simply a run the card records as incomplete.
+  // scorecard, and nothing closes one any more — the API retires an idle card on
+  // its own. A play left unfinished is simply a run the card records as
+  // incomplete.
   return { tools };
 }
 

@@ -48,6 +48,18 @@ const dbMigrations: MigrationConfig = {
         when: 1785022003643,
         tag: "0004_free_jean_grey",
         breakpoints: true
+      },
+      {
+        idx: 5,
+        when: 1785279895613,
+        tag: "0005_add_scorecard_last_used",
+        breakpoints: true
+      },
+      {
+        idx: 6,
+        when: 1785279904141,
+        tag: "0006_drop_scorecard_status",
+        breakpoints: true
       }
     ]
   },
@@ -124,7 +136,32 @@ CREATE INDEX \`idx_subtasks_created_at\` ON \`subtasks\` (\`created_at\`);`,
 CREATE INDEX \`idx_scorecards_opened_at\` ON \`scorecards\` (\`opened_at\`);`,
     // Both nullable-with-default, so SQLite adds them in place — no table rebuild.
     m0004: `ALTER TABLE \`scorecards\` ADD \`cookies_json\` text DEFAULT '{}' NOT NULL;--> statement-breakpoint
-ALTER TABLE \`subtasks\` ADD \`params_json\` text DEFAULT '{}' NOT NULL;`
+ALTER TABLE \`subtasks\` ADD \`params_json\` text DEFAULT '{}' NOT NULL;`,
+    // Hand-written, like m0002: `last_used_at` is required with no default, so
+    // SQLite cannot ADD COLUMN it (drizzle-kit emits exactly that, and SQLite
+    // rejects it). The table is rebuilt and pre-existing cards are backfilled
+    // with their `opened_at` — the most recent moment we can prove the card was
+    // touched. Any such card is long past the reuse window anyway, so the
+    // backfill only has to be ordered, not accurate.
+    m0005: `CREATE TABLE \`__new_scorecards\` (
+\t\`card_id\` text PRIMARY KEY NOT NULL,
+\t\`status\` text DEFAULT 'open' NOT NULL,
+\t\`cookies_json\` text DEFAULT '{}' NOT NULL,
+\t\`opened_at\` integer NOT NULL,
+\t\`closed_at\` integer,
+\t\`summary_json\` text,
+\t\`last_used_at\` integer NOT NULL
+);
+--> statement-breakpoint
+INSERT INTO \`__new_scorecards\`("card_id", "status", "cookies_json", "opened_at", "closed_at", "summary_json", "last_used_at") SELECT "card_id", "status", "cookies_json", "opened_at", "closed_at", "summary_json", "opened_at" FROM \`scorecards\`;--> statement-breakpoint
+DROP TABLE \`scorecards\`;--> statement-breakpoint
+ALTER TABLE \`__new_scorecards\` RENAME TO \`scorecards\`;--> statement-breakpoint
+CREATE INDEX \`idx_scorecards_last_used_at\` ON \`scorecards\` (\`last_used_at\`);`,
+    // The card lifecycle is the API's, not ours: nothing closes a card any more,
+    // so open/closed state and the close-only summary have no reader left.
+    m0006: `ALTER TABLE \`scorecards\` DROP COLUMN \`status\`;--> statement-breakpoint
+ALTER TABLE \`scorecards\` DROP COLUMN \`closed_at\`;--> statement-breakpoint
+ALTER TABLE \`scorecards\` DROP COLUMN \`summary_json\`;`
   }
 };
 
