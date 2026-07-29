@@ -73,7 +73,7 @@ const subtaskProposalSchema = z.object({
   dependsOn: z.array(nonBlank("dependsOn entry")),
   /**
    * The type's required inputs — ids the model quotes from a tool result (e.g.
-   * a scorecard `card_id`). Every key any type declares is named here, gathered
+   * a `game_id` from `arc_list_games`). Every key any type declares is named here, gathered
    * from those types by {@link subtaskParamProperties}; which of them a given
    * type actually *requires* is the per-type contract, checked below.
    *

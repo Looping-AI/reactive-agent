@@ -8,11 +8,11 @@ import { RECALL_TOP_K } from "@/config";
 import type { WorkspaceHandle } from "@/subagent/workspace";
 import type { ProgressEvent, SubtaskRuntime } from "./subtasks/types";
 import type { SubtaskParams } from "@/recipes/types";
-import { buildArcGameTools } from "@/recipes/arc-game/tools";
+import { ARC_GAME_FAMILY, buildArcGameTools } from "@/recipes/arc-game/tools";
 import {
-  buildArcScorecardTools,
-  type ArcScorecardDeps
-} from "@/recipes/arc-game/scorecard-tools";
+  buildArcGamesTools,
+  type ArcGamesDeps
+} from "@/recipes/arc-game/game-tools";
 
 /**
  * The agent's tools. Pure handlers are exported separately from the AI-SDK
@@ -102,9 +102,9 @@ export interface ToolFamilyContext {
    */
   params: SubtaskParams;
   /**
-   * Session state the parent resolved *from* those params — what the model could
-   * not supply and must never be asked to, such as the cookie jar an API pinned
-   * to the resource named in `params`.
+   * Session state the parent resolved for this execution — what no model could
+   * supply and none should be asked to: the scorecard the `arc-game` recipe
+   * leased for this play, and the cookie jar the API pinned to it.
    */
   runtime: SubtaskRuntime;
 }
@@ -116,9 +116,9 @@ export interface ToolFamilyContext {
  * hook is safe to run on a fresh isolate after eviction.
  *
  * No family supplies one today: the `arc-game` family used to close the game's
- * scorecard here, but a scorecard is now the main agent's to open and close, and
- * a subagent must not end one it does not own. The hook stays as the extension
- * point for the next family that holds something external.
+ * scorecard here, and nothing closes a scorecard any more — the API auto-closes
+ * an idle card, so an abandoned play needs no release at all. The hook stays as
+ * the extension point for the next family that holds something external.
  */
 export interface RecipeToolSet {
   tools: ToolSet;
@@ -201,14 +201,15 @@ export function buildRecipeTools(
     } else if (family === "workspace") {
       Object.assign(tools, buildWorkspaceTools(ctx.workspace));
     } else if (
-      family === "arc-game" &&
-      ctx.params.card_id &&
-      ctx.params.game_id
+      family === ARC_GAME_FAMILY &&
+      ctx.params.game_id &&
+      ctx.runtime.cardId
     ) {
-      // Gated on the params the `arc-game` type declares: with no card and no
-      // game there is nothing to play, and offering the tools anyway would let a
-      // subagent burn its whole budget discovering that. The type contract is
-      // enforced before this point; this is defense in depth.
+      // Gated on the game the type declares *and* the card the parent leased:
+      // with no game to play or no card to play it on there is nothing to do, and
+      // offering the tools anyway would let a subagent burn its whole budget
+      // discovering that. Both are settled before this point; this is defense in
+      // depth.
       const built = buildArcGameTools(ctx);
       Object.assign(tools, built.tools);
       if (built.abort) aborts.push(built.abort);
@@ -233,33 +234,33 @@ export function buildRecipeTools(
 export interface MainAgentToolDeps {
   recall?: RecallDeps;
   browser?: QuickActionBinding;
-  /** ARC scorecard lifecycle — the caller's card store plus an API client. */
-  arcScorecard?: ArcScorecardDeps;
+  /** The ARC game catalogue — an API client, nothing stateful. */
+  arcGames?: ArcGamesDeps;
 }
 
 /**
  * Build the toolset for a turn. Tools are gated on their per-instance
  * dependency: `recall` only once this caller's history has been compacted at
  * least once (`recall.hasArchive`) — nothing to search before that — the browser
- * tools only when a Browser Rendering binding is available, and the ARC tools
- * only when a card store and client are supplied. The Session contributes its own
- * `set_context` tool on top of these (merged in the loop), so an otherwise-empty
- * toolset here is fine.
+ * tools only when a Browser Rendering binding is available, and the ARC tool only
+ * when a client is supplied. The Session contributes its own `set_context` tool
+ * on top of these (merged in the loop), so an otherwise-empty toolset here is
+ * fine.
  *
- * The ARC tools here are the **scorecard lifecycle only** (list games, list /
- * open / close scorecards). Playing a game is a subagent's job, through the
- * `arc-game` tool family in {@link buildRecipeTools}.
+ * The ARC surface here is the **game catalogue only**. Playing a game is a
+ * subagent's job, through the `arc-game` tool family in {@link buildRecipeTools};
+ * the scorecard it plays on is leased by the recipe and never reaches a model.
  */
 export function buildTools(deps: MainAgentToolDeps = {}): ToolSet {
-  const { recall: recallDeps, browser, arcScorecard } = deps;
+  const { recall: recallDeps, browser, arcGames } = deps;
   const tools: ToolSet = {};
 
   if (browser) {
     Object.assign(tools, buildBrowserTools(browser));
   }
 
-  if (arcScorecard) {
-    Object.assign(tools, buildArcScorecardTools(arcScorecard));
+  if (arcGames) {
+    Object.assign(tools, buildArcGamesTools(arcGames));
   }
 
   if (recallDeps?.hasArchive) {

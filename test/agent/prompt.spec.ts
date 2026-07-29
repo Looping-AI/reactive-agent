@@ -1,20 +1,5 @@
 import { describe, it, expect } from "vitest";
-import {
-  SOUL,
-  callerContext,
-  scorecardContext,
-  soulPrompt
-} from "@/agent/prompt";
-import type { Scorecard } from "@/recipes/arc-game/types";
-
-const openCard = (cardId: string): Scorecard => ({
-  cardId,
-  status: "open",
-  cookies: {},
-  openedAt: 1,
-  closedAt: null,
-  summary: null
-});
+import { SOUL, callerContext, soulPrompt } from "@/agent/prompt";
 
 describe("SOUL", () => {
   it("includes the <turn> provenance awareness rule", () => {
@@ -50,19 +35,6 @@ describe("callerContext", () => {
   });
 });
 
-describe("scorecardContext", () => {
-  it("is empty when no card is open, so non-players carry no ARC bookkeeping", () => {
-    expect(scorecardContext([])).toBe("");
-  });
-
-  it("lists the open card ids for the model to quote when delegating", () => {
-    const out = scorecardContext([openCard("card-1"), openCard("card-2")]);
-    expect(out).toContain("Open ARC scorecards");
-    expect(out).toContain("- card-1");
-    expect(out).toContain("- card-2");
-  });
-});
-
 describe("soulPrompt", () => {
   it("joins the SOUL lines into the frozen identity block (the Session's soul)", () => {
     const p = soulPrompt();
@@ -70,13 +42,21 @@ describe("soulPrompt", () => {
     expect(p).toContain(SOUL[SOUL.length - 1]);
   });
 
-  it("teaches the scorecard lifecycle the main agent owns", () => {
+  it("teaches how to delegate a play and where the score comes from", () => {
     const p = soulPrompt();
-    expect(p).toContain("arc_open_scorecard");
-    expect(p).toContain("arc_close_scorecard");
-    // The two rules no code path can enforce.
-    expect(p).toContain("two different scorecards");
-    expect(p).toContain("Reuse the same scorecard");
-    expect(p).toContain("do not close prematurely");
+    expect(p).toContain("arc_list_games");
+    expect(p).toContain("`game_id`");
+    expect(p).toContain("Report that score rather than inventing one");
+  });
+
+  it("offers the main agent no scorecard vocabulary at all", () => {
+    // The card is leased by the recipe. Naming a scorecard tool here would
+    // invite the model to call one that no longer exists, and naming a card id
+    // would invite it to pass one as a param the type no longer declares.
+    const p = soulPrompt();
+    expect(p).not.toContain("arc_open_scorecard");
+    expect(p).not.toContain("arc_close_scorecard");
+    expect(p).not.toContain("arc_list_scorecards");
+    expect(p).not.toContain("card_id");
   });
 });

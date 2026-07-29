@@ -54,7 +54,13 @@ export interface SubtaskDraft {
  * the same discipline as the chunk number.
  */
 export interface SubtaskRuntime {
-  /** Cookies an external API pinned to the resource named in `params`. */
+  /**
+   * The ARC scorecard the parent leased for this play. Resolved per chunk rather
+   * than declared as a param: which card is live is a fact about the clock, not a
+   * choice, and the delegating model has no way to know it.
+   */
+  cardId?: string;
+  /** Cookies an external API pinned to that resource. */
   cookies?: Record<string, string>;
 }
 
@@ -124,8 +130,10 @@ export interface RecipeExecutionRequest {
   dependencyResults: DependencyResult[];
   /**
    * The Subtask's validated params. Part of the execution's identity — two plays
-   * of one game on different scorecards are different work — so this IS
-   * fingerprinted, unlike the {@link SubtaskRuntime} resolved from it.
+   * of different games are different work — so this IS fingerprinted, unlike
+   * {@link SubtaskRuntime}, which is deliberately excluded: the leased scorecard
+   * can legitimately differ between two chunks of one run, and must not make a
+   * retry look like a different execution.
    */
   params: SubtaskParams;
 }

@@ -64,8 +64,10 @@ export class SubtaskParamsError extends Error {
  * to persist. A type with no schema must carry no params — a stray param would
  * otherwise ride along unread, looking meaningful.
  *
- * Shape only: whether `card_id` names a scorecard that actually exists and is
- * still open is a question for durable rows, answered when the execution starts.
+ * Shape only: whether `game_id` names a game the API actually offers is a
+ * question for the API, answered when the play starts. Unknown keys are stripped
+ * rather than refused — a model that invents one has produced a valid subtask
+ * with noise attached, and the noise provably cannot reach the execution.
  */
 export function validateSubtaskParams(
   type: string,
@@ -107,9 +109,9 @@ export function validateSubtaskParams(
  * has to serve every type, so the only alternative to naming the union of keys
  * here is naming none of them — and a key the schema does not name is a key the
  * model has no legal way to send, whatever the description promises. That is
- * exactly how an `arc-game` subtask once reached validation with no `card_id`:
- * the field was declared as a free-form record, which the provider's schema
- * conversion flattens to an object permitting no keys at all.
+ * exactly how an `arc-game` subtask once reached validation with none of its
+ * declared ids: the field was declared as a free-form record, which the
+ * provider's schema conversion flattens to an object permitting no keys at all.
  *
  * Descriptions are prefixed with the owning type, so a flat namespace still
  * reads unambiguously to the model (and a key two types share names both).

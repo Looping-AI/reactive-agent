@@ -47,14 +47,16 @@ describe("makeArcClient", () => {
     expect(opened.cookies).toEqual({ AWSALB: "xyz" });
 
     // The jar from the first call is threaded into the next request's Cookie header.
-    await client.closeScorecard("card-1", opened.cookies);
+    await client.getScorecard("card-1", opened.cookies);
     const sent = new Headers(calls[1].init.headers);
     expect(sent.get("cookie")).toBe("AWSALB=xyz");
     expect(calls[0].url).toBe("https://three.arcprize.org/api/scorecard/open");
-    expect(calls[1].url).toBe("https://three.arcprize.org/api/scorecard/close");
+    expect(calls[1].url).toBe(
+      "https://three.arcprize.org/api/scorecard/card-1"
+    );
   });
 
-  it("posts the close body with the card id and returns the aggregate", async () => {
+  it("reads the whole card by GET, one environments entry per game", async () => {
     const { fn, calls } = fetchStub([
       json({
         card_id: "card-9",
@@ -64,18 +66,30 @@ describe("makeArcClient", () => {
         total_environments_completed: 0,
         total_levels: 6,
         total_levels_completed: 2,
-        environments: []
+        environments: [
+          { id: "ls20-abc", score: 2.5, actions: 41, runs: [{ guid: "g" }] }
+        ]
       })
     ]);
     const { summary } = await makeArcClient("k", {
       fetchFn: fn
-    }).closeScorecard("card-9", {});
-    expect(JSON.parse(String(calls[0].init.body))).toEqual({
-      card_id: "card-9"
-    });
-    // Closing is the only time the API reports a card's score.
-    expect(summary.score).toBe(2.5);
-    expect(summary.total_levels_completed).toBe(2);
+    }).getScorecard("card-9", {});
+
+    expect(calls[0].init.method).toBe("GET");
+    expect(calls[0].init.body).toBeUndefined();
+    // Nothing closes a card any more, so this read is the only path to a score.
+    expect(summary.environments[0].id).toBe("ls20-abc");
+    expect(summary.environments[0].score).toBe(2.5);
+  });
+
+  it("escapes the card id into the path rather than interpolating it raw", async () => {
+    const { fn, calls } = fetchStub([json({})]);
+    await makeArcClient("k", { fetchFn: fn })
+      .getScorecard("card/9", {})
+      .catch(() => {});
+    expect(calls[0].url).toBe(
+      "https://three.arcprize.org/api/scorecard/card%2F9"
+    );
   });
 
   it("includes x,y only for ACTION6 and wraps the note as a reasoning object", async () => {

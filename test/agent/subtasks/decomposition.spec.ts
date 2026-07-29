@@ -194,16 +194,10 @@ describe("resolveDecomposition — field hygiene", () => {
 
   it("carries a type's params onto the draft", () => {
     const { drafts } = resolveDecomposition(
-      proposal({
-        type: "arc-game",
-        params: { card_id: "card-1", game_id: "ls20-abc" }
-      }),
+      proposal({ type: "arc-game", params: { game_id: "ls20-abc" } }),
       CATALOG
     );
-    expect(drafts[0].params).toEqual({
-      card_id: "card-1",
-      game_id: "ls20-abc"
-    });
+    expect(drafts[0].params).toEqual({ game_id: "ls20-abc" });
   });
 
   it("defaults to empty params for a type that takes none", () => {
@@ -304,7 +298,7 @@ describe("decompositionProposalSchema", () => {
  * conversion writes `false` into it unconditionally, so `z.record(z.string(),
  * z.string())` — correct in zod, and correct in zod's own JSON Schema output —
  * reaches the model as an object that permits **no keys at all**. That shipped,
- * and a Task failed on an `arc-game` subtask with no `card_id`: the model's
+ * and a Task failed on an `arc-game` subtask with no `game_id`: the model's
  * reasoning said it was passing one, and the schema gave it nowhere to put it.
  *
  * So these assertions deliberately run on the converted output. Anything checked
@@ -339,7 +333,7 @@ describe("the delegate tool's schema, as converted for the provider", () => {
 
   it("names every param key any type declares", () => {
     // Sanity: a manifest with no params at all would make this vacuous.
-    expect(declaredKeys).toContain("card_id");
+    expect(declaredKeys).toContain("game_id");
     expect(Object.keys(paramsWireSchema().properties ?? {}).sort()).toEqual(
       declaredKeys.sort()
     );
@@ -367,9 +361,6 @@ describe("the delegate tool's schema, as converted for the provider", () => {
 
   it("still describes how to obtain each param", () => {
     // The prose from the type's own declaration survives the type prefix.
-    expect(paramsWireSchema().properties?.card_id?.description).toContain(
-      "arc_open_scorecard"
-    );
     expect(paramsWireSchema().properties?.game_id?.description).toContain(
       "arc_list_games"
     );
