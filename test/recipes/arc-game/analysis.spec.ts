@@ -7,14 +7,20 @@ import {
   describeBox,
   describeCell,
   diffGrids,
+  diffShapes,
+  describeShift,
   lastGrid,
   locateComponents,
+  matchShapes,
   parseGrid,
   renderGrid,
   renderLegend,
   renderRegion,
+  renderShapeDelta,
   renderShapes,
-  serializeGrid
+  renderTravel,
+  serializeGrid,
+  MAX_SHAPE_CHANGES
 } from "@/recipes/arc-game/analysis";
 
 /** A tiny grid for readable assertions. */
@@ -389,5 +395,180 @@ describe("renderRegion", () => {
 
   it("reports an empty grid rather than rendering nothing", () => {
     expect(renderRegion([], 0, 0)).toBe("empty grid.");
+  });
+});
+
+/**
+ * Shape matching is the answer to a specific failure: on a board with a step
+ * counter, every action changes cells, so a cell diff can never say "that move
+ * was blocked". These tests are about the two claims the renderer makes —
+ * something moved, or nothing did — and about it declining when it cannot tell.
+ */
+describe("matchShapes", () => {
+  /** A grid with one 2×2 blue block whose top-left sits at (top, left). */
+  const block = (top: number, left: number, color = 9): number[][] => {
+    const grid = Array.from({ length: 8 }, () => new Array(8).fill(0));
+    for (const [r, c] of [
+      [0, 0],
+      [0, 1],
+      [1, 0],
+      [1, 1]
+    ]) {
+      grid[top + r][left + c] = color;
+    }
+    return grid;
+  };
+
+  it("reports a rigid shape that travelled, with its displacement", () => {
+    const { moved, other } = matchShapes(
+      locateComponents(block(1, 1)),
+      locateComponents(block(1, 4))
+    );
+    expect(other).toEqual([]);
+    expect(moved).toHaveLength(1);
+    expect(moved[0]).toMatchObject({ dRow: 0, dCol: 3 });
+    expect(moved[0].from).toMatchObject({ color: 9, size: 4, top: 1, left: 1 });
+  });
+
+  it("says nothing about a shape that did not move", () => {
+    const same = locateComponents(block(1, 1));
+    expect(matchShapes(same, same)).toEqual({ moved: [], other: [] });
+  });
+
+  it("calls a same-color shape with a different cell count a resize", () => {
+    // A bar losing a cell, which is what a fuel or step counter looks like.
+    const before = locateComponents([[11, 11, 11, 0]]);
+    const after = locateComponents([[11, 11, 0, 0]]);
+    const { moved, other } = matchShapes(before, after);
+    expect(moved).toEqual([]);
+    expect(other).toEqual([
+      {
+        kind: "resized",
+        from: { color: 11, size: 3, top: 0, left: 0, bottom: 0, right: 2 },
+        to: { color: 11, size: 2, top: 0, left: 0, bottom: 0, right: 1 }
+      }
+    ]);
+  });
+
+  it("reports arrivals and departures when nothing pairs up", () => {
+    const { moved, other } = matchShapes(
+      locateComponents([[9, 0]]),
+      locateComponents([[0, 14]])
+    );
+    expect(moved).toEqual([]);
+    expect(other.map((c) => c.kind).sort()).toEqual(["appeared", "gone"]);
+  });
+
+  it("pairs each shape with its nearest candidate, not the first one", () => {
+    // Two identical blocks; the right one steps right. Matching by proximity keeps
+    // that attribution — matching in list order would report both as moving.
+    const before = [
+      ...locateComponents(block(1, 1)),
+      ...locateComponents(block(5, 5))
+    ];
+    const after = [
+      ...locateComponents(block(1, 1)),
+      ...locateComponents(block(5, 6))
+    ];
+    const { moved } = matchShapes(before, after);
+    expect(moved).toHaveLength(1);
+    expect(moved[0]).toMatchObject({ dRow: 0, dCol: 1 });
+    expect(moved[0].from.top).toBe(5);
+  });
+
+  it("has nothing to compare against on the first frame", () => {
+    expect(diffShapes(null, [[9]])).toBeNull();
+  });
+});
+
+describe("renderShapeDelta", () => {
+  const moving = (dRow: number, dCol: number) =>
+    matchShapes(
+      locateComponents([
+        [9, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0]
+      ]),
+      [{ color: 9, size: 1, top: dRow, left: dCol, bottom: dRow, right: dCol }]
+    );
+
+  it("names the shape, where it went, and how far", () => {
+    expect(renderShapeDelta(moving(0, 2))).toBe(
+      "blue 1×1 row 0, col 0 → cols 2-2 (right 2)"
+    );
+  });
+
+  it("spells out both axes when a shape moves diagonally", () => {
+    expect(renderShapeDelta(moving(1, 1))).toBe(
+      "blue 1×1 row 0, col 0 → row 1, col 1 (down 1, right 1)"
+    );
+  });
+
+  it("leads with `nothing moved` when only a counter changed", () => {
+    // The line the whole matcher exists for: cells changed, position did not.
+    const delta = matchShapes(
+      locateComponents([[11, 11, 11]]),
+      locateComponents([[11, 11, 0]])
+    );
+    expect(renderShapeDelta(delta)).toBe(
+      "nothing moved; yellow row 0, cols 0-2 → row 0, cols 0-1 (3→2 cells)"
+    );
+  });
+
+  it("declines when the frames are identical, leaving the cell diff to speak", () => {
+    expect(renderShapeDelta({ moved: [], other: [] })).toBeNull();
+  });
+
+  it("declines a repaint rather than narrating every shape of it", () => {
+    // A level change replaces the board. Naming twenty arrivals says less than
+    // the cell diff does, so this view stands aside.
+    const scatter = (color: number) =>
+      locateComponents(
+        Array.from({ length: 9 }, (_, r) =>
+          Array.from({ length: 9 }, (_, c) => ((r + c) % 2 === 0 ? color : 0))
+        )
+      );
+    const delta = matchShapes(scatter(9), scatter(14));
+    expect(delta.other.length).toBeGreaterThan(MAX_SHAPE_CHANGES);
+    expect(renderShapeDelta(delta)).toBeNull();
+  });
+});
+
+describe("renderTravel", () => {
+  const shape = { color: 12, size: 25, top: 0, left: 0, bottom: 4, right: 4 };
+
+  it("states the per-move stride when the total divides by the moves", () => {
+    // Two presses of a selector that slides five cells are not "ten cells down":
+    // a model reading it that way places itself ten cells from where it is.
+    expect(renderTravel({ shape, dRow: 10, dCol: 0, moves: 2 })).toBe(
+      "orange 5×5 down 10 over 2 moves, down 5 per move"
+    );
+  });
+
+  it("gives the total alone when the moves were not uniform", () => {
+    expect(renderTravel({ shape, dRow: 7, dCol: 0, moves: 2 })).toBe(
+      "orange 5×5 down 7 over 2 moves"
+    );
+  });
+
+  it("does not bother with a stride for a single move", () => {
+    expect(renderTravel({ shape, dRow: 0, dCol: -5, moves: 1 })).toBe(
+      "orange 5×5 left 5"
+    );
+  });
+
+  it("says so when a shape ended up where it started", () => {
+    expect(renderTravel({ shape, dRow: 0, dCol: 0, moves: 2 })).toBe(
+      "orange 5×5 is back where it started after 2 move(s)"
+    );
+  });
+});
+
+describe("describeShift", () => {
+  it("names directions rather than signed numbers", () => {
+    expect(describeShift(-3, 0)).toBe("up 3");
+    expect(describeShift(0, 4)).toBe("right 4");
+    expect(describeShift(2, -1)).toBe("down 2, left 1");
+    expect(describeShift(0, 0)).toBe("no shift");
   });
 });

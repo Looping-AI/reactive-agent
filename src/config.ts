@@ -8,13 +8,13 @@
 import type { RecipeLimits } from "@/recipes/types";
 
 /** Workers AI model used by the agent tool loop. Must support function calling. */
-export const CHAT_MODEL_ID = "@cf/moonshotai/kimi-k2.7-code";
+export const CHAT_MODEL_ID = "@cf/zai-org/glm-5.2";
 
 /**
  * Fallback model tried when the primary model throws an error. Deliberately a
  * *different vendor and family* from {@link CHAT_MODEL_ID}.
  */
-export const CHAT_FALLBACK_MODEL_ID = "@cf/zai-org/glm-5.2";
+export const CHAT_FALLBACK_MODEL_ID = "@cf/moonshotai/kimi-k2.7-code";
 
 /** Cloudflare AI Gateway slug — "default" auto-provisions a gateway on first request. */
 export const AI_GATEWAY_ID = "default";

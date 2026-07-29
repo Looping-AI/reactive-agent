@@ -10,33 +10,52 @@ import {
 } from "@/recipes/arc-game/recipe";
 import { validateRecipe } from "@/recipes/validation";
 import { SUBAGENT_LIMITS } from "@/config";
+import { MAX_CHUNKS_PER_BRANCH } from "@/platform";
 
 describe("ARC_GAME_RECIPE", () => {
-  it("is the enabled arc-game recipe with the workspace and arc-game tool families", () => {
+  it("is the enabled arc-game recipe, playing and nothing else", () => {
     const recipe = resolveRecipeForType(ARC_GAME_TYPE);
     expect(recipe.key).toBe(ARC_GAME_TYPE);
     expect(recipe.reportMetrics).toBe(true);
-    expect(recipe.toolFamilies).toEqual(["workspace", "arc-game"]);
+    // It used to carry `workspace` too, so the model could keep notes in files.
+    // Across two logged plays it wrote three and read none, at a turn apiece; the
+    // `note` field of `arc_act` carries a plan for free instead. The session file
+    // is untouched by this — the family reaches the workspace through its context,
+    // not through tools a model can call.
+    expect(recipe.toolFamilies).toEqual(["arc-game"]);
   });
 
-  it("runs on the baseline budget like everything else", () => {
+  it("buys more turns than the baseline, and stops short of the chunk cap", () => {
     // It used to be "the long recipe" at 1,000 turns, sliced 25 to a chunk on the
     // theory that made 40 durable chunks. Real turns here — a reasoning model plus
-    // an ARC HTTP round trip — are far slower than that arithmetic assumed, so
-    // runs took 70-100 chunks, blew the per-branch cap, and were killed after
-    // hours instead of reporting. A game would still happily use more turns, which
-    // is exactly why the number is not the game's to choose.
-    expect(ARC_GAME_RECIPE.limits).toEqual({});
-    expect(validateRecipe(ARC_GAME_RECIPE).limits).toEqual(SUBAGENT_LIMITS);
+    // an ARC HTTP round trip — are far slower than that arithmetic assumed, so runs
+    // took 70-100 chunks, blew the per-branch cap, and were killed after hours
+    // instead of reporting. The correction was not to leave a play on the baseline:
+    // 20 turns bought about ten game actions once inspection was paid for. It is
+    // the *shape* of the old number that was wrong, and 39 is the most a recipe can
+    // ask for while a yielding chunk still costs a turn — see the assertion over
+    // every recipe in `test/agent/subtasks/subtask-types.spec.ts`.
+    expect(ARC_GAME_RECIPE.limits.maxTurns).toBeGreaterThan(
+      SUBAGENT_LIMITS.maxTurns
+    );
+    expect(ARC_GAME_RECIPE.limits.maxTurns).toBeLessThan(MAX_CHUNKS_PER_BRANCH);
+    // Time is not overridden: turns are what a play is short of, and the two
+    // ceilings end a run identically, so the baseline stands until a run is
+    // observed ending on the clock.
+    expect(ARC_GAME_RECIPE.limits.maxWallMs).toBeUndefined();
+    expect(validateRecipe(ARC_GAME_RECIPE).limits.maxWallMs).toBe(
+      SUBAGENT_LIMITS.maxWallMs
+    );
   });
 
-  it("keeps a deliberately small context window, unlike its budget", () => {
-    // The one thing it does tune, and the one thing that is genuinely a property
-    // of the domain: the model leans on its workspace rather than its context.
-    // Counts assistant messages, so a play spends it faster than the number looks.
+  it("keeps a context window smaller than its budget, since it is now the only memory", () => {
+    // The one thing it genuinely tunes as a property of the domain. It counts
+    // assistant messages, so a play spends it faster than the number looks — and
+    // with the workspace tools gone, a plan that scrolls out of it is gone.
     expect(ARC_GAME_RECIPE.historyWindow).toBeLessThan(
-      SUBAGENT_LIMITS.maxTurns * 2
+      validateRecipe(ARC_GAME_RECIPE).limits.maxTurns
     );
+    expect(ARC_GAME_RECIPE.historyWindow).toBeGreaterThan(24);
   });
 });
 
