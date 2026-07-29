@@ -19,7 +19,10 @@ import { buildArcGameTools } from "@/recipes/arc-game/tools";
 import type { ArcSession, FrameResponse } from "@/recipes/arc-game/types";
 import { ctx, callTool } from "./helpers";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -89,13 +92,15 @@ function stubFetch(routes: Record<string, () => unknown>) {
   return hits;
 }
 
-/** Capture the JSON bodies posted to one path. */
+/** Route requests as {@link stubFetch} does, and capture the JSON bodies posted. */
 function stubFetchCapturing(routes: Record<string, () => unknown>) {
   const bodies: Record<string, unknown>[] = [];
+  const hits: string[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string | URL, init?: RequestInit) => {
       const path = new URL(String(url)).pathname;
+      hits.push(path);
       if (typeof init?.body === "string") {
         bodies.push(JSON.parse(init.body) as Record<string, unknown>);
       }
@@ -105,7 +110,7 @@ function stubFetchCapturing(routes: Record<string, () => unknown>) {
         : new Response("no route", { status: 404 });
     })
   );
-  return bodies;
+  return { bodies, hits };
 }
 
 describe("arc-game tool family", () => {
@@ -158,7 +163,9 @@ describe("arc-game tool family", () => {
   });
 
   it("addresses every action to the resolved guid", async () => {
-    const bodies = stubFetchCapturing({ "/api/cmd/ACTION1": () => FRAME() });
+    const { bodies } = stubFetchCapturing({
+      "/api/cmd/ACTION1": () => FRAME()
+    });
     const { ctx: c } = ctx("test-key", {
       params: { game_id: "ls20-abc" },
       runtime: { cardId: "card-7", guid: "gid-parent", frame: FRAME() }
@@ -174,8 +181,16 @@ describe("arc-game tool family", () => {
     expect(bodies[0]).not.toHaveProperty("card_id");
   });
 
-  it("rejoins the same play in a later chunk that holds a new lease", async () => {
-    const hits = stubFetch({ "/api/cmd/ACTION1": () => FRAME() });
+  it("keeps playing its own play when a later chunk's lease rolled over", async () => {
+    // The only rollover shape production can produce: `guids` is keyed per card,
+    // so a fresh card has no recorded guid and the parent RESETs — a new card
+    // therefore *always* arrives with a new guid, naming an empty play while the
+    // workspace holds the one with every level reached. The stub echoes the guid
+    // it was addressed with, as the API does.
+    const { bodies, hits } = stubFetchCapturing({
+      "/api/cmd/ACTION1": () => FRAME({ guid: "gid-parent" })
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { ctx: first } = ctx("test-key", {
       params: { game_id: "ls20-abc" },
       runtime: { cardId: "card-old", guid: "gid-parent", frame: FRAME() }
@@ -184,18 +199,43 @@ describe("arc-game tool family", () => {
       view: "shapes"
     });
 
-    // Same workspace, later chunk, lease rolled over. The session it finds is
-    // the play, and no new card can pull it onto a different one.
     const second: typeof first = {
       ...first,
-      runtime: { cardId: "card-new", guid: "gid-parent" }
+      runtime: { cardId: "card-new", guid: "gid-rollover" }
     };
     await callTool(buildArcGameTools(second).tools.arc_act, one(1));
 
+    // The play outlives the lease: neither the new card nor the new guid pulls it.
+    expect(bodies.at(-1)).toMatchObject({ guid: "gid-parent" });
     expect(hits).not.toContain("/api/cmd/RESET");
     const session =
       await first.workspace.readJson<ArcSession>("arc/session.json");
     expect(session?.cardId).toBe("card-old");
+    expect(session?.guid).toBe("gid-parent");
+
+    // Nothing here can undo the parent's RESET or correct the score it will read
+    // from the new card, so the divergence has to be visible in the logs.
+    expect(warn).toHaveBeenCalledWith(
+      "[arc-game] play/lease divergence",
+      expect.objectContaining({
+        playing: "gid-parent",
+        resolved: "gid-rollover",
+        playCard: "card-old",
+        leaseCard: "card-new"
+      })
+    );
+  });
+
+  it("says nothing about a lease that resolved onto the play it is already on", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    stubFetch({ "/api/cmd/ACTION1": () => FRAME({ guid: "gid-parent" }) });
+    const { ctx: c } = ctx("test-key", {
+      params: { game_id: "ls20-abc" },
+      runtime: { cardId: "card-7", guid: "gid-parent", frame: FRAME() }
+    });
+    await callTool(buildArcGameTools(c).tools.arc_act, one(1));
+    await callTool(buildArcGameTools(c).tools.arc_act, one(1));
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("joins a play it has no frame for, and learns the board from the first action", async () => {
@@ -221,6 +261,10 @@ describe("arc-game tool family", () => {
     expect(acted).not.toContain("not available");
     expect(hits).toContain("/api/cmd/ACTION1");
     expect(hits).not.toContain("/api/cmd/RESET");
+    // A reply that cannot carry the orientation must not spend it either: the
+    // inspect above had no board to describe, so this call is where the chunk
+    // still owes the model its bearings.
+    expect(acted).toContain("Playing ls20-abc");
 
     const session = await c.workspace.readJson<ArcSession>("arc/session.json");
     expect(session?.availableActions).toEqual([1, 2, 6]);
@@ -233,8 +277,23 @@ describe("arc-game tool family", () => {
     // Minting a guid is precisely the power this family does not have, so there
     // is nothing to fall back to.
     await expect(callTool(tools.arc_act, one(1))).rejects.toThrow(
-      "no play was resolved"
+      "no play was resolved for this subtask (missing runtime.guid)"
     );
+  });
+
+  it("names every part of the play the parent failed to resolve", async () => {
+    // `buildRecipeTools` gates the family on the card, so an unset one means the
+    // family was built past its gate; the error says which piece is missing
+    // rather than writing a session around an absent card id.
+    const { ctx: c } = ctx("test-key", { runtime: { guid: "gid-1" } });
+    await expect(
+      callTool(buildArcGameTools(c).tools.arc_act, one(1))
+    ).rejects.toThrow("missing runtime.cardId");
+
+    const { ctx: bare } = ctx("test-key", { runtime: {} });
+    await expect(
+      callTool(buildArcGameTools(bare).tools.arc_act, one(1))
+    ).rejects.toThrow("missing runtime.guid and runtime.cardId");
   });
 
   it("rejects an action that is not currently available", async () => {
@@ -550,7 +609,7 @@ describe("arc_act sequences", () => {
   });
 
   it("carries per-step click coordinates, not one pair for the whole batch", async () => {
-    const bodies = stubFetchCapturing({
+    const { bodies } = stubFetchCapturing({
       "/api/cmd/ACTION6": () => FRAME({ available_actions: [6] })
     });
     const { ctx: c } = ctx();

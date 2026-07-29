@@ -61,7 +61,7 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
   // declared param; the card and the guid are what the parent resolved for this
   // chunk, and the guid in particular is the play it must join rather than open.
   const gameId = params.game_id;
-  const cardId = runtime.cardId as string;
+  const cardId = runtime.cardId;
   const guid = runtime.guid;
 
   const load = (): Promise<ArcSession | null> =>
@@ -81,16 +81,46 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
    * opening frame is handed over only to whoever opened the play, and no ARC
    * endpoint reads a board back. An empty list means *unknown*, not *none* — the
    * first ACTION returns a full frame and fills it in.
+   *
+   * **Once the file exists it is the play**, and a later chunk's lease cannot
+   * pull it onto a different card or a different guid. A rollover — the reuse
+   * window elapsing between two chunk starts, so an ARC outage or an exhausted
+   * step retry rather than anything a play did — leases a fresh card, and a fresh
+   * card has no recorded guid, so the parent RESETs. `runtime.guid` then names a
+   * play with nothing in it while this file names the play holding every level
+   * reached. Joining the new one would throw the real one away, so the divergence
+   * is logged and not acted on — and logged rather than silent because both of its
+   * residuals are outside this family's reach:
+   *
+   * - the parent's RESET already recorded a second, empty run on the new card, and
+   * - `enrichResult` reads the score from the *leased* card, so the report
+   *   describes that empty run instead of this play.
    */
   const resume = async (): Promise<ArcSession> => {
     const stored = await load();
-    if (stored) return stored;
-    if (guid === undefined) {
+    if (stored) {
+      if (guid !== undefined && stored.guid !== guid) {
+        console.warn("[arc-game] play/lease divergence", {
+          gameId,
+          playing: stored.guid,
+          resolved: guid,
+          playCard: stored.cardId,
+          leaseCard: cardId
+        });
+      }
+      return stored;
+    }
+    if (guid === undefined || cardId === undefined) {
       // Only reachable if a Subtask ran this family without the parent resolving
-      // a play. Nothing here can recover — minting a guid is exactly the power
-      // this family does not have.
+      // a play — `buildRecipeTools` gates the family on the card and
+      // `resolveRuntime` settles both together. Nothing here can recover:
+      // minting a guid is exactly the power this family does not have.
+      const missing = [
+        guid === undefined ? "runtime.guid" : null,
+        cardId === undefined ? "runtime.cardId" : null
+      ].filter((field) => field !== null);
       throw new Error(
-        "arc-game: no play was resolved for this subtask (missing runtime.guid)"
+        `arc-game: no play was resolved for this subtask (missing ${missing.join(" and ")})`
       );
     }
     const session = joinSession(gameId, cardId, guid, runtime);
@@ -323,17 +353,18 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
       }),
       execute: async ({ view, x, y, radius }) => {
         const session = await resume();
-        const opening = orient(session, false);
         const grid = board(session);
+        // Ahead of `orient`, so a chunk that opens on a boardless inspect has not
+        // spent its one orientation on a message that cannot carry it: this
+        // reply already says the board is unknown, and the next call — the first
+        // `arc_act`, or an inspect once a frame has landed — orients instead.
         if (grid === null) {
-          // The orientation is consumed but deliberately dropped: for an unknown
-          // session it degrades to "level, state and available actions arrive
-          // with your next action's result", which is this message again.
           return (
             "No board received yet for this play — the frame arrives with your " +
             "first `arc_act`, so take one action and inspect after it."
           );
         }
+        const opening = orient(session, false);
         const rendered = ((): string => {
           switch (view) {
             case "grid":
