@@ -47,11 +47,11 @@ export function ctx(
       env: { ARC_API_KEY: apiKey } as unknown as Env,
       workspace: memHandle(),
       emitProgress: (e) => events.push(e),
-      // The arc-game family is gated on the game param plus the leased card, so
-      // default to a usable pair; pass `{ params: {} }` or `{ runtime: {} }` to
-      // exercise the ungated paths.
+      // The arc-game family plays the game its param names, on the play the
+      // parent resolved — card and guid both. Default to a usable set; pass
+      // `{ params: {} }` or `{ runtime: {} }` to exercise the ungated paths.
       params: over.params ?? { game_id: "ls20-abc" },
-      runtime: over.runtime ?? { cardId: "card-1" }
+      runtime: over.runtime ?? { cardId: "card-1", guid: "gid-1" }
     }
   };
 }
@@ -72,6 +72,7 @@ export function memStore(
       const card: Scorecard = {
         cardId,
         cookies,
+        guids: {},
         openedAt: now(),
         lastUsedAt: now()
       };
@@ -79,6 +80,16 @@ export function memStore(
       return card;
     },
     get: (cardId) => cards.get(cardId) ?? null,
+    // First writer wins, exactly as the real model does — the race it settles is
+    // the whole reason the column exists.
+    setGuid(cardId, gameId, guid) {
+      const card = cards.get(cardId);
+      if (!card || card.guids[gameId] !== undefined) return;
+      cards.set(cardId, {
+        ...card,
+        guids: { ...card.guids, [gameId]: guid }
+      });
+    },
     findRecent: (since) =>
       [...cards.values()]
         .filter((c) => c.lastUsedAt >= since)

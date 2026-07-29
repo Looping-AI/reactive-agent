@@ -16,25 +16,29 @@ import {
   serializeGrid,
   type GridDiff
 } from "./analysis";
-import {
-  ARC_SESSION_PATH,
-  type ArcSession,
-  type FrameResponse,
-  type PlaySummary
-} from "./types";
+import { ARC_SESSION_PATH, type ArcSession, type FrameResponse } from "./types";
 
 /**
- * The `arc-game` tool family: reset / act / inspect against the ARC-AGI-3 REST
- * API. All durable session state (cookies, guid, frames, metrics) lives in the
- * workspace at {@link ARC_SESSION_PATH}, so the run resumes across chunks and
- * isolate eviction. The API key is closed over from `env`, never model input.
+ * The `arc-game` tool family: act / inspect against the ARC-AGI-3 REST API. All
+ * durable session state (cookies, guid, frames, metrics) lives in the workspace
+ * at {@link ARC_SESSION_PATH}, so the run resumes across chunks and isolate
+ * eviction. The API key is closed over from `env`, never model input.
  *
  * This family **plays**; it does not manage scorecards. The game arrives as a
  * validated Subtask param and the card as parent-resolved runtime (leased by
  * {@link file://./scorecard.ts}), so nothing here ever opens, closes, or chooses
- * a card. That is also why reaching WIN or GAME_OVER no longer ends anything: the
- * card outlives the play, and {@link ArcSession.plays} lets the model try again
- * on it.
+ * a card.
+ *
+ * **Nothing here ever RESETs.** The play is opened once per (card, game) by the
+ * parent (`resolvePlay`) and arrives as `runtime.guid`; this family only joins
+ * it. That is the whole point: a guid is mintable only by RESET, and a second
+ * RESET is a second run on the card, so a family that could reset would be able
+ * to throw away a play by retrying it. Instead a WIN or GAME_OVER is the result
+ * this card recorded for this game, and the model reports it.
+ *
+ * The session file is a local cache of that play, not its identity — the guid in
+ * `runtime` is. A subagent that lost its workspace, or a re-dispatched Subtask,
+ * rebuilds the file around the same guid and plays on.
  *
  * Transient ARC faults surface to the model as tool errors (the SDK captures a
  * throwing tool as an in-band `tool-error` result, not a rejected generation);
@@ -52,11 +56,13 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
   const { workspace, env, emitProgress, params, runtime } = ctx;
   const client = makeArcClient(env.ARC_API_KEY);
 
-  // Both settled before the model runs — it cannot pick a different game, and it
-  // cannot see, choose, or name a card at all. The game is the type's declared
-  // param; the card is the lease the parent resolved for this chunk.
+  // All settled before the model runs — it cannot pick a different game, and it
+  // cannot see, choose, or name a card or a play at all. The game is the type's
+  // declared param; the card and the guid are what the parent resolved for this
+  // chunk, and the guid in particular is the play it must join rather than open.
   const gameId = params.game_id;
-  const cardId = runtime.cardId as string;
+  const cardId = runtime.cardId;
+  const guid = runtime.guid;
 
   const load = (): Promise<ArcSession | null> =>
     workspace.readJson<ArcSession>(ARC_SESSION_PATH);
@@ -66,40 +72,92 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
   const board = (s: ArcSession): number[][] | null =>
     s.lastGridHex === null ? null : parseGrid(s.lastGridHex);
 
-  const tools = {
-    arc_reset_game: tool({
-      description:
-        "Start playing your assigned game. Call this first. Call it again after a WIN or GAME_OVER to play the same game once more on the same scorecard.",
-      inputSchema: z.object({}),
-      execute: async () => {
-        const previous = await load();
-        // Once a play has started, its own card wins over the current lease: a
-        // lease that rolled over mid-execution must not strand this play's later
-        // runs on a different card from its earlier ones.
-        const playCardId = previous?.cardId ?? cardId;
-        // The ARC API pins a scorecard to the session that opened it, so the
-        // first RESET must present the jar the parent stored with the card;
-        // afterwards this session's own jar carries the play forward.
-        const { frame, cookies } = await client.reset(
-          { gameId, cardId: playCardId },
-          previous?.cookies ?? runtime.cookies ?? {}
-        );
-        const session = nextSession(
-          previous,
+  /**
+   * The session for the play in `runtime`, from the workspace or rebuilt around
+   * the resolved guid. Never opens a play — there is nothing here that could.
+   *
+   * The rebuilt case is a real one (fresh workspace, re-dispatched Subtask), and
+   * it is why {@link ArcSession.availableActions} may be empty: the parent's
+   * opening frame is handed over only to whoever opened the play, and no ARC
+   * endpoint reads a board back. An empty list means *unknown*, not *none* — the
+   * first ACTION returns a full frame and fills it in.
+   *
+   * **Once the file exists it is the play**, and a later chunk's lease cannot
+   * pull it onto a different card or a different guid. A rollover — the reuse
+   * window elapsing between two chunk starts, so an ARC outage or an exhausted
+   * step retry rather than anything a play did — leases a fresh card, and a fresh
+   * card has no recorded guid, so the parent RESETs. `runtime.guid` then names a
+   * play with nothing in it while this file names the play holding every level
+   * reached. Joining the new one would throw the real one away, so the divergence
+   * is logged and not acted on — and logged rather than silent because both of its
+   * residuals are outside this family's reach:
+   *
+   * - the parent's RESET already recorded a second, empty run on the new card, and
+   * - `enrichResult` reads the score from the *leased* card, so the report
+   *   describes that empty run instead of this play.
+   */
+  const resume = async (): Promise<ArcSession> => {
+    const stored = await load();
+    if (stored) {
+      if (guid !== undefined && stored.guid !== guid) {
+        console.warn("[arc-game] play/lease divergence", {
           gameId,
-          playCardId,
-          frame,
-          cookies
-        );
-        await save(session);
-        const prefix =
-          session.plays.length === 0
-            ? `Started ${gameId}.`
-            : `Restarted ${gameId} (play ${session.playIndex + 1}).`;
-        return describeState(session, prefix);
+          playing: stored.guid,
+          resolved: guid,
+          playCard: stored.cardId,
+          leaseCard: cardId
+        });
       }
-    }),
+      return stored;
+    }
+    if (guid === undefined || cardId === undefined) {
+      // Only reachable if a Subtask ran this family without the parent resolving
+      // a play — `buildRecipeTools` gates the family on the card and
+      // `resolveRuntime` settles both together. Nothing here can recover:
+      // minting a guid is exactly the power this family does not have.
+      const missing = [
+        guid === undefined ? "runtime.guid" : null,
+        cardId === undefined ? "runtime.cardId" : null
+      ].filter((field) => field !== null);
+      throw new Error(
+        `arc-game: no play was resolved for this subtask (missing ${missing.join(" and ")})`
+      );
+    }
+    const session = joinSession(gameId, cardId, guid, runtime);
+    await save(session);
+    return session;
+  };
 
+  /**
+   * True once this chunk has told the model where it is.
+   *
+   * The tool family is rebuilt per chunk (`buildRecipeTools` in the subagent
+   * facet), so this closure variable *is* the chunk boundary — and a chunk
+   * boundary is exactly where the model's context window was trimmed.
+   */
+  let oriented = false;
+
+  /**
+   * The orientation to prepend to this chunk's first tool result, and "" after.
+   *
+   * Completing a level emits progress, and progress ends the chunk, so the model
+   * resumes every new level with its recent turns trimmed away. Leading its next
+   * result with the board costs no game action and no extra turn — it rides on a
+   * call it was making anyway — where re-inspecting to get its bearings costs a
+   * turn out of the run's budget, once per level.
+   *
+   * `withBoard` is false for `arc_inspect`, whose view already *is* the board;
+   * repeating it as shapes would say the same thing twice.
+   */
+  const orient = (session: ArcSession, withBoard: boolean): string => {
+    if (oriented) return "";
+    oriented = true;
+    return withBoard
+      ? `${describeState(session, `Playing ${gameId}.`)}\n`
+      : `Playing ${gameId}. ${stateLine(session)}\n`;
+  };
+
+  const tools = {
     arc_act: tool({
       description:
         "Take one or more actions in the current game, in order. Only use actions listed in the latest available_actions. Returns one diff per step — what each individual action changed — then the new level, state and available_actions. Batch only a movement you are confident about: every step is a real action counted against the game's baseline, so a wrong batch wastes score. While forming a hypothesis, send a single step.",
@@ -143,12 +201,16 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
           .describe("brief reasoning for this move or sequence")
       }),
       execute: async ({ steps, note }) => {
-        const session = await load();
-        if (!session) return "No game in progress. Call arc_reset_game first.";
+        // Acting immediately is right — the results below carry the board — but
+        // this chunk's orientation goes out first, so the model is never acting
+        // on a board it can no longer see.
+        const session = await resume();
+        const opening = orient(session, true);
         if (session.state === "WIN" || session.state === "GAME_OVER") {
           return (
+            opening +
             `This play is over (state=${session.state}). ` +
-            "Call arc_reset_game to play again on the same scorecard, or write your final report."
+            "Write your final report."
           );
         }
 
@@ -172,7 +234,15 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
 
           // Guard before sending: these are requests the API would reject or that
           // cannot mean anything, so spending an action on them is pure waste.
-          if (!session.availableActions.includes(action)) {
+          //
+          // An empty list is *unknown*, not *none* — a session rebuilt around a
+          // resolved guid has not seen a frame yet. Guessing "nothing is legal"
+          // there would deadlock the play, so the API is left to judge, and its
+          // response fills the list in for every step after this one.
+          if (
+            session.availableActions.length > 0 &&
+            !session.availableActions.includes(action)
+          ) {
             stopped =
               `${actionName(action)} is not available ` +
               `(available: ${session.availableActions.join(", ") || "none"})`;
@@ -221,14 +291,13 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
           ) {
             session.levelsReported.push(frame.levels_completed);
             emitProgress({
-              // Keyed per play: the same level reached on a later attempt is a
-              // genuinely new note, and the gateway dedupes on this key.
-              key: `arc:${session.gameId}:play${session.playIndex}:level:${frame.levels_completed}`,
+              // One play per execution, so the level alone identifies the note;
+              // the gateway dedupes on this key.
+              key: `arc:${session.gameId}:level:${frame.levels_completed}`,
               text:
                 `ARC ${session.gameId}: reached level ${frame.levels_completed}` +
                 `${session.winLevels ? `/${session.winLevels}` : ""} ` +
-                `(${session.actionsSent} actions` +
-                `${session.playIndex > 0 ? `, play ${session.playIndex + 1}` : ""}).`
+                `(${session.actionsSent} actions).`
             });
           }
 
@@ -255,13 +324,14 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
 
         const terminal =
           session.state === "WIN" || session.state === "GAME_OVER"
-            ? "\nThis play is over — call arc_reset_game to play again, or write your final report."
+            ? "\nThis play is over — write your final report."
             : "";
         const header =
           steps.length === 1
             ? ""
             : `${steps.length} steps requested, ${sent} sent.\n`;
         return (
+          opening +
           header +
           trace.join("\n") +
           "\n" +
@@ -282,23 +352,36 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
         radius: z.number().int().min(1).max(20).optional()
       }),
       execute: async ({ view, x, y, radius }) => {
-        const session = await load();
-        const grid = session === null ? null : board(session);
-        if (grid === null) return "No game in progress.";
-        switch (view) {
-          case "grid":
-            return renderGrid(grid);
-          case "region":
-            if (x === undefined || y === undefined)
-              return "region view needs x and y.";
-            return renderRegion(grid, y, x, radius);
-          case "histogram":
-            return colorHistogram(grid)
-              .map((h) => `${colorName(h.color)}: ${h.count} cells`)
-              .join("\n");
-          case "shapes":
-            return renderShapes(grid);
+        const session = await resume();
+        const grid = board(session);
+        // Ahead of `orient`, so a chunk that opens on a boardless inspect has not
+        // spent its one orientation on a message that cannot carry it: this
+        // reply already says the board is unknown, and the next call — the first
+        // `arc_act`, or an inspect once a frame has landed — orients instead.
+        if (grid === null) {
+          return (
+            "No board received yet for this play — the frame arrives with your " +
+            "first `arc_act`, so take one action and inspect after it."
+          );
         }
+        const opening = orient(session, false);
+        const rendered = ((): string => {
+          switch (view) {
+            case "grid":
+              return renderGrid(grid);
+            case "region":
+              if (x === undefined || y === undefined)
+                return "region view needs x and y.";
+              return renderRegion(grid, y, x, radius);
+            case "histogram":
+              return colorHistogram(grid)
+                .map((h) => `${colorName(h.color)}: ${h.count} cells`)
+                .join("\n");
+            case "shapes":
+              return renderShapes(grid);
+          }
+        })();
+        return opening + rendered;
       }
     })
   };
@@ -311,42 +394,34 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
 }
 
 /**
- * The session after a RESET: a fresh play, with any previous one archived into
- * `plays` so the final report can account for every attempt. Per-play counters
- * (`actionsSent`, `levelsReported`) start over; the cookie jar and the history of
- * plays carry forward.
+ * A session file for the resolved play, built from whatever the parent could
+ * supply.
+ *
+ * With `runtime.frame` — this chunk is the one that opened the play — the state
+ * is complete and indistinguishable from what a local RESET used to produce.
+ * Without it the play already existed, so everything a frame carries is unknown:
+ * empty `availableActions` and a null board, both filled in by the first ACTION.
+ * Only `guid` matters for correctness, and it always comes from the parent.
  */
-function nextSession(
-  previous: ArcSession | null,
+function joinSession(
   gameId: string,
   cardId: string,
-  frame: FrameResponse,
-  cookies: Record<string, string>
+  guid: string,
+  runtime: { cookies?: Record<string, string>; frame?: FrameResponse }
 ): ArcSession {
-  const plays: PlaySummary[] = previous ? [...previous.plays] : [];
-  if (previous) {
-    plays.push({
-      gameId: previous.gameId,
-      guid: previous.guid,
-      state: previous.state,
-      levelsCompleted: previous.levelsCompleted,
-      actionsSent: previous.actionsSent
-    });
-  }
+  const frame = runtime.frame;
   return {
     cardId,
     gameId,
-    guid: frame.guid,
-    cookies,
-    winLevels: frame.win_levels ?? 0,
-    levelsCompleted: frame.levels_completed,
-    state: frame.state,
-    availableActions: frame.available_actions,
+    guid,
+    cookies: runtime.cookies ?? {},
+    winLevels: frame?.win_levels ?? 0,
+    levelsCompleted: frame?.levels_completed ?? 0,
+    state: frame?.state ?? "NOT_FINISHED",
+    availableActions: frame?.available_actions ?? [],
     actionsSent: 0,
-    playIndex: plays.length,
-    plays,
     levelsReported: [],
-    lastGridHex: serializeGrid(lastGrid(frame.frame)),
+    lastGridHex: frame ? serializeGrid(lastGrid(frame.frame)) : null,
     pendingAction: null
   };
 }
@@ -395,8 +470,18 @@ function renderDiff(diff: GridDiff): string {
   return `${diff.changed} cells changed${where}${examples}`;
 }
 
-/** Level / state / legal-actions — the board-independent status, one line. */
+/**
+ * Level / state / legal-actions — the board-independent status, one line.
+ *
+ * A session that joined a play without a frame knows none of it, and saying
+ * `level 0 | state NOT_FINISHED | available actions: none` there would state
+ * three placeholders as facts — the last of which reads as "you may do nothing".
+ * Such a session is reported as what it is instead.
+ */
 function stateLine(session: ArcSession): string {
+  if (session.availableActions.length === 0 && session.lastGridHex === null) {
+    return "level, state and available actions arrive with your next action's result";
+  }
   return [
     `level ${session.levelsCompleted}${session.winLevels ? `/${session.winLevels}` : ""}`,
     `state ${session.state}`,
@@ -405,10 +490,9 @@ function stateLine(session: ArcSession): string {
 }
 
 /**
- * Full summary used on start / re-entry, including where every shape is. Orienting
- * the model here is what lets a reset cost one turn instead of two: the old text
- * told it to call `arc_inspect` next, which guaranteed a second turn before it
- * could act.
+ * Full summary used when `arc_act` joins the play, including where every shape
+ * is. Orienting the model here is what keeps joining free: it never costs a turn
+ * of its own, and the model is not left acting blind.
  */
 function describeState(session: ArcSession, prefix: string): string {
   const grid =

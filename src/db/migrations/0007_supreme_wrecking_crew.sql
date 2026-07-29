@@ -1,0 +1,1 @@
+ALTER TABLE `scorecards` ADD `guids_json` text DEFAULT '{}' NOT NULL;

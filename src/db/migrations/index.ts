@@ -60,6 +60,12 @@ const dbMigrations: MigrationConfig = {
         when: 1785279904141,
         tag: "0006_drop_scorecard_status",
         breakpoints: true
+      },
+      {
+        idx: 7,
+        when: 1785344281948,
+        tag: "0007_supreme_wrecking_crew",
+        breakpoints: true
       }
     ]
   },
@@ -161,7 +167,10 @@ CREATE INDEX \`idx_scorecards_last_used_at\` ON \`scorecards\` (\`last_used_at\`
     // so open/closed state and the close-only summary have no reader left.
     m0006: `ALTER TABLE \`scorecards\` DROP COLUMN \`status\`;--> statement-breakpoint
 ALTER TABLE \`scorecards\` DROP COLUMN \`closed_at\`;--> statement-breakpoint
-ALTER TABLE \`scorecards\` DROP COLUMN \`summary_json\`;`
+ALTER TABLE \`scorecards\` DROP COLUMN \`summary_json\`;`,
+    // One RESET per game per card: the guid it minted is recorded so nothing ever
+    // opens a second play on a card that already has one.
+    m0007: `ALTER TABLE \`scorecards\` ADD \`guids_json\` text DEFAULT '{}' NOT NULL;`
   }
 };
 

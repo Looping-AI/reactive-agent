@@ -130,7 +130,6 @@ describe("buildTools", () => {
 
   it("never gives the main agent the tools that play a game", () => {
     const tools = buildTools({ arcGames: arcGamesDeps() });
-    expect(tools.arc_reset_game).toBeUndefined();
     expect(tools.arc_act).toBeUndefined();
     expect(tools.arc_inspect).toBeUndefined();
   });
@@ -224,11 +223,7 @@ describe("buildRecipeTools", () => {
 
   it("builds the arc-game play tools, and no scorecard tools", () => {
     const built = buildRecipeTools(["arc-game"], ctx());
-    expect(Object.keys(built.tools).sort()).toEqual([
-      "arc_act",
-      "arc_inspect",
-      "arc_reset_game"
-    ]);
+    expect(Object.keys(built.tools).sort()).toEqual(["arc_act", "arc_inspect"]);
   });
 
   it("gives a subagent no way to open or close a scorecard", () => {

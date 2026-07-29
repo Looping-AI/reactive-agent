@@ -10,6 +10,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   gameScoreReport,
   renderGameScore,
+  resolvePlay,
   resolveScorecard,
   SCORECARD_REUSE_MS,
   type ArcScorecardDeps
@@ -109,8 +110,21 @@ const OTHER_GAME = {
 const card = (over: Partial<Scorecard> = {}): Scorecard => ({
   cardId: "card-1",
   cookies: { AWSALB: "x" },
+  guids: {},
   openedAt: Date.now(),
   lastUsedAt: Date.now(),
+  ...over
+});
+
+/** A RESET response body; `guid` is the handle the whole policy turns on. */
+const FRAME = (over: Record<string, unknown> = {}) => ({
+  game_id: "ls20-abc",
+  guid: "gid-new",
+  frame: [[[0, 1]]],
+  state: "NOT_FINISHED",
+  levels_completed: 0,
+  win_levels: 5,
+  available_actions: [1, 2],
   ...over
 });
 
@@ -204,6 +218,115 @@ describe("resolveScorecard", () => {
 
     expect(second.cardId).toBe(first.cardId);
     expect(hits).toEqual(["/api/scorecard/open"]);
+  });
+});
+
+/**
+ * The one RESET in the system, and the rule that keeps it one: a guid recorded
+ * per (card, game) is what stops a retry, a fresh workspace, or a second chunk
+ * from opening a play the first one already opened. Every extra RESET would be a
+ * separately-scored run on the card that discards what the first play reached.
+ */
+describe("resolvePlay", () => {
+  it("RESETs once and records the guid against the card", async () => {
+    const hits = stubFetch({ "/api/cmd/RESET": () => FRAME() });
+    const d = deps([card()]);
+
+    const play = await resolvePlay(d, "ls20-abc");
+    expect(play.cardId).toBe("card-1");
+    expect(play.guid).toBe("gid-new");
+    // The opening frame goes only to whoever opened the play.
+    expect(play.frame).toBeDefined();
+    expect(hits.filter((h) => h === "/api/cmd/RESET")).toHaveLength(1);
+    expect(d.store.get("card-1")?.guids["ls20-abc"]).toBe("gid-new");
+  });
+
+  it("reuses the recorded guid instead of opening a second play", async () => {
+    const hits = stubFetch({ "/api/cmd/RESET": () => FRAME() });
+    const d = deps([card({ guids: { "ls20-abc": "gid-existing" } })]);
+
+    const play = await resolvePlay(d, "ls20-abc");
+    expect(play.guid).toBe("gid-existing");
+    expect(hits).not.toContain("/api/cmd/RESET");
+    // Nothing to hand over: the board belongs to a play already in progress.
+    expect(play.frame).toBeUndefined();
+  });
+
+  it("resolves the same play on every later chunk", async () => {
+    stubFetch({ "/api/cmd/RESET": () => FRAME() });
+    const d = deps([card()]);
+
+    const first = await resolvePlay(d, "ls20-abc");
+    const second = await resolvePlay(d, "ls20-abc");
+    const third = await resolvePlay(d, "ls20-abc");
+    expect([second.guid, third.guid]).toEqual([first.guid, first.guid]);
+    expect([second.frame, third.frame]).toEqual([undefined, undefined]);
+  });
+
+  it("opens a separate play per game on one shared card", async () => {
+    let n = 0;
+    stubFetch({ "/api/cmd/RESET": () => FRAME({ guid: `gid-${++n}` }) });
+    const d = deps([card()]);
+
+    const a = await resolvePlay(d, "ls20-abc");
+    const b = await resolvePlay(d, "px7-def");
+    // Sharing a card is the normal case; sharing a play would be a bug.
+    expect(a.guid).not.toBe(b.guid);
+    expect(d.store.get("card-1")?.guids).toEqual({
+      "ls20-abc": a.guid,
+      "px7-def": b.guid
+    });
+  });
+
+  it("hands every racing caller the guid that won, and no frame to the loser", async () => {
+    let n = 0;
+    stubFetch({ "/api/cmd/RESET": () => FRAME({ guid: `gid-${++n}` }) });
+    const d = deps([card()]);
+
+    // Both find no recorded guid and both RESET. The store keeps the first, and
+    // the loser must not hand out a play nobody else will ever join.
+    const [first, second] = await Promise.all([
+      resolvePlay(d, "ls20-abc"),
+      resolvePlay(d, "ls20-abc")
+    ]);
+    expect(second.guid).toBe(first.guid);
+    const winner = d.store.get("card-1")?.guids["ls20-abc"];
+    expect(winner).toBe(first.guid);
+    const loser = [first, second].find((p) => p.frame === undefined);
+    expect(loser).toBeDefined();
+  });
+
+  it("opens the card first when there is none, then the play on it", async () => {
+    const hits = stubFetch({
+      "/api/scorecard/open": () => ({ card_id: "card-fresh" }),
+      "/api/cmd/RESET": () => FRAME()
+    });
+    const d = deps();
+
+    const play = await resolvePlay(d, "ls20-abc");
+    expect(play.cardId).toBe("card-fresh");
+    expect(hits).toEqual(["/api/scorecard/open", "/api/cmd/RESET"]);
+    expect(d.store.get("card-fresh")?.guids["ls20-abc"]).toBe("gid-new");
+  });
+
+  it("opens a new play when the card rolled over, since a guid is card-bound", async () => {
+    const now = Date.now();
+    stubFetch({
+      "/api/scorecard/open": () => ({ card_id: "card-2" }),
+      "/api/cmd/RESET": () => FRAME({ guid: "gid-on-card-2" })
+    });
+    // The old card is past the reuse window, so its guid is unreachable: a play
+    // belongs to the card it was opened on.
+    const d = deps([
+      card({
+        guids: { "ls20-abc": "gid-on-card-1" },
+        lastUsedAt: now - SCORECARD_REUSE_MS - MINUTE
+      })
+    ]);
+
+    const play = await resolvePlay(d, "ls20-abc", now);
+    expect(play.cardId).toBe("card-2");
+    expect(play.guid).toBe("gid-on-card-2");
   });
 });
 
