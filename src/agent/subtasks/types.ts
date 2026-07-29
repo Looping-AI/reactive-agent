@@ -1,4 +1,5 @@
 import type { ResolvedRecipe, SubtaskParams } from "@/recipes/types";
+import type { FrameResponse } from "@/recipes/arc-game/types";
 
 export type SubtaskStatus =
   "pending" | "running" | "completed" | "failed" | "skipped" | "canceled";
@@ -62,6 +63,19 @@ export interface SubtaskRuntime {
   cardId?: string;
   /** Cookies an external API pinned to that resource. */
   cookies?: Record<string, string>;
+  /**
+   * The ARC play handle for this Subtask's game on that card, resolved by
+   * `resolvePlay`. The subagent never mints one — it has no reset tool and its
+   * client never calls RESET — so this is the only way a play reaches it, and
+   * receiving the same guid twice is what makes a retry rejoin one play.
+   */
+  guid?: string;
+  /**
+   * The opening frame, present only when this resolution is what opened the
+   * play. A later chunk or a re-dispatch gets the guid without it; see
+   * `ResolvedPlay.frame` for why no endpoint can supply it after the fact.
+   */
+  frame?: FrameResponse;
 }
 
 /**

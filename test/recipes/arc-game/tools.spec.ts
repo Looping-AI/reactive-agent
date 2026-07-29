@@ -1,6 +1,6 @@
 /**
- * The `arc-game` tool family (src/recipes/arc-game/tools.ts): reset / act /
- * inspect, with session state in an in-memory workspace.
+ * The `arc-game` tool family (src/recipes/arc-game/tools.ts): act / inspect,
+ * with session state in an in-memory workspace.
  *
  * These specs script *synthetic* responses per request to exercise the
  * state-transition branches (level-up, GAME_OVER, unavailable action, replay) —
@@ -9,12 +9,14 @@
  * the deterministic flow through the undici SnapshotAgent VCR
  * (test/helpers/vcr.ts) instead of stubbing `fetch`.
  *
- * The family plays; it never opens or closes a scorecard. Several specs here
- * assert that negative directly, because it used to do both.
+ * The family plays; it never opens or closes a scorecard, and it never offers a
+ * reset. Several specs here assert those negatives directly, because it used to
+ * do all three: one execution is now one play, and a GAME_OVER is the result the
+ * card recorded rather than something to retry away.
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { buildArcGameTools } from "@/recipes/arc-game/tools";
-import type { ArcSession } from "@/recipes/arc-game/types";
+import type { ArcSession, FrameResponse } from "@/recipes/arc-game/types";
 import { ctx, callTool } from "./helpers";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -26,7 +28,7 @@ function jsonResponse(body: unknown): Response {
   });
 }
 
-const FRAME = (over: Record<string, unknown> = {}) => ({
+const FRAME = (over: Partial<FrameResponse> = {}): FrameResponse => ({
   game_id: "ls20-abc",
   guid: "gid-1",
   frame: [
@@ -53,8 +55,6 @@ const SESSION = (over: Partial<ArcSession> = {}): ArcSession => ({
   state: "NOT_FINISHED",
   availableActions: [1, 2],
   actionsSent: 0,
-  playIndex: 0,
-  plays: [],
   levelsReported: [],
   lastGridHex: "0",
   pendingAction: null,
@@ -109,86 +109,132 @@ function stubFetchCapturing(routes: Record<string, () => unknown>) {
 }
 
 describe("arc-game tool family", () => {
-  it("resets onto the leased card and persists the session", async () => {
-    const hits = stubFetch({ "/api/cmd/RESET": () => FRAME() });
+  it("offers no reset tool — the model cannot start or restart a play", () => {
+    const { ctx: c } = ctx();
+    const { tools } = buildArcGameTools(c);
+    expect(Object.keys(tools).sort()).toEqual(["arc_act", "arc_inspect"]);
+  });
+
+  it("never RESETs — it joins the play the parent resolved", async () => {
+    const hits = stubFetch({ "/api/cmd/ACTION1": () => FRAME() });
     const { ctx: c } = ctx("test-key", {
       params: { game_id: "ls20-abc" },
-      runtime: { cardId: "card-7" }
+      runtime: { cardId: "card-7", guid: "gid-parent", frame: FRAME() }
     });
     const { tools } = buildArcGameTools(c);
 
-    const out = await callTool(tools.arc_reset_game, {});
-    expect(out).toContain("Started ls20-abc");
+    const out = await callTool(tools.arc_inspect, { view: "shapes" });
+    expect(out).toContain("Playing ls20-abc");
     // The card is not the model's business, so it is not narrated back to it.
     expect(out).not.toContain("card-7");
 
-    const session = await c.workspace.readJson<ArcSession>("arc/session.json");
-    expect(session?.cardId).toBe("card-7");
-    expect(session?.guid).toBe("gid-1");
-    expect(session?.availableActions).toEqual([1, 2, 6]);
-    expect(session?.playIndex).toBe(0);
-    expect(session?.plays).toEqual([]);
-    // It was told both ids: it must not go looking for either.
+    await callTool(tools.arc_act, one(1));
+    // The one thing this family must never do, however it is driven.
+    expect(hits).not.toContain("/api/cmd/RESET");
     expect(hits).not.toContain("/api/games");
     expect(hits).not.toContain("/api/scorecard/open");
   });
 
-  it("takes its ids from params and runtime, not from the model", async () => {
-    const bodies = stubFetchCapturing({ "/api/cmd/RESET": () => FRAME() });
+  it("seeds its session from the resolved play, not from anything it opened", async () => {
     const { ctx: c } = ctx("test-key", {
       params: { game_id: "ls20-abc" },
-      runtime: { cardId: "card-7" }
+      runtime: {
+        cardId: "card-7",
+        guid: "gid-parent",
+        cookies: { GAMESESSION: "abc" },
+        frame: FRAME({ guid: "gid-ignored" })
+      }
+    });
+    const { tools } = buildArcGameTools(c);
+    await callTool(tools.arc_inspect, { view: "shapes" });
+
+    const session = await c.workspace.readJson<ArcSession>("arc/session.json");
+    expect(session?.cardId).toBe("card-7");
+    // The guid is the parent's, and it outranks anything in the frame body: it
+    // is the play this subagent was told to join.
+    expect(session?.guid).toBe("gid-parent");
+    expect(session?.cookies).toEqual({ GAMESESSION: "abc" });
+    expect(session?.availableActions).toEqual([1, 2, 6]);
+  });
+
+  it("addresses every action to the resolved guid", async () => {
+    const bodies = stubFetchCapturing({ "/api/cmd/ACTION1": () => FRAME() });
+    const { ctx: c } = ctx("test-key", {
+      params: { game_id: "ls20-abc" },
+      runtime: { cardId: "card-7", guid: "gid-parent", frame: FRAME() }
     });
     const { tools } = buildArcGameTools(c);
 
-    // No arguments: which game, on which card, was settled before the run.
-    await callTool(tools.arc_reset_game, {});
+    await callTool(tools.arc_act, one(1));
     expect(bodies[0]).toMatchObject({
       game_id: "ls20-abc",
-      card_id: "card-7"
+      guid: "gid-parent"
     });
+    // A card id would mean this call could open a play; it cannot.
+    expect(bodies[0]).not.toHaveProperty("card_id");
   });
 
-  it("keeps a play on its own card when the lease has since rolled over", async () => {
-    // A play's later runs must land on the card its earlier runs did, or the
-    // scorecard splits one game across two cards.
-    const bodies = stubFetchCapturing({
-      "/api/cmd/RESET": () => FRAME({ state: "GAME_OVER" })
-    });
+  it("rejoins the same play in a later chunk that holds a new lease", async () => {
+    const hits = stubFetch({ "/api/cmd/ACTION1": () => FRAME() });
     const { ctx: first } = ctx("test-key", {
       params: { game_id: "ls20-abc" },
-      runtime: { cardId: "card-old" }
+      runtime: { cardId: "card-old", guid: "gid-parent", frame: FRAME() }
     });
-    await callTool(buildArcGameTools(first).tools.arc_reset_game, {});
+    await callTool(buildArcGameTools(first).tools.arc_inspect, {
+      view: "shapes"
+    });
 
-    // Same workspace, new lease: the second RESET must still name the old card.
-    const second: typeof first = { ...first, runtime: { cardId: "card-new" } };
-    await callTool(buildArcGameTools(second).tools.arc_reset_game, {});
+    // Same workspace, later chunk, lease rolled over. The session it finds is
+    // the play, and no new card can pull it onto a different one.
+    const second: typeof first = {
+      ...first,
+      runtime: { cardId: "card-new", guid: "gid-parent" }
+    };
+    await callTool(buildArcGameTools(second).tools.arc_act, one(1));
 
-    expect(bodies[1]).toMatchObject({ card_id: "card-old" });
+    expect(hits).not.toContain("/api/cmd/RESET");
     const session =
       await first.workspace.readJson<ArcSession>("arc/session.json");
     expect(session?.cardId).toBe("card-old");
   });
 
-  it("presents the parent's stored jar on the first RESET", async () => {
-    const headers: (string | undefined)[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_url: string | URL, init?: RequestInit) => {
-        headers.push(new Headers(init?.headers).get("cookie") ?? undefined);
-        return jsonResponse(FRAME());
-      })
-    );
+  it("joins a play it has no frame for, and learns the board from the first action", async () => {
+    // A re-dispatched Subtask or a lost workspace: the parent resolved the guid
+    // it already had, so there is no opening frame to hand over and no endpoint
+    // that could fetch one.
+    const hits = stubFetch({ "/api/cmd/ACTION1": () => FRAME() });
     const { ctx: c } = ctx("test-key", {
-      runtime: { cookies: { GAMESESSION: "abc" } }
+      params: { game_id: "ls20-abc" },
+      runtime: { cardId: "card-7", guid: "gid-parent" }
     });
     const { tools } = buildArcGameTools(c);
 
-    // The ARC API pins a card to the session that opened it: without this jar
-    // the card is invisible and RESET reports the game as not found.
-    await callTool(tools.arc_reset_game, {});
-    expect(headers[0]).toBe("GAMESESSION=abc");
+    const look = await callTool(tools.arc_inspect, { view: "shapes" });
+    expect(look).toContain("No board received yet");
+    // Level/state/actions are unknown here, and saying "available actions: none"
+    // would read as "you may do nothing".
+    expect(look).not.toContain("available actions: none");
+
+    // An unknown action list must not read as "nothing is legal", or the play
+    // would be stuck with no way to ever learn otherwise.
+    const acted = await callTool(tools.arc_act, one(1));
+    expect(acted).not.toContain("not available");
+    expect(hits).toContain("/api/cmd/ACTION1");
+    expect(hits).not.toContain("/api/cmd/RESET");
+
+    const session = await c.workspace.readJson<ArcSession>("arc/session.json");
+    expect(session?.availableActions).toEqual([1, 2, 6]);
+    expect(session?.lastGridHex).not.toBeNull();
+  });
+
+  it("fails loudly when no play was resolved for it", async () => {
+    const { ctx: c } = ctx("test-key", { runtime: { cardId: "card-7" } });
+    const { tools } = buildArcGameTools(c);
+    // Minting a guid is precisely the power this family does not have, so there
+    // is nothing to fall back to.
+    await expect(callTool(tools.arc_act, one(1))).rejects.toThrow(
+      "no play was resolved"
+    );
   });
 
   it("rejects an action that is not currently available", async () => {
@@ -200,7 +246,7 @@ describe("arc-game tool family", () => {
     expect(out).toContain("not available");
   });
 
-  it("emits a level-up progress event keyed to the current play", async () => {
+  it("emits a level-up progress event", async () => {
     stubFetch({ "/api/cmd/ACTION1": () => FRAME({ levels_completed: 1 }) });
     const { ctx: c, events } = ctx();
     await c.workspace.writeJson(
@@ -213,23 +259,10 @@ describe("arc-game tool family", () => {
     expect(out).toContain("level 1/5");
     expect(events).toEqual([
       {
-        key: "arc:ls20-abc:play0:level:1",
+        key: "arc:ls20-abc:level:1",
         text: expect.stringContaining("reached level 1/5") as string
       }
     ]);
-  });
-
-  it("keeps level-up keys distinct across plays, so a replay still reports", async () => {
-    stubFetch({ "/api/cmd/ACTION1": () => FRAME({ levels_completed: 1 }) });
-    const { ctx: c, events } = ctx();
-    await c.workspace.writeJson(
-      "arc/session.json",
-      SESSION({ availableActions: [1], playIndex: 1 })
-    );
-
-    const { tools } = buildArcGameTools(c);
-    await callTool(tools.arc_act, one(1));
-    expect(events[0].key).toBe("arc:ls20-abc:play1:level:1");
   });
 
   it("never closes the scorecard when a play reaches GAME_OVER", async () => {
@@ -245,61 +278,144 @@ describe("arc-game tool family", () => {
     const { tools } = buildArcGameTools(c);
     const out = await callTool(tools.arc_act, one(1));
     expect(hits).not.toContain("/api/scorecard/close");
-    expect(out).toContain("arc_reset_game");
+    // A GAME_OVER is the card's result for this game: report it, do not retry it.
+    expect(out).toContain("write your final report");
+    expect(out).not.toContain("reset");
 
     const session = await c.workspace.readJson<ArcSession>("arc/session.json");
     expect(session?.state).toBe("GAME_OVER");
   });
 
-  it("tells the model to reset or report when acting on a finished play", async () => {
+  it("sends nothing and asks for the report when acting on a finished play", async () => {
     const hits = stubFetch({});
     const { ctx: c } = ctx();
     await c.workspace.writeJson("arc/session.json", SESSION({ state: "WIN" }));
 
     const { tools } = buildArcGameTools(c);
     const out = await callTool(tools.arc_act, one(1));
-    expect(out).toContain("arc_reset_game");
+    expect(out).toContain("Write your final report");
+    expect(out).not.toContain("reset");
     expect(hits).toEqual([]);
   });
 
-  it("archives the finished play and starts a fresh one on re-reset", async () => {
-    stubFetch({ "/api/cmd/RESET": () => FRAME({ guid: "gid-2" }) });
+  it("never opens a second play after a terminal state", async () => {
+    // The exact behaviour the reset tool used to provide, now impossible: a
+    // finished play stays finished, so the scorecard's GAME_OVER stands.
+    const hits = stubFetch({});
     const { ctx: c } = ctx();
     await c.workspace.writeJson(
       "arc/session.json",
-      SESSION({
-        state: "GAME_OVER",
-        levelsCompleted: 2,
-        actionsSent: 17,
-        levelsReported: [1, 2]
-      })
+      SESSION({ state: "GAME_OVER", levelsCompleted: 2, actionsSent: 17 })
     );
 
     const { tools } = buildArcGameTools(c);
-    const out = await callTool(tools.arc_reset_game, {});
-    expect(out).toContain("Restarted ls20-abc (play 2)");
+    await callTool(tools.arc_act, one(1));
+    await callTool(tools.arc_inspect, { view: "shapes" });
+    expect(hits).not.toContain("/api/cmd/RESET");
 
+    // Untouched: no new guid, and the counters still describe the play that ran.
     const session = await c.workspace.readJson<ArcSession>("arc/session.json");
-    expect(session?.playIndex).toBe(1);
-    expect(session?.guid).toBe("gid-2");
-    expect(session?.state).toBe("NOT_FINISHED");
-    // Per-play counters start over; the finished play is kept for the report.
-    expect(session?.actionsSent).toBe(0);
-    expect(session?.levelsReported).toEqual([]);
-    expect(session?.plays).toEqual([
-      {
-        gameId: "ls20-abc",
-        guid: "gid-1",
-        state: "GAME_OVER",
-        levelsCompleted: 2,
-        actionsSent: 17
-      }
-    ]);
+    expect(session?.guid).toBe("gid-1");
+    expect(session?.state).toBe("GAME_OVER");
+    expect(session?.actionsSent).toBe(17);
   });
 
   it("has no abort hook — the scorecard is not the subagent's to release", () => {
     const { ctx: c } = ctx();
     expect(buildArcGameTools(c).abort).toBeUndefined();
+  });
+});
+
+/**
+ * Completing a level emits progress, and progress is a chunk-end boundary, so
+ * the model resumes every new level with its recent turns trimmed out of context
+ * — the board included. The tool family is rebuilt per chunk, which is what makes
+ * "once per chunk" expressible here at all: one `buildArcGameTools` call is one
+ * chunk. Leading that chunk's first result with the board costs no game action
+ * and no turn, where re-inspecting to get oriented costs a turn per level.
+ */
+describe("chunk orientation", () => {
+  it("leads this chunk's first arc_act with the status and the board", async () => {
+    stubFetch({ "/api/cmd/ACTION1": () => FRAME() });
+    const { ctx: c } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({
+        availableActions: [1],
+        levelsCompleted: 2,
+        lastGridHex: "9b\n00"
+      })
+    );
+
+    const { tools } = buildArcGameTools(c);
+    const first = await callTool(tools.arc_act, one(1));
+    expect(first).toContain("Playing ls20-abc");
+    expect(first).toContain("level 2/5");
+    expect(first).toContain("blue: row 0, col 0 (1 cell)");
+
+    // Still the same chunk: the model has all of that in context already, and
+    // repeating it every call would be the context window's problem, not a fix.
+    const second = await callTool(tools.arc_act, one(1));
+    expect(second).not.toContain("Playing ls20-abc");
+    expect(second).not.toContain("Board:");
+  });
+
+  it("leads the first arc_inspect with the status line and no second board", async () => {
+    const { ctx: c } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({ lastGridHex: "9b\n00" })
+    );
+
+    const { tools } = buildArcGameTools(c);
+    const out = await callTool(tools.arc_inspect, { view: "shapes" });
+    expect(out).toContain("Playing ls20-abc");
+    expect(out).toContain("state NOT_FINISHED");
+    // The view already IS the board; orienting with shapes too would print it
+    // twice in one result.
+    expect(out.match(/blue: row 0, col 0/g)).toHaveLength(1);
+    expect(out).not.toContain("Board:");
+  });
+
+  it("orients again in the next chunk, which is where a level-up lands", async () => {
+    stubFetch({ "/api/cmd/ACTION1": () => FRAME({ levels_completed: 1 }) });
+    const { ctx: c, events } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({ availableActions: [1], lastGridHex: "9b\n00" })
+    );
+
+    // The level-up. Its progress event is what ends the chunk.
+    const before = buildArcGameTools(c);
+    await callTool(before.tools.arc_act, one(1));
+    expect(events).toHaveLength(1);
+
+    // The next chunk: same workspace, family rebuilt, context window trimmed.
+    // The model has to be told where it is, and it must not cost it a turn.
+    const after = buildArcGameTools(c);
+    const resumed = await callTool(after.tools.arc_inspect, { view: "shapes" });
+    expect(resumed).toContain("Playing ls20-abc");
+    expect(resumed).toContain("level 1/5");
+  });
+
+  it("says where a finished play ended before asking for the report", async () => {
+    const { ctx: c } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({
+        state: "GAME_OVER",
+        levelsCompleted: 3,
+        lastGridHex: "9b\n00"
+      })
+    );
+
+    // Resuming onto a terminal play: the report has to name what it reached, and
+    // by now that may be the only place the model can read it.
+    const { tools } = buildArcGameTools(c);
+    const out = await callTool(tools.arc_act, one(1));
+    expect(out).toContain("level 3/5");
+    expect(out).toContain("state GAME_OVER");
+    expect(out).toContain("Write your final report");
   });
 });
 
@@ -311,7 +427,7 @@ describe("arc-game tool family", () => {
  */
 describe("arc_act sequences", () => {
   /** Frames whose boards differ per call, so a mis-paired diff is visible. */
-  function stubFrames(frames: Array<Record<string, unknown>>) {
+  function stubFrames(frames: FrameResponse[]) {
     let i = 0;
     const paths: string[] = [];
     vi.stubGlobal(
@@ -325,7 +441,7 @@ describe("arc_act sequences", () => {
   }
 
   /** A 2×2 board as a frame response body. */
-  const boardFrame = (grid: number[][], over: Record<string, unknown> = {}) =>
+  const boardFrame = (grid: number[][], over: Partial<FrameResponse> = {}) =>
     FRAME({ frame: [grid], available_actions: [1, 2, 4, 6], ...over });
 
   it("sends every step in order and attributes each change to its own action", async () => {
@@ -499,8 +615,10 @@ describe("arc_act sequences", () => {
     const long = await callTool(tools.arc_act, {
       steps: Array.from({ length: 6 }, () => ({ action: 4 }))
     });
-    // floor(24/6) = 4 example cells per step.
-    expect(long.split("\n")[1].match(/\(\d,\d\)/g)).toHaveLength(4);
+    // floor(24/6) = 4 example cells per step. Anchored to the step line's own
+    // text rather than its position: the chunk orientation rides in front of it.
+    const step1 = long.split("\n").find((l) => l.startsWith("1. right"));
+    expect(step1?.match(/\(\d,\d\)/g)).toHaveLength(4);
 
     await c.workspace.writeJson(
       "arc/session.json",
@@ -515,21 +633,24 @@ describe("arc_act sequences", () => {
   });
 
   it("orients a fresh play with where the shapes are, not an order to go look", async () => {
-    stubFetch({
-      "/api/cmd/RESET": () =>
-        FRAME({
-          frame: [
-            [
-              [0, 0],
-              [9, 9]
-            ]
-          ]
-        })
+    // arc_act joins the play and acts in the same turn, so the opening carries
+    // the board the parent handed over — otherwise that first action is blind.
+    const board = [
+      [0, 0],
+      [9, 9]
+    ];
+    stubFetch({ "/api/cmd/ACTION1": () => FRAME({ frame: [board] }) });
+    const { ctx: c } = ctx("test-key", {
+      runtime: {
+        cardId: "card-1",
+        guid: "gid-1",
+        frame: FRAME({ frame: [board] })
+      }
     });
-    const { ctx: c } = ctx();
     const { tools } = buildArcGameTools(c);
 
-    const out = await callTool(tools.arc_reset_game, {});
+    const out = await callTool(tools.arc_act, one(1));
+    expect(out).toContain("Playing ls20-abc");
     expect(out).toContain("blue: row 1, cols 0-1 (2 cells)");
     // The old text ended with "Call arc_inspect to see the board", which bought a
     // guaranteed second turn before the model could act.

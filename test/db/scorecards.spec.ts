@@ -41,6 +41,59 @@ describe("scorecards.open", () => {
     const card = await withScorecards("sc-missing", (s) => s.get("nope"));
     expect(card).toBeNull();
   });
+
+  it("starts with no plays recorded on it", async () => {
+    const card = await withScorecards("sc-guids-empty", (s) =>
+      s.open("card-1", {})
+    );
+    expect(card.guids).toEqual({});
+  });
+});
+
+/**
+ * The guid map is what makes RESET happen once per game per card. A guid is
+ * mintable only by RESET and a second RESET is a second scored run, so these pin
+ * the two properties the policy relies on: a guid survives a round-trip, and an
+ * existing one is never overwritten.
+ */
+describe("scorecards.setGuid", () => {
+  it("records a game's guid and round-trips it", async () => {
+    const card = await withScorecards("sc-guid-set", (s) => {
+      s.open("card-1", {});
+      s.setGuid("card-1", "ls20-abc", "gid-1");
+      return s.get("card-1");
+    });
+    expect(card?.guids).toEqual({ "ls20-abc": "gid-1" });
+  });
+
+  it("keeps one guid per game on a shared card", async () => {
+    const card = await withScorecards("sc-guid-multi", (s) => {
+      s.open("card-1", {});
+      s.setGuid("card-1", "ls20-abc", "gid-1");
+      s.setGuid("card-1", "px7-def", "gid-2");
+      return s.get("card-1");
+    });
+    expect(card?.guids).toEqual({ "ls20-abc": "gid-1", "px7-def": "gid-2" });
+  });
+
+  it("keeps the first guid, so a racing second RESET cannot steal the play", async () => {
+    const card = await withScorecards("sc-guid-race", (s) => {
+      s.open("card-1", {});
+      s.setGuid("card-1", "ls20-abc", "gid-first");
+      s.setGuid("card-1", "ls20-abc", "gid-second");
+      return s.get("card-1");
+    });
+    // Everyone resolving this game afterwards joins the play that won.
+    expect(card?.guids["ls20-abc"]).toBe("gid-first");
+  });
+
+  it("ignores an unknown card rather than creating a row for it", async () => {
+    const card = await withScorecards("sc-guid-unknown", (s) => {
+      s.setGuid("nope", "ls20-abc", "gid-1");
+      return s.get("nope");
+    });
+    expect(card).toBeNull();
+  });
 });
 
 describe("scorecards.findRecent", () => {

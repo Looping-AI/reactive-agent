@@ -22,8 +22,10 @@ import { callerContext, soulPrompt } from "@/agent/prompt";
 import { makeArcClient } from "@/recipes/arc-game/client";
 import {
   gameScoreReport,
+  resolvePlay,
   resolveScorecard,
   type ArcScorecardDeps,
+  type ResolvedPlay,
   type ResolvedScorecard
 } from "@/recipes/arc-game/scorecard";
 import { ARC_GAME_FAMILY } from "@/recipes/arc-game/tools";
@@ -38,7 +40,7 @@ import {
 } from "@/agent/history";
 import { buildAgentSession, type SessionLike } from "@/agent/session";
 import { validateRecipe } from "@/recipes/validation";
-import type { ResolvedRecipe } from "@/recipes/types";
+import type { ResolvedRecipe, SubtaskParams } from "@/recipes/types";
 import { resolveRecipeForType } from "@/agent/subtasks/subtask-types";
 import type {
   CompositionBranch,
@@ -114,6 +116,8 @@ export class ReactiveAgent extends Agent<Env> {
   private _db?: AgentDB;
   /** In-flight scorecard lease, shared by concurrent branches — see {@link leaseScorecard}. */
   private leasingCard?: Promise<ResolvedScorecard>;
+  /** In-flight play resolutions by game id — see {@link leasePlay}. */
+  private leasingPlays = new Map<string, Promise<ResolvedPlay>>();
 
   /**
    * Test-only model injection. A **field**, not a constructor argument or RPC
@@ -764,7 +768,7 @@ export class ReactiveAgent extends Agent<Env> {
       request,
       recipe: validated,
       name,
-      runtime: await this.resolveRuntime(validated.toolFamilies)
+      runtime: await this.resolveRuntime(validated.toolFamilies, subtask.params)
     };
   }
 
@@ -796,22 +800,34 @@ export class ReactiveAgent extends Agent<Env> {
   /**
    * Resolve the session state an execution needs and no model can supply.
    *
-   * Today that is one thing: an `arc-game` play needs a live scorecard, and which
-   * card is live is a fact about the clock rather than a choice — so the card is
-   * leased here instead of being delegated as a param. Called once per **chunk**,
-   * not once per run: that repetition is load-bearing, because each call also
-   * restarts the card's reuse clock, which is what keeps a long play's card alive
-   * (see `resolveScorecard`).
+   * For `arc-game` that is the card and the play on it. Which card is live is a
+   * fact about the clock rather than a choice, and the guid is mintable only by
+   * RESET — a call the subagent must never make, since a second RESET is a second
+   * run on the card. Both are settled here and handed down.
+   *
+   * Called once per **chunk**, not once per run, and that repetition is
+   * load-bearing twice over: each call restarts the card's reuse clock (which
+   * keeps a long play's card alive), and each call re-resolves the same guid from
+   * the store rather than opening anything (see `resolvePlay`).
    *
    * Keyed on the tool family rather than the Subtask type, so a second type that
    * plays ARC inherits this with no change here.
    */
   private async resolveRuntime(
-    toolFamilies: string[]
+    toolFamilies: string[],
+    params: SubtaskParams
   ): Promise<SubtaskRuntime> {
     if (!toolFamilies.includes(ARC_GAME_FAMILY)) return {};
-    const { cardId, cookies } = await this.leaseScorecard();
-    return { cardId, cookies };
+    const gameId = params.game_id;
+    // A Subtask whose params never validated still reaches here. Resolve the card
+    // alone and let the recipe's own validation report the missing game, rather
+    // than RESETting on it and turning a clean failure into an API error.
+    if (!gameId) {
+      const { cardId, cookies } = await this.leaseScorecard();
+      return { cardId, cookies };
+    }
+    const { cardId, cookies, guid, frame } = await this.leasePlay(gameId);
+    return { cardId, cookies, guid, frame };
   }
 
   /** The scorecard store + ARC client, as the scorecard policy consumes them. */
@@ -838,6 +854,28 @@ export class ReactiveAgent extends Agent<Env> {
       }
     );
     return this.leasingCard;
+  }
+
+  /**
+   * Resolve a game's play, collapsing concurrent resolutions of the *same game*
+   * onto one call.
+   *
+   * Same reasoning as {@link leaseScorecard}, and it matters more here: RESET is
+   * a `fetch`, so without this two Subtasks for one game starting together would
+   * each find no recorded guid and each open a play. The store settles that race
+   * anyway (first guid written wins), but only after a wasted run has already
+   * been recorded on the card — so collapsing is what keeps the card's history
+   * honest, not just cheap. Keyed per game: different games legitimately open
+   * different plays on the same card.
+   */
+  private leasePlay(gameId: string): Promise<ResolvedPlay> {
+    const inFlight = this.leasingPlays.get(gameId);
+    if (inFlight) return inFlight;
+    const pending = resolvePlay(this.arcScorecardDeps(), gameId).finally(() => {
+      this.leasingPlays.delete(gameId);
+    });
+    this.leasingPlays.set(gameId, pending);
+    return pending;
   }
 
   /** The validated tool families for a Subtask type, or none if the recipe is unusable. */

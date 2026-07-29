@@ -27,6 +27,7 @@ import { buildArcGameTools } from "@/recipes/arc-game/tools";
 import { buildArcGamesTools } from "@/recipes/arc-game/game-tools";
 import {
   gameScoreReport,
+  resolvePlay,
   resolveScorecard
 } from "@/recipes/arc-game/scorecard";
 import { makeArcClient } from "@/recipes/arc-game/client";
@@ -91,16 +92,37 @@ describe("arc (recorded real API)", () => {
       expect(leased.cardId).toBeTruthy();
       expect(store.get(leased.cardId)).not.toBeNull();
 
-      // 3. The subagent plays: the game arrives as its Subtask's param, the card
-      //    and the session it is pinned to as the runtime the parent resolved.
-      //    Without that jar the ARC API cannot see the card at all.
+      // 3. The parent opens the play — the one RESET in the system — and records
+      //    the guid on the card. Resolving the same game again returns that guid
+      //    against the real API, with no second RESET and so no second run.
+      const opened = await resolvePlay(deps, gameId);
+      expect(opened.cardId).toBe(leased.cardId);
+      expect(opened.guid).toBeTruthy();
+      expect(opened.frame).toBeDefined();
+      expect(store.get(leased.cardId)?.guids[gameId]).toBe(opened.guid);
+
+      const rejoined = await resolvePlay(deps, gameId);
+      expect(rejoined.guid).toBe(opened.guid);
+      expect(rejoined.frame).toBeUndefined();
+
+      // 4. The subagent plays: the game arrives as its Subtask's param, the card,
+      //    guid and the session they are pinned to as the runtime the parent
+      //    resolved. Without that jar the ARC API cannot see the card at all.
       const { ctx: c } = ctx(env.ARC_API_KEY, {
         params: { game_id: gameId },
-        runtime: { cardId: leased.cardId, cookies: leased.cookies }
+        runtime: {
+          cardId: opened.cardId,
+          cookies: opened.cookies,
+          guid: opened.guid,
+          frame: opened.frame
+        }
       });
       const play = buildArcGameTools(c);
-      const started = await callTool(play.tools.arc_reset_game, {});
-      expect(started).toContain("Started");
+      // The subagent joins the play; it has no way to open one.
+      const started = await callTool(play.tools.arc_inspect, {
+        view: "shapes"
+      });
+      expect(started).toContain("Playing");
 
       const session =
         await c.workspace.readJson<ArcSession>("arc/session.json");
@@ -120,7 +142,7 @@ describe("arc (recorded real API)", () => {
         grid.flat().every((c) => Number.isInteger(c) && c >= 0 && c < 16)
       ).toBe(true);
 
-      // 4. A SECOND game onto the same card, driven straight through the client.
+      // 5. A SECOND game onto the same card, driven straight through the client.
       //    Sharing a card is the normal case now, and it is what makes the
       //    card-wide/game-specific distinction below observable at all: this game
       //    spends actions, the one above spent none.
@@ -136,7 +158,7 @@ describe("arc (recorded real API)", () => {
         otherJar
       );
 
-      // 5. The result, read off the card with no close anywhere in sight. This
+      // 6. The result, read off the card with no close anywhere in sight. This
       //    is the assumption the whole design rests on: a scorecard reports a
       //    game's result while it is still open.
       const report = await gameScoreReport(deps, leased.cardId, gameId);

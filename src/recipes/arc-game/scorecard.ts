@@ -1,6 +1,11 @@
 import { z } from "zod";
 import type { ArcClient } from "./client";
-import type { CookieJar, Scorecard, ScorecardSummary } from "./types";
+import type {
+  CookieJar,
+  FrameResponse,
+  Scorecard,
+  ScorecardSummary
+} from "./types";
 
 /**
  * The `arc-game` recipe's scorecard policy: which card a play runs on, and what
@@ -35,6 +40,7 @@ export interface ScorecardStore {
   findRecent(since: number): Scorecard | null;
   get(cardId: string): Scorecard | null;
   open(cardId: string, cookies: CookieJar): Scorecard;
+  setGuid(cardId: string, gameId: string, guid: string): void;
   touch(cardId: string): void;
 }
 
@@ -68,6 +74,54 @@ export async function resolveScorecard(
   const { cardId, cookies } = await deps.client.openScorecard({});
   deps.store.open(cardId, cookies);
   return { cardId, cookies };
+}
+
+/** A play a subagent can join: the card, and the ARC session handle on it. */
+export interface ResolvedPlay extends ResolvedScorecard {
+  /** The ARC play handle. Every ACTION is addressed to it. */
+  guid: string;
+  /**
+   * The opening frame — present **only** on the call that minted the guid, and
+   * absent on every later resolution of the same play. There is no ARC endpoint
+   * that reads a board back, so this is the one chance to hand one over; a
+   * subagent that joins later learns the board from its first ACTION instead.
+   */
+  frame?: FrameResponse;
+}
+
+/**
+ * Resolve the play a Subtask runs: the leased card, plus the guid for this game
+ * on it — reusing the recorded one, or RESETting **once** to mint it.
+ *
+ * This is the only RESET in the system. A guid is mintable only by RESET, and a
+ * second RESET is a second run on the card: separately scored, with whatever the
+ * first play reached left behind. Pinning one guid per (card, game) in the store
+ * is what makes a re-dispatched Subtask, a lost workspace, or a later chunk
+ * rejoin the play in progress instead of quietly starting another — so a
+ * GAME_OVER stays the result this card recorded for this game.
+ */
+export async function resolvePlay(
+  deps: ArcScorecardDeps,
+  gameId: string,
+  now: number = Date.now()
+): Promise<ResolvedPlay> {
+  const { cardId, cookies } = await resolveScorecard(deps, now);
+  const recorded = deps.store.get(cardId)?.guids[gameId];
+  if (recorded !== undefined) return { cardId, cookies, guid: recorded };
+
+  const { frame, cookies: next } = await deps.client.reset(
+    { gameId, cardId },
+    cookies
+  );
+  deps.store.setGuid(cardId, gameId, frame.guid);
+
+  // `setGuid` keeps the first guid written, so losing a race to a concurrent
+  // resolution means this RESET opened a play nobody will join. Hand back the
+  // guid that won — and not this frame, which belongs to the abandoned play.
+  const winner = deps.store.get(cardId)?.guids[gameId] ?? frame.guid;
+  return winner === frame.guid
+    ? { cardId, cookies: next, guid: frame.guid, frame }
+    : { cardId, cookies: next, guid: winner };
 }
 
 /**

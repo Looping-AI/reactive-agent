@@ -5,6 +5,7 @@ import type { DB } from "@/db/db";
 import type { CookieJar, Scorecard } from "@/recipes/arc-game/types";
 
 const cookiesSchema = z.record(z.string(), z.string());
+const guidsSchema = z.record(z.string(), z.string());
 
 type ScorecardRow = typeof scorecards.$inferSelect;
 
@@ -27,6 +28,7 @@ export function makeScorecards(db: DB) {
   const rowToScorecard = (row: ScorecardRow): Scorecard => ({
     cardId: row.cardId,
     cookies: cookiesSchema.parse(JSON.parse(row.cookiesJson)),
+    guids: guidsSchema.parse(JSON.parse(row.guidsJson)),
     openedAt: row.openedAt,
     lastUsedAt: row.lastUsedAt
   });
@@ -76,6 +78,34 @@ export function makeScorecards(db: DB) {
         .orderBy(desc(scorecards.lastUsedAt))
         .get();
       return row ? rowToScorecard(row) : null;
+    },
+
+    /**
+     * Record the guid a RESET minted for one game on one card, so the next
+     * resolution of that game rejoins the play instead of opening another.
+     *
+     * Read-modify-write of a JSON map rather than a `(card_id, game_id)` table:
+     * durable-sqlite is synchronous and single-threaded within the DO, so this
+     * cannot interleave, and every reader already loads the whole row.
+     *
+     * First writer wins. Two concurrent resolutions of the same game can both
+     * find no guid and both RESET, and the loser's play must not overwrite the
+     * guid the winner already handed out — keeping the first keeps everyone
+     * afterwards on one play.
+     */
+    setGuid(cardId: string, gameId: string, guid: string): void {
+      const row = db
+        .select()
+        .from(scorecards)
+        .where(eq(scorecards.cardId, cardId))
+        .get();
+      if (!row) return;
+      const guids = guidsSchema.parse(JSON.parse(row.guidsJson));
+      if (guids[gameId] !== undefined) return;
+      db.update(scorecards)
+        .set({ guidsJson: JSON.stringify({ ...guids, [gameId]: guid }) })
+        .where(eq(scorecards.cardId, cardId))
+        .run();
     },
 
     /**

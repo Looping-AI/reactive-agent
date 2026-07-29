@@ -88,6 +88,15 @@ import type { CompositionBranch, SubtaskDraft } from "./subtasks/types";
  * small model than prose-versus-tool, which is what the weaker fallback models
  * consistently got wrong. See {@link file://./final-reply.ts final-reply.ts}.
  *
+ * Narration survived that fix by moving house. A round whose results have just come
+ * back can still announce its next step *inside* a `final_reply` — "now sending the
+ * second one" — and that ends the Task as surely as prose did, having done nothing,
+ * while telling the user the opposite. No mechanism can catch it: `final_reply` is a
+ * legitimate ending for exactly this round, and only the model knows whether the
+ * request is finished. So it is the {@link ROUND_CONTRACT} that has to close it,
+ * which is why that document keeps the two endings symmetric *after* results land
+ * rather than treating "results are in" as a cue to answer.
+ *
  * The model reasons over the whole conversation but references it by **catalog
  * index only** — see {@link renderTurnMessages}.
  */
@@ -163,15 +172,27 @@ output is raw material for you, never something the user sees directly.
 ## Using results that have come back
 
 When a \`${DELEGATE_TOOL_NAME}\` call's results are already in this conversation, they are
-yours to use. Put your answer in a \`${FINAL_REPLY_TOOL_NAME}\` call, in your own voice —
-do not paste results verbatim, introduce them as "subtask output", or mention
-subtasks, subagents, or delegation. The user asked you.
+yours to use. Speak in your own voice — do not paste results verbatim, introduce
+them as "subtask output", or mention subtasks, subagents, or delegation. The user
+asked you.
+
+Then end the round the same two ways as any other, and the choice is still yours:
+\`${FINAL_REPLY_TOOL_NAME}\` if what came back finishes the request,
+\`${DELEGATE_TOOL_NAME}\` if it does not. Results arriving is not itself a reason to
+answer. Anything the user asked for that is still undone — a later step of a plan
+they already gave you, or work the results themselves show is needed — is delegated
+again, now, in this call, rather than guessed at.
+
+**Announcing is not doing.** A \`${FINAL_REPLY_TOOL_NAME}\` that says what you are about
+to do next ends the request instead of doing it: nothing runs after that call, and
+the user has been told otherwise. If your next step is more work, that step is a
+\`${DELEGATE_TOOL_NAME}\` call whose "reply" carries the very words you would have
+announced.
 
 If some work failed or was skipped, say plainly what you could not do, in one
 short sentence, without diagnostics or blame — then give them everything you did
 manage. Never present a partial answer as complete, and never invent a result for
-work that failed. If more work is genuinely needed, delegate again instead of
-guessing.`;
+work that failed.`;
 
 /**
  * Prompt suffix teaching the round contract. Appended to the soul + caller

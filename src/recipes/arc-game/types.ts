@@ -132,6 +132,12 @@ export interface Scorecard {
    * not held by whoever happened to open it.
    */
   cookies: CookieJar;
+  /**
+   * `{ [gameId]: guid }` — the play this card has already opened per game, so a
+   * game resolving onto it a second time rejoins that play instead of RESETting
+   * a new one. See `resolvePlay` in `recipes/arc-game/scorecard.ts`.
+   */
+  guids: Record<string, string>;
   openedAt: number;
   /** Last time a play resolved onto this card; the reuse clock. */
   lastUsedAt: number;
@@ -140,31 +146,23 @@ export interface Scorecard {
 /** Session-affinity cookie jar (AWSALB*), echoed on every request of a session. */
 export type CookieJar = Record<string, string>;
 
-/** A finished play, kept so the final report can account for every attempt. */
-export interface PlaySummary {
-  gameId: string;
-  guid: string;
-  state: GameState;
-  levelsCompleted: number;
-  actionsSent: number;
-}
-
 /**
  * Durable play session, persisted to the workspace at {@link ARC_SESSION_PATH}.
  * The single grid we render/diff is the LAST grid of the frame array (the current
  * board).
  *
- * One session file spans the whole execution, not one play: reaching WIN or
- * GAME_OVER no longer ends anything, so `arc_reset_game` may be called again to
- * play once more on the same scorecard. Each finished play is archived into
- * {@link plays} first, and `playIndex` keeps per-play progress keys distinct.
+ * One session file is one play, and one execution gets exactly one: the RESET
+ * that creates this file is implicit and fires once, so reaching WIN or GAME_OVER
+ * is a terminal result to report on this card, not a state the model can reset
+ * out of. Its presence on disk is what makes that guarantee — every later tool
+ * call loads it instead of starting.
  */
 export interface ArcSession {
   /**
-   * The scorecard this session plays on, pinned at the first RESET from the card
-   * the parent resolved. Pinned rather than re-read each chunk: if the lease rolls
-   * over onto a new card mid-execution, this play must finish on the card its
-   * runs already belong to.
+   * The scorecard this play belongs to, recorded from the lease the parent
+   * resolved at the opening RESET. Kept rather than re-read each chunk: if the
+   * lease rolls over onto a new card mid-execution, this play's runs still belong
+   * to the card that recorded them.
    */
   cardId: string;
   gameId: string;
@@ -174,13 +172,9 @@ export interface ArcSession {
   levelsCompleted: number;
   state: GameState;
   availableActions: number[];
-  /** Count of actions actually sent to the API (game moves) in the current play. */
+  /** Count of actions actually sent to the API (game moves) in this play. */
   actionsSent: number;
-  /** 0-based index of the current play; increments on every re-RESET. */
-  playIndex: number;
-  /** Plays already finished in this execution, oldest first. */
-  plays: PlaySummary[];
-  /** Levels at which we have emitted a level-up progress note (per play). */
+  /** Levels at which we have emitted a level-up progress note. */
   levelsReported: number[];
   /**
    * The current board as bare hex rows (`serializeGrid`), not `number[][]`.
@@ -188,7 +182,7 @@ export interface ArcSession {
    * The workspace pretty-prints its JSON, so a nested numeric array serializes to
    * one integer per line — ~38 KB for a 64×64 board. Since the session is written
    * twice per action (write-ahead intent, then the recorded result) and one
-   * `arc_act` call may now carry several actions, that adds up to hundreds of KB of
+   * `arc_act` call may carry several actions, that adds up to hundreds of KB of
    * SQLite per tool call. Hex rows are ~4 KB.
    */
   lastGridHex: string | null;

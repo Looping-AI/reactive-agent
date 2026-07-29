@@ -105,6 +105,17 @@ export const scorecards = sqliteTable(
      * identity, not an optimization.
      */
     cookiesJson: text("cookies_json").notNull().default("{}"),
+    /**
+     * JSON `{ [gameId]: guid }` — the play this card already opened per game.
+     *
+     * This is what makes RESET happen **once per game per card**. A guid is the
+     * only handle the ARC API gives to a play, and it is mintable only by RESET,
+     * so a second RESET is a second play: a new run on the card, scored
+     * separately, discarding whatever the first reached. Recording the guid here
+     * means a re-dispatched Subtask or a subagent that lost its workspace resumes
+     * the play this card already has instead of starting another one.
+     */
+    guidsJson: text("guids_json").notNull().default("{}"),
     openedAt: integer("opened_at").notNull(),
     /** Last time a play resolved onto this card — the reuse clock. */
     lastUsedAt: integer("last_used_at").notNull()
