@@ -86,8 +86,8 @@ export const subtasks = sqliteTable(
  * `resolveScorecard` in `recipes/arc-game/scorecard.ts`.
  *
  * Unlike the old shape, rows carry nothing irreplaceable (a score is read back
- * from the API with `GET /api/scorecard/{card_id}/{game_id}`), so they are swept
- * by the weekly cron exactly like {@link notifyTasks} and {@link subtasks}.
+ * from the API with `GET /api/scorecard/{card_id}`), so they are swept by the
+ * weekly cron exactly like {@link notifyTasks} and {@link subtasks}.
  *
  * Nothing here binds a card to a Subtask. A scorecard is not owned by one unit of
  * work — several concurrent plays share the live card — so the card a subagent
