@@ -22,6 +22,13 @@ export interface MockStep {
   text?: string;
   /** Emit a tool call (finishReason "tool-calls"); may accompany `text`. */
   toolCall?: { toolName: string; input?: unknown };
+  /**
+   * Emit several tool calls in **one** step, which a real model does whenever it
+   * decides two things at once. That is the only way to script the cases the round
+   * has to arbitrate: two different endings in one step (precedence decides), or
+   * the same ending twice (the tool's own `parse` decides).
+   */
+  toolCalls?: { toolName: string; input?: unknown }[];
 }
 
 /**
@@ -48,15 +55,20 @@ function stepResult(step: MockStep) {
   > = [];
   // Keep the empty-string text part so a `{ text: "" }` step still yields "".
   if (step.text !== undefined) content.push({ type: "text", text: step.text });
-  if (step.toolCall) {
+  const calls = [
+    ...(step.toolCall ? [step.toolCall] : []),
+    ...(step.toolCalls ?? [])
+  ];
+  for (const call of calls) {
     content.push({
       type: "tool-call",
       toolCallId: crypto.randomUUID(),
-      toolName: step.toolCall.toolName,
-      input: JSON.stringify(step.toolCall.input ?? {})
+      toolName: call.toolName,
+      input: JSON.stringify(call.input ?? {})
     });
   }
-  const unified = step.toolCall ? ("tool-calls" as const) : ("stop" as const);
+  const unified =
+    calls.length > 0 ? ("tool-calls" as const) : ("stop" as const);
   return {
     content,
     finishReason: { unified, raw: undefined },

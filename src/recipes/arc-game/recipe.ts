@@ -2,6 +2,7 @@ import { z } from "zod";
 import { CHAT_MODEL_ID, CHAT_FALLBACK_MODEL_ID } from "@/config";
 import type { ResolvedRecipe, SubtaskTypeSpec } from "@/recipes/types";
 import { ARC_GAME_SOUL } from "./soul";
+import { ARC_CAPABILITY, arcDelegationGuidance } from "./main-agent";
 
 /** Semantic Subtask type the decomposer emits for a "play this game" request. */
 export const ARC_GAME_TYPE = "arc-game";
@@ -66,5 +67,9 @@ export const ARC_GAME_SPEC: SubtaskTypeSpec = {
     game_id: z.string().min(1).describe("An exact game id from arc_list_games")
   }),
   paramsHelp: "requires param `game_id` (an exact id from `arc_list_games`)",
+  // What the main agent is told about ARC, both blocks of it — see
+  // {@link file://./main-agent.ts}. Nothing in `agent/` names this domain.
+  capability: ARC_CAPABILITY,
+  delegationGuidance: arcDelegationGuidance,
   recipe: ARC_GAME_RECIPE
 };

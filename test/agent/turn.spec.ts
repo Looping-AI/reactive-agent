@@ -6,6 +6,8 @@ import {
   joinSuccessfulBranches,
   renderTurnMessages,
   runTurn,
+  ROUND_CONTRACT,
+  TURN_INSTRUCTIONS,
   type RunTurnArgs
 } from "@/agent/turn";
 import { createModelPair, type ModelPair } from "@/agent/model";
@@ -24,6 +26,7 @@ import {
   type DelegateSubtaskOutcome
 } from "@/agent/subtasks/delegate";
 import { decompositionProposalSchema } from "@/agent/subtasks/decomposition";
+import { FINAL_REPLY_TOOL_NAME } from "@/agent/final-reply";
 import type {
   CompositionBranch,
   DecompositionProposal
@@ -180,6 +183,23 @@ function capturing(...steps: MockStep[]) {
   };
   return { model, seen };
 }
+
+describe("TURN_INSTRUCTIONS", () => {
+  it("is the domain-free round contract plus whatever the types declare", () => {
+    // The contract is true of every request; how to delegate a *particular* type
+    // is that type's to say, and is collected from the recipe manifest. ARC advice
+    // was written by hand here once, in a second copy that drifted out of step
+    // with the one in the soul.
+    // The type *keys* do appear in it — the enum is interpolated from the
+    // manifest. What must not is anything written about a domain by hand.
+    for (const domain of ["ARC", "arc_", "game_id"]) {
+      expect(ROUND_CONTRACT).not.toContain(domain);
+    }
+    expect(TURN_INSTRUCTIONS.startsWith(ROUND_CONTRACT)).toBe(true);
+    expect(TURN_INSTRUCTIONS).toContain("## Playing an ARC-AGI-3 game");
+    expect(TURN_INSTRUCTIONS).toContain(FINAL_REPLY_TOOL_NAME);
+  });
+});
 
 describe("renderTurnMessages — reference catalog", () => {
   it("marks referenceable turns with the index the model selects them by", () => {
@@ -1037,7 +1057,302 @@ describe("runTurn — invalid model output", () => {
     );
     expect(outcome).not.toHaveProperty("drafts");
   });
+});
 
+/**
+ * A shape error is the one failure a model can fix once it is shown it, so it is
+ * fed back to the *same* model rather than spent on the fallback — which is for a
+ * model that could not answer at all. The `arc-game` type is the natural fixture:
+ * its required `game_id` is exactly the param two models once both omitted.
+ *
+ * Nothing here is delegate-specific: the round refuses and repairs *any* control
+ * call its tool cannot parse — see the `final_reply` cases below.
+ */
+describe("runTurn — repairing a rejected control call", () => {
+  /** A delegation the catalog rejects: `arc-game` with its required param missing. */
+  const missingGameId = delegates({
+    subtasks: [
+      {
+        localKey: "play",
+        type: "arc-game",
+        prompt: "Play the ARC-AGI-3 game.",
+        dependsOn: []
+      }
+    ]
+  });
+
+  /** The same delegation, corrected. */
+  const withGameId = delegates({
+    subtasks: [
+      {
+        localKey: "play",
+        type: "arc-game",
+        prompt: "Play the ARC-AGI-3 game ls20.",
+        dependsOn: [],
+        params: { game_id: "ls20" }
+      }
+    ]
+  });
+
+  /**
+   * One model instance shared by every attempt in a slot — the factory form used
+   * elsewhere would hand each attempt a fresh script with its counter reset, and
+   * a repair is precisely a *second* call to the same model.
+   */
+  function scripted(...steps: MockStep[]) {
+    const model = mockModel(...steps);
+    let calls = 0;
+    const orig = model.doGenerate.bind(model);
+    const seen: Array<Parameters<typeof orig>[0]> = [];
+    model.doGenerate = async (options: Parameters<typeof orig>[0]) => {
+      calls++;
+      seen.push(options);
+      return orig(options);
+    };
+    return { factory: () => model, calls: () => calls, seen };
+  }
+
+  it("retries the same model with the error and takes its correction", async () => {
+    const primary = scripted(missingGameId, withGameId);
+    const fallback = scripted(finalReply("the fallback answered"));
+
+    const outcome = await runPair(modelPair(primary.factory, fallback.factory));
+
+    expect(outcome.status).toBe("delegated");
+    if (outcome.status !== "delegated") return;
+    expect(outcome.drafts[0].params).toEqual({ game_id: "ls20" });
+    expect(primary.calls()).toBe(2);
+    // The whole point: a shape error must not cost the fallback slot.
+    expect(fallback.calls()).toBe(0);
+  });
+
+  it("shows the model its rejected call and the rejection", async () => {
+    const primary = scripted(missingGameId, withGameId);
+    await runPair(modelPair(primary.factory, () => mockModel(withGameId)));
+
+    const repaired = primary.seen[1].prompt;
+    const call = repaired.at(-2);
+    const result = repaired.at(-1);
+
+    expect(call?.role).toBe("assistant");
+    expect(call?.content).toContainEqual(
+      expect.objectContaining({
+        type: "tool-call",
+        toolName: DELEGATE_TOOL_NAME
+      })
+    );
+    expect(result?.role).toBe("tool");
+    const output = (
+      result?.content as Array<{ output?: { type: string; value: string } }>
+    )[0].output;
+    expect(output?.type).toBe("error-text");
+    expect(output?.value).toContain("game_id");
+    expect(output?.value).toContain("nothing was started");
+  });
+
+  it("falls through to the fallback only once repairs are exhausted", async () => {
+    const primary = scripted(missingGameId);
+    const fallback = scripted(finalReply("the fallback answered"));
+
+    const outcome = await runPair(
+      modelPair(primary.factory, fallback.factory),
+      { allowance: MAIN_AGENT_LIMITS.maxTurns }
+    );
+
+    expect(outcome.status).toBe("replied");
+    // The first attempt plus its three repairs, and not a fifth.
+    expect(primary.calls()).toBe(4);
+    expect(fallback.calls()).toBe(1);
+  });
+
+  it("does not repair a model that produced no decision at all", async () => {
+    const primary = scripted({ text: "" }, withGameId);
+    const fallback = scripted(finalReply("the fallback answered"));
+
+    const outcome = await runPair(modelPair(primary.factory, fallback.factory));
+
+    // Nothing to hand back, so this is the fallback's failure to cover — the
+    // primary must not be asked again.
+    expect(primary.calls()).toBe(1);
+    expect(fallback.calls()).toBe(1);
+    expect(outcome.status).toBe("replied");
+  });
+
+  it("stops repairing once the round's allowance is gone", async () => {
+    const primary = scripted(missingGameId);
+    const fallback = scripted(finalReply("the fallback answered"));
+
+    const { turns } = await runPairCosted(
+      modelPair(primary.factory, fallback.factory),
+      { allowance: 1 }
+    );
+
+    // One turn buys one attempt; a repair past the allowance would only get
+    // `stepAllowance`'s floor, which cannot reconsider an ending.
+    expect(primary.calls()).toBe(1);
+    expect(fallback.calls()).toBe(1);
+    // The documented bound: over by exactly the fallback's floor, never more.
+    expect(turns).toBe(2);
+  });
+
+  it("reports every attempt when both slots are exhausted", async () => {
+    const outcome = await runPair(
+      modelPair(
+        scripted(missingGameId).factory,
+        scripted(missingGameId).factory
+      )
+    );
+
+    expect(outcome.status).toBe("failed");
+    if (outcome.status !== "failed") return;
+    expect(outcome.error).toContain("exhausted both models");
+    expect(outcome.error).toContain("attempt 4");
+  });
+
+  /** The `error-text` the round handed back on the Nth attempt. */
+  function feedback(
+    seen: Array<{ prompt: ModelMessage[] }>,
+    attempt: number
+  ): string {
+    const result = seen[attempt].prompt.at(-1);
+    const parts = result?.content as Array<{
+      output?: { type: string; value: string };
+    }>;
+    expect(parts[0].output?.type).toBe("error-text");
+    return parts[0].output?.value ?? "";
+  }
+
+  /*
+   * A control tool has no `execute`, so the SDK validates none of its input — the
+   * round does. Before it did, every case below reached the user or the data layer
+   * unchecked.
+   */
+
+  it("refuses a blank reply instead of delivering it", async () => {
+    const session = new FakeSession();
+    const primary = scripted(
+      {
+        toolCall: { toolName: FINAL_REPLY_TOOL_NAME, input: { text: "  \n " } }
+      },
+      finalReply("a real answer")
+    );
+
+    const outcome = await runPair(
+      modelPair(primary.factory, () => mockModel(finalReply("fallback"))),
+      { session }
+    );
+
+    expect(outcome).toEqual({ status: "replied", reply: "a real answer" });
+    expect(primary.calls()).toBe(2);
+    // One reply is stored, and it is the answer — not the blank that preceded it.
+    const stored = (await session.getHistory()).filter(
+      (m) => m.id === finalReplyMessageId(TASK_ID)
+    );
+    expect(stored).toHaveLength(1);
+    expect(sessionText(stored[0])).toBe("a real answer");
+  });
+
+  it("tells the model which field of its reply was wrong", async () => {
+    const primary = scripted(
+      { toolCall: { toolName: FINAL_REPLY_TOOL_NAME, input: {} } },
+      finalReply("a real answer")
+    );
+    await runPair(
+      modelPair(primary.factory, () => mockModel(finalReply("fallback")))
+    );
+
+    const value = feedback(primary.seen, 1);
+    expect(value).toContain(`${FINAL_REPLY_TOOL_NAME} input is invalid`);
+    expect(value).toContain("text");
+  });
+
+  it("refuses a delegate payload that is not a decomposition", async () => {
+    const primary = scripted(
+      { toolCall: { toolName: DELEGATE_TOOL_NAME, input: { nonsense: true } } },
+      withGameId
+    );
+
+    const outcome = await runPair(
+      modelPair(primary.factory, () => mockModel(finalReply("fallback")))
+    );
+
+    // Rejected by the schema with a message naming the fields, rather than by
+    // `resolveDecomposition` blowing up on a shape nothing had checked.
+    const value = feedback(primary.seen, 1);
+    expect(value).toContain(`${DELEGATE_TOOL_NAME} input is invalid`);
+    expect(value).not.toContain("TypeError");
+    expect(outcome.status).toBe("delegated");
+  });
+
+  it("refuses a second delegate in one step, and says why", async () => {
+    const primary = scripted(
+      {
+        toolCalls: [
+          { toolName: DELEGATE_TOOL_NAME, input: proposal() },
+          { toolName: DELEGATE_TOOL_NAME, input: proposal() }
+        ]
+      },
+      withGameId
+    );
+
+    const outcome = await runPair(
+      modelPair(primary.factory, () => mockModel(finalReply("fallback")))
+    );
+
+    expect(feedback(primary.seen, 1)).toContain("called 2 times in one turn");
+    // Repaired on the same model rather than costing the slot.
+    expect(outcome.status).toBe("delegated");
+    expect(primary.calls()).toBe(2);
+  });
+
+  it("shows back the repeated call that was actually rejected, not the first", async () => {
+    // `final_reply` takes the *last* of a repeated set — the restatement is what
+    // the model meant. So the restatement is what the rejection is about, and
+    // showing it the earlier call would ask it to fix something it moved past.
+    const primary = scripted(
+      {
+        toolCalls: [
+          { toolName: FINAL_REPLY_TOOL_NAME, input: { text: "a first draft" } },
+          { toolName: FINAL_REPLY_TOOL_NAME, input: { text: "   " } }
+        ]
+      },
+      finalReply("a real answer")
+    );
+
+    const outcome = await runPair(
+      modelPair(primary.factory, () => mockModel(finalReply("fallback")))
+    );
+
+    expect(outcome).toEqual({ status: "replied", reply: "a real answer" });
+    const call = primary.seen[1].prompt.at(-2);
+    expect(call?.content).toContainEqual(
+      expect.objectContaining({
+        type: "tool-call",
+        toolName: FINAL_REPLY_TOOL_NAME,
+        input: { text: "   " }
+      })
+    );
+  });
+
+  it("lets the more committal ending win when two arrive together", async () => {
+    const outcome = await runPair(
+      modelPair(
+        scripted({
+          toolCalls: [
+            { toolName: FINAL_REPLY_TOOL_NAME, input: { text: "on it" } },
+            { toolName: DELEGATE_TOOL_NAME, input: proposal() }
+          ]
+        }).factory,
+        () => mockModel(finalReply("fallback"))
+      )
+    );
+
+    // The reply is the acknowledgment for the work, not an answer instead of it.
+    expect(outcome.status).toBe("delegated");
+  });
+});
+
+describe("runTurn — failure reporting", () => {
   it("does not append a reply when the round fails", async () => {
     const session = new FakeSession();
     await runPair(

@@ -28,6 +28,20 @@ export type SubtaskParamsShape = Record<string, z.ZodType<string>>;
 export type SubtaskParamsSchema = z.ZodObject<SubtaskParamsShape>;
 
 /**
+ * The control-tool names the agent injects when it renders a type's
+ * {@link SubtaskTypeSpec.delegationGuidance}.
+ *
+ * Guidance legitimately names those tools ("ask the user with `final_reply`
+ * rather than guessing"), and their names are the agent's to own. Injecting them
+ * is what lets a domain write that sentence without importing from `agent/` —
+ * the direction this module depends on.
+ */
+export interface DelegationNames {
+  delegateTool: string;
+  finalReplyTool: string;
+}
+
+/**
  * The execution budget for one Recipe, enforced by the resumable runner (not the
  * Workflow). Exactly two fields, because there are exactly two things worth
  * bounding: what an execution **costs** and how long it can **run away for**. The
@@ -134,6 +148,30 @@ export interface SubtaskTypeSpec {
   params: SubtaskParamsSchema | null;
   /** How the model is told to obtain each param, appended to the description. */
   paramsHelp?: string;
+  /**
+   * What the main agent is told it can *do* with this domain, rendered into its
+   * soul alongside the other capability blocks. Omit when the type needs no
+   * introduction beyond {@link description}.
+   *
+   * These two prompt fields exist to hold one rule: **everything the main agent
+   * is told about a domain is declared here, never written inside `agent/`.**
+   * Both of them started as hand-written blocks in `agent/prompt.ts` and
+   * `agent/turn.ts`; the main agent read the same advice twice per round from two
+   * files that had already drifted into contradicting each other on how many
+   * subtasks a multi-game request gets.
+   */
+  capability?: string;
+  /**
+   * How to construct a `delegate` payload for this type, rendered into the round
+   * contract the main agent reads every round.
+   *
+   * A function because the text names the control tools, whose names belong to
+   * the agent (see {@link DelegationNames}). Three rules, none of them enforced
+   * beyond a test: it must open with its own `## ` heading, it must not restate
+   * the params schema — the `delegate` tool description already renders that from
+   * {@link params} — and it must stay short, because every round pays for it.
+   */
+  delegationGuidance?: (names: DelegationNames) => string;
   /** The execution configuration this type runs under. */
   recipe: ResolvedRecipe;
 }

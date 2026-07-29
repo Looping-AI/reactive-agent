@@ -3,7 +3,11 @@
  */
 import { describe, it, expect } from "vitest";
 import { resolveRecipeForType } from "@/agent/subtasks/subtask-types";
-import { ARC_GAME_RECIPE, ARC_GAME_TYPE } from "@/recipes/arc-game/recipe";
+import {
+  ARC_GAME_RECIPE,
+  ARC_GAME_SPEC,
+  ARC_GAME_TYPE
+} from "@/recipes/arc-game/recipe";
 import { validateRecipe } from "@/recipes/validation";
 import { SUBAGENT_LIMITS } from "@/config";
 
@@ -33,5 +37,38 @@ describe("ARC_GAME_RECIPE", () => {
     expect(ARC_GAME_RECIPE.historyWindow).toBeLessThan(
       SUBAGENT_LIMITS.maxTurns * 2
     );
+  });
+});
+
+describe("what ARC_GAME_SPEC tells the main agent", () => {
+  const guidance = ARC_GAME_SPEC.delegationGuidance!({
+    delegateTool: "delegate",
+    finalReplyTool: "final_reply"
+  });
+
+  it("owns both halves of it, so neither can drift from the other", () => {
+    // Both used to be hand-written in `agent/` — the capability in the soul, the
+    // guidance in the round contract — and they ended up disagreeing: one said to
+    // delegate a subtask per game, the other said exactly one subtask and nothing
+    // else. They are declared together now, and they agree.
+    expect(ARC_GAME_SPEC.capability).toContain(
+      "one `arc-game` subtask per game"
+    );
+    expect(guidance).toContain("per game");
+    expect(guidance).not.toContain("exactly one");
+  });
+
+  it("names the param that starts a play and the tool that supplies it", () => {
+    for (const text of [ARC_GAME_SPEC.capability!, guidance]) {
+      expect(text).toContain("game_id");
+      expect(text).toContain("arc_list_games");
+      // The card is leased per chunk by the recipe; naming one here would invite
+      // the model to pass a param the type does not declare.
+      expect(text).not.toContain("card_id");
+    }
+  });
+
+  it("leaves the params schema to the delegate tool description", () => {
+    expect(guidance).not.toContain(ARC_GAME_SPEC.paramsHelp);
   });
 });
