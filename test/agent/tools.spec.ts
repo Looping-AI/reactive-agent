@@ -12,20 +12,26 @@ import type { SubtaskRuntime } from "@/agent/subtasks/types";
 /**
  * An ARC client whose every method throws: registration assertions never run a
  * handler, and a throw makes an accidental call obvious.
+ *
+ * Annotated as `ArcClient` rather than cast to it. A `as unknown as ArcClient`
+ * here silently outlived a rename — the stub kept a `getGameScorecard` the
+ * interface no longer had — because a double cast asserts the shape instead of
+ * checking it. The annotation makes any future drift a compile error. `unused`
+ * returns `never`, which satisfies every method's return type, and TypeScript
+ * accepts a zero-argument function for a method that takes arguments.
  */
 function arcGamesDeps(): ArcGamesDeps {
   const unused = () => {
     throw new Error("not called in registration tests");
   };
-  return {
-    client: {
-      listGames: unused,
-      openScorecard: unused,
-      getGameScorecard: unused,
-      reset: unused,
-      act: unused
-    } as unknown as ArcClient
+  const client: ArcClient = {
+    listGames: unused,
+    openScorecard: unused,
+    getScorecard: unused,
+    reset: unused,
+    act: unused
   };
+  return { client };
 }
 
 /** Recall deps backed by a fake index returning one canned match. */
