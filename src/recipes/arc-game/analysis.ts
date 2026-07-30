@@ -276,22 +276,211 @@ export function connectedComponents(grid: number[][]): ComponentSummary[] {
 }
 
 /**
- * Named components with their positions, largest first — the locational view.
- * `cap` bounds the list; anything beyond it is reported as a count so the model
- * knows the view is truncated rather than complete.
+ * How much of its bounding box a region actually occupies, 0–1.
+ *
+ * Boxes are well formed by construction wherever this is used: every caller
+ * passes either a {@link Component} from {@link locateComponents} or a
+ * {@link unionBox} of those, and a flood fill cannot produce `bottom < top`. So
+ * `area` is always at least 1, and the zero-area branch below is unreachable —
+ * kept only so a malformed box degrades to 0 instead of dividing by zero.
+ *
+ * The result is deliberately **not** clamped into 0–1. An out-of-range value here
+ * could only mean a caller broke that invariant, and the way to learn that is a
+ * region classified absurdly, not a number quietly corrected into looking sane.
+ */
+export function fillRatio(box: Box, size: number): number {
+  const area = (box.bottom - box.top + 1) * (box.right - box.left + 1);
+  return area === 0 ? 0 : size / area;
+}
+
+/**
+ * The rectangle enclosing several boxes. Takes a **non-empty** list — the reduce
+ * has no seed, since there is no identity box to start from, so `[]` throws. Its
+ * one caller filters components for a color it is already holding one of, and so
+ * cannot pass an empty list.
+ */
+function unionBox(boxes: Box[]): Box {
+  return boxes.reduce((a, b) => ({
+    top: Math.min(a.top, b.top),
+    left: Math.min(a.left, b.left),
+    bottom: Math.max(a.bottom, b.bottom),
+    right: Math.max(a.right, b.right)
+  }));
+}
+
+/**
+ * A band of consecutive rows in which one color occupies exactly the same
+ * columns, and the column runs it occupies there.
+ */
+export interface SpanBand extends Pick<Box, "top" | "bottom"> {
+  /** Inclusive `[first, last]` column runs, left to right. */
+  cols: Array<[number, number]>;
+  /** Runs the cap dropped, so a truncated band never reads as a complete one. */
+  hidden: number;
+}
+
+/** Runs of `color` in one row, as inclusive `[first, last]` column pairs. */
+function rowRuns(row: number[], color: number): Array<[number, number]> {
+  const runs: Array<[number, number]> = [];
+  let start = -1;
+  for (let c = 0; c <= row.length; c++) {
+    const hit = c < row.length && row[c] === color;
+    if (hit && start < 0) start = c;
+    else if (!hit && start >= 0) {
+      runs.push([start, c - 1]);
+      start = -1;
+    }
+  }
+  return runs;
+}
+
+/**
+ * Where one color sits, row band by row band — the view a bounding box cannot
+ * give for a maze, a frame, or any other structure that is mostly holes.
+ *
+ * Keyed by **color rather than component** on purpose. A wall that a doorway
+ * splits into three components is one thing to a player, and three boxes describe
+ * it worse than one span list does; the flood fill's notion of connectedness is an
+ * implementation detail here, not something the model should have to reassemble.
+ *
+ * Rows whose runs are identical collapse into one band, the same trick
+ * {@link renderGrid} uses — and for the same reason, since ARC boards are banded.
+ * On a real 64×64 maze it turns 64 rows into ~20 bands.
+ */
+export function colorSpans(grid: number[][], color: number): SpanBand[] {
+  const perRow = grid.map((row) => rowRuns(row, color));
+  const keys = perRow.map((runs) =>
+    runs.map(([a, b]) => `${a}:${b}`).join(" ")
+  );
+  const bands: SpanBand[] = [];
+  for (let r = 0; r < perRow.length;) {
+    let end = r;
+    while (end + 1 < perRow.length && keys[end + 1] === keys[r]) end++;
+    if (perRow[r].length > 0) {
+      bands.push({
+        top: r,
+        bottom: end,
+        cols: perRow[r].slice(0, MAX_SPAN_RUNS),
+        hidden: Math.max(0, perRow[r].length - MAX_SPAN_RUNS)
+      });
+    }
+    r = end + 1;
+  }
+  return bands;
+}
+
+/**
+ * Runs named per band, one line each. Both caps exist to bound the render on a
+ * board this encoding suits badly — a checkerboard is 32 runs in every one of 64
+ * rows — and both announce themselves, so a clipped view is never mistaken for
+ * the whole of one.
+ */
+export function renderSpans(bands: SpanBand[]): string {
+  const lines = bands.slice(0, MAX_SPAN_BANDS).map((band) => {
+    const rows =
+      band.top === band.bottom
+        ? `row ${band.top}`
+        : `rows ${band.top}-${band.bottom}`;
+    const cols = band.cols
+      .map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`))
+      .join(", ");
+    const more = band.hidden === 0 ? "" : `, +${band.hidden} more run(s)`;
+    return `  ${rows}: cols ${cols}${more}`;
+  });
+  if (bands.length > MAX_SPAN_BANDS) {
+    lines.push(`  +${bands.length - MAX_SPAN_BANDS} more row band(s)`);
+  }
+  return lines.join("\n");
+}
+
+/** Column runs named per band before {@link renderSpans} stops. */
+const MAX_SPAN_RUNS = 8;
+
+/**
+ * Row bands named per color before {@link renderSpans} stops. Set from the real
+ * `ls20` board, whose floor needs 25: a cap that clips a terrain layer three
+ * quarters of the way down the board hides exactly the part a play reaches last.
+ */
+const MAX_SPAN_BANDS = 28;
+
+/**
+ * A region this big whose box it fills less than {@link SPRAWL_MAX_FILL} of is
+ * described by spans instead. Both gates matter: fill alone would spend lines on
+ * every small hollow glyph (a 3×3 donut fills 8/9 of its box, a 6×6 outline just
+ * over half), and size alone would spend them on solid blocks that a box already
+ * describes exactly.
+ */
+const SPRAWL_MIN_CELLS = 64;
+const SPRAWL_MAX_FILL = 0.7;
+
+/** How many colors {@link renderShapes} will describe by spans. */
+const SPRAWL_COLORS = 3;
+
+/**
+ * Named regions with their positions, largest first — the locational view.
+ *
+ * A bounding box describes a region only when the region roughly fills it. That
+ * holds for the movable pieces and fails for exactly the two things a route
+ * depends on: on a real `ls20` board the model was told `off-black: rows 0-63,
+ * cols 0-63 (2129 cells)` for the whole maze and `neutral: rows 5-54, cols 9-58
+ * (1354 cells)` for the whole floor, both a shade over half-filled. The first says
+ * nothing; the second is worse, asserting a 50×50 open arena of which 46% is wall.
+ * Blind to both, the play read its route off the boxes and walked into walls, then
+ * spent a dozen turns rebuilding the maze through 11×11 `region` peepholes.
+ *
+ * So a region that sprawls is rendered as {@link colorSpans} instead — every row
+ * band and the columns it occupies, which is the same fact at a resolution that
+ * can be acted on. Sprawl is judged per color and the whole color is then spanned
+ * at once, so a wall and the doorway splitting it read as one terrain layer rather
+ * than as two boxes that overlap everything.
+ *
+ * `cap` bounds the boxed list; anything beyond it is reported as a count so the
+ * model knows the view is truncated rather than complete.
  */
 export function renderShapes(grid: number[][], cap = 20): string {
   const comps = locateComponents(grid);
   if (comps.length === 0) return "no shapes (board is entirely white).";
-  const lines = comps
-    .slice(0, cap)
-    .map(
-      (s) =>
-        `${colorName(s.color)}: ${describeBox(s)} (${s.size} cell${s.size === 1 ? "" : "s"})`
-    );
-  if (comps.length > cap) {
-    lines.push(`+${comps.length - cap} more shape(s), smaller than these.`);
+
+  // Judged on the largest component of each color, walking largest-first: a color
+  // whose biggest region is a sprawl is a terrain layer whatever its offcuts do.
+  const sprawling = new Set<number>();
+  const judged = new Set<number>();
+  for (const s of comps) {
+    if (judged.has(s.color)) continue;
+    judged.add(s.color);
+    if (sprawling.size >= SPRAWL_COLORS) break;
+    if (s.size >= SPRAWL_MIN_CELLS && fillRatio(s, s.size) < SPRAWL_MAX_FILL) {
+      sprawling.add(s.color);
+    }
   }
+
+  const lines: string[] = [];
+  const spanned = new Set<number>();
+  let boxed = 0;
+  for (const s of comps) {
+    if (sprawling.has(s.color)) {
+      if (spanned.has(s.color)) continue;
+      spanned.add(s.color);
+      const parts = comps.filter((c) => c.color === s.color);
+      const cells = parts.reduce((n, c) => n + c.size, 0);
+      const box = unionBox(parts);
+      const pct = Math.round(fillRatio(box, cells) * 100);
+      lines.push(
+        `${colorName(s.color)}: ${cells} cells in ${parts.length} region(s), ` +
+          `${pct}% of ${describeBox(box)} — too sparse for a box, so by row:`
+      );
+      lines.push(renderSpans(colorSpans(grid, s.color)));
+      continue;
+    }
+    if (boxed >= cap) continue;
+    boxed++;
+    lines.push(
+      `${colorName(s.color)}: ${describeBox(s)} (${s.size} cell${s.size === 1 ? "" : "s"})`
+    );
+  }
+
+  const rest = comps.filter((c) => !sprawling.has(c.color)).length - boxed;
+  if (rest > 0) lines.push(`+${rest} more shape(s), smaller than these.`);
   return lines.join("\n");
 }
 
@@ -640,15 +829,27 @@ export function renderLegend(grid: number[][]): string {
 }
 
 /**
- * A column ruler for a labeled grid: a tens-digit line marking every 10th column
- * and a tick line beneath it, both indented past the row-label gutter.
+ * A column ruler for a labeled grid: a line labelling every `step`-th column and
+ * a tick line beneath it, both indented past the row-label gutter.
+ *
+ * Labels are **absolute** column numbers — `firstCol` is where the drawn area
+ * starts, so a clipped window rules to the same coordinates the rest of the
+ * output uses. `step` narrows for a window, where every-tenth might not land at
+ * all.
  */
-function columnRuler(cols: number, gutter: number): string[] {
+function columnRuler(
+  cols: number,
+  gutter: number,
+  firstCol = 0,
+  step = 10
+): string[] {
   let marks = "";
   let ticks = "";
   for (let c = 0; c < cols; c++) {
-    if (c % 10 === 0) {
-      const label = String(c);
+    const label = String(firstCol + c);
+    // A label that would run off the end is dropped rather than widening the
+    // ruler past the body it rules.
+    if ((firstCol + c) % step === 0 && c + label.length <= cols) {
       marks += label;
       ticks += "|";
       // The multi-char label has already consumed the next columns' slots.
@@ -659,9 +860,15 @@ function columnRuler(cols: number, gutter: number): string[] {
       ticks += " ";
     }
   }
+  // A window too narrow to contain a single mark gets no ruler at all, rather
+  // than two blank lines the caller would have to recognize as empty.
+  if (marks.trim() === "") return [];
   const pad = " ".repeat(gutter);
   return [(pad + marks).trimEnd(), (pad + ticks).trimEnd()];
 }
+
+/** Ruler spacing for {@link renderRegion}, whose windows are at most 41 wide. */
+const REGION_RULER_STEP = 5;
 
 /**
  * The full board: a legend, a column ruler, then one labeled line per row —
@@ -702,8 +909,14 @@ export function renderGrid(grid: number[][]): string {
  * The window is **clipped** on every side, never padded, which is what makes the
  * header's `cols` anchor true: character `i` of a body line is column
  * `firstCol + i`. Padding off-grid columns with spaces instead would shift that
- * mapping by up to `radius` near the left edge, and unlike {@link renderGrid}
- * this view carries no column ruler — the header is the only thing to count from.
+ * mapping by up to `radius` near the left edge.
+ *
+ * The header used to be the only thing to count from, on the reasoning that a
+ * window this narrow does not need a ruler. Logs disagree: asked to place a cell
+ * in an 11-wide window, the model counted the characters by hand and got them
+ * wrong — "cols 34-38, 5 chars wait that's 10... hmm" — then reasoned on the wrong
+ * columns. So the window is ruled too, at {@link REGION_RULER_STEP} rather than
+ * {@link renderGrid}'s tens, which a window this size can miss entirely.
  */
 export function renderRegion(
   grid: number[][],
@@ -737,6 +950,14 @@ export function renderRegion(
     renderLegend(window),
     `rows ${firstRow}-${lastRow}, cols ${firstCol}-${lastCol} ` +
       `(centered on row ${centerRow}, col ${centerCol})`,
+    // `gutter + 3` is the body's `<label> | ` prefix, so the ruler sits over the
+    // cells rather than over the labels.
+    ...columnRuler(
+      lastCol - firstCol + 1,
+      gutter + 3,
+      firstCol,
+      REGION_RULER_STEP
+    ),
     ...body
   ].join("\n");
 }

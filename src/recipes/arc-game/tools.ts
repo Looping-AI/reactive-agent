@@ -377,7 +377,7 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
 
     arc_inspect: tool({
       description:
-        "Look at the current board without taking a game action. Views: 'shapes' (every colored region with its row/column box — usually what you want, and far cheaper than the grid), 'region' (a labeled square around x,y), 'histogram' (how many cells of each color), 'grid' (the whole 64×64 board, one character per cell with a legend).",
+        "Look at the current board without taking a game action. Views: 'shapes' (every colored region with its row/column box, and for large sparse ones — walls, floors, frames — the columns they occupy in each band of rows; this is the map, and usually what you want), 'grid' (the whole 64×64 board, one character per cell with a legend and a column ruler; identical rows collapse, so it is cheaper than it sounds), 'region' (a labeled, ruled square around x,y — for fine detail, not for mapping), 'histogram' (how many cells of each color).",
       inputSchema: z.object({
         view: z.enum(["grid", "region", "histogram", "shapes"]),
         x: z.number().int().min(0).max(63).optional(),
