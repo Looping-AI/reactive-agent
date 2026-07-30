@@ -295,6 +295,341 @@ export function renderShapes(grid: number[][], cap = 20): string {
   return lines.join("\n");
 }
 
+/**
+ * What became of one shape between two frames.
+ *
+ * The four cases are kept apart because only **one** of them answers the question
+ * an action asks — did anything move? Folding a counter ticking down into the
+ * same bucket as a step taken is exactly the mistake {@link diffGrids} cannot
+ * help making: in `ls20` every action shrinks a fuel bar by four cells, so a move
+ * into a wall reports "4 cells changed" and reads, to a model told that `0 cells
+ * changed` means blocked, as a move that worked. It spent eleven actions on that
+ * misreading. A wall is `moved: []` here, whatever else on the board ticked.
+ */
+export type ShapeChange =
+  | {
+      kind: "moved";
+      /** Where it was, with its color and cell count. */
+      from: Component;
+      /** Where it is now — same color and same cell count, by construction. */
+      to: Box;
+      dRow: number;
+      dCol: number;
+    }
+  /** Same color, still overlapping, different cell count — a bar, a trail, a fill. */
+  | { kind: "resized"; from: Component; to: Component }
+  | { kind: "appeared"; shape: Component }
+  | { kind: "gone"; shape: Component };
+
+export type MovedShape = Extract<ShapeChange, { kind: "moved" }>;
+
+/**
+ * Two frames' shapes, matched. Split rather than one list because both consumers
+ * want the split: the renderer leads with movement, and a caller summing a batch
+ * accumulates only the moves.
+ */
+export interface ShapeDelta {
+  /** Every shape that travelled, largest first. */
+  moved: MovedShape[];
+  /** Resized, appeared and disappeared shapes, largest first. */
+  other: ShapeChange[];
+}
+
+/**
+ * Above this many changed shapes, a frame is a repaint (a level change, a
+ * transform) rather than a board where things moved, and naming twenty shapes
+ * that all "appeared" says less than the cell diff does. {@link renderShapeDelta}
+ * declines, and its caller falls back.
+ */
+export const MAX_SHAPE_CHANGES = 10;
+
+/** Manhattan distance between two boxes' top-left corners. */
+const originDistance = (a: Box, b: Box): number =>
+  Math.abs(a.top - b.top) + Math.abs(a.left - b.left);
+
+/**
+ * Pair each `from` with its nearest unclaimed `to`, closest pair first — a greedy
+ * assignment, which is right here because the alternative (a full optimal
+ * matching) buys nothing: within one group every candidate is the same color and
+ * the same size, and one action moves things by a few cells, so the nearest
+ * candidate is the same object in all but contrived cases.
+ */
+function pairByProximity<T extends Box>(
+  from: T[],
+  to: T[]
+): { pairs: Array<[T, T]>; unpairedFrom: T[]; unpairedTo: T[] } {
+  const candidates: Array<{ a: number; b: number; d: number }> = [];
+  for (const [a, fromShape] of from.entries()) {
+    for (const [b, toShape] of to.entries()) {
+      candidates.push({ a, b, d: originDistance(fromShape, toShape) });
+    }
+  }
+  candidates.sort((x, y) => x.d - y.d);
+
+  const claimedFrom = new Set<number>();
+  const claimedTo = new Set<number>();
+  const pairs: Array<[T, T]> = [];
+  for (const { a, b } of candidates) {
+    if (claimedFrom.has(a) || claimedTo.has(b)) continue;
+    claimedFrom.add(a);
+    claimedTo.add(b);
+    pairs.push([from[a], to[b]]);
+  }
+  return {
+    pairs,
+    unpairedFrom: from.filter((_, i) => !claimedFrom.has(i)),
+    unpairedTo: to.filter((_, i) => !claimedTo.has(i))
+  };
+}
+
+/** Group shapes under a key, preserving each group's input order. */
+function groupShapes(
+  shapes: Component[],
+  key: (s: Component) => string
+): Map<string, Component[]> {
+  const groups = new Map<string, Component[]>();
+  for (const shape of shapes) {
+    const k = key(shape);
+    const group = groups.get(k);
+    if (group) group.push(shape);
+    else groups.set(k, [shape]);
+  }
+  return groups;
+}
+
+/**
+ * Match the shapes of two frames: what moved, what changed size, what came and
+ * went. Null when there is no earlier frame to compare against.
+ *
+ * Two passes, and the order is the whole design. Color **and** cell count first,
+ * because a rigid object that travelled keeps both — that pass is what finds a
+ * move, and its pairs are never reconsidered. Color alone second, over what is
+ * left, which is what a bar losing cells or a trail growing looks like.
+ */
+export function diffShapes(
+  before: number[][] | null,
+  after: number[][]
+): ShapeDelta | null {
+  if (before === null) return null;
+  return matchShapes(locateComponents(before), locateComponents(after));
+}
+
+/** {@link diffShapes} over already-located components. Exported for tests. */
+export function matchShapes(
+  before: Component[],
+  after: Component[]
+): ShapeDelta {
+  const moved: MovedShape[] = [];
+  const other: ShapeChange[] = [];
+  const leftFrom: Component[] = [];
+  const leftTo: Component[] = [];
+
+  const rigid = (s: Component): string => `${s.color}:${s.size}`;
+  const beforeGroups = groupShapes(before, rigid);
+  const afterGroups = groupShapes(after, rigid);
+  for (const key of new Set([...beforeGroups.keys(), ...afterGroups.keys()])) {
+    const result = pairByProximity(
+      beforeGroups.get(key) ?? [],
+      afterGroups.get(key) ?? []
+    );
+    for (const [from, to] of result.pairs) {
+      // Same color, same size, same corner: either it did not move, or it turned
+      // in place. Both are silence here — a turn shows up in the cell diff, which
+      // is what the caller falls back to when this delta explains nothing.
+      if (from.top === to.top && from.left === to.left) continue;
+      moved.push({
+        kind: "moved",
+        from,
+        to,
+        dRow: to.top - from.top,
+        dCol: to.left - from.left
+      });
+    }
+    leftFrom.push(...result.unpairedFrom);
+    leftTo.push(...result.unpairedTo);
+  }
+
+  const byColor = (s: Component): string => String(s.color);
+  const colorBefore = groupShapes(leftFrom, byColor);
+  const colorAfter = groupShapes(leftTo, byColor);
+  for (const key of new Set([...colorBefore.keys(), ...colorAfter.keys()])) {
+    const result = pairByProximity(
+      colorBefore.get(key) ?? [],
+      colorAfter.get(key) ?? []
+    );
+    for (const [from, to] of result.pairs) {
+      other.push({ kind: "resized", from, to });
+    }
+    for (const shape of result.unpairedFrom)
+      other.push({ kind: "gone", shape });
+    for (const shape of result.unpairedTo) {
+      other.push({ kind: "appeared", shape });
+    }
+  }
+
+  moved.sort((x, y) => y.from.size - x.from.size);
+  other.sort((x, y) => shapeOf(y).size - shapeOf(x).size);
+  return { moved, other };
+}
+
+/** The component a change is about, whichever field carries it. */
+function shapeOf(change: ShapeChange): Component {
+  return change.kind === "appeared" || change.kind === "gone"
+    ? change.shape
+    : change.from;
+}
+
+/** `orange 2×5` — a shape's color and how much board it spans. */
+function shapeLabel(s: Component): string {
+  return `${colorName(s.color)} ${s.bottom - s.top + 1}×${s.right - s.left + 1}`;
+}
+
+/** `down 5, left 10` — a displacement in board directions, zero terms dropped. */
+export function describeShift(dRow: number, dCol: number): string {
+  const parts: string[] = [];
+  if (dRow !== 0) parts.push(`${dRow > 0 ? "down" : "up"} ${Math.abs(dRow)}`);
+  if (dCol !== 0)
+    parts.push(`${dCol > 0 ? "right" : "left"} ${Math.abs(dCol)}`);
+  return parts.length === 0 ? "no shift" : parts.join(", ");
+}
+
+/** Destination of a move, spelling out only the axis that changed. */
+function describeDestination(change: MovedShape): string {
+  if (change.dCol === 0) return `rows ${change.to.top}-${change.to.bottom}`;
+  if (change.dRow === 0) return `cols ${change.to.left}-${change.to.right}`;
+  return describeBox(change.to);
+}
+
+/**
+ * One action's effect as movement: `nothing moved` when the board's objects
+ * stayed put, whatever a counter did alongside them.
+ *
+ * Null means *this view has nothing to say* — either no shape can be paired
+ * across the frames, or so many changed that they are a repaint
+ * ({@link MAX_SHAPE_CHANGES}). Both leave the cell diff as the better witness, so
+ * the caller renders that instead rather than printing a confident "nothing
+ * moved" over a board that changed completely.
+ */
+export function renderShapeDelta(delta: ShapeDelta, cap = 6): string | null {
+  const total = delta.moved.length + delta.other.length;
+  if (total === 0 || total > MAX_SHAPE_CHANGES) return null;
+
+  const lines: string[] = [];
+  for (const change of delta.moved.slice(0, cap)) {
+    lines.push(
+      `${shapeLabel(change.from)} ${describeBox(change.from)} → ` +
+        `${describeDestination(change)} (${describeShift(change.dRow, change.dCol)})`
+    );
+  }
+  if (delta.moved.length === 0) lines.push("nothing moved");
+
+  const room = Math.max(0, cap - lines.length);
+  for (const change of delta.other.slice(0, room)) {
+    switch (change.kind) {
+      case "resized":
+        lines.push(
+          `${colorName(change.from.color)} ${describeBox(change.from)} → ` +
+            `${describeBox(change.to)} (${change.from.size}→${change.to.size} cells)`
+        );
+        break;
+      case "appeared":
+        lines.push(
+          `${shapeLabel(change.shape)} appeared at ${describeBox(change.shape)}`
+        );
+        break;
+      case "gone":
+        lines.push(
+          `${shapeLabel(change.shape)} at ${describeBox(change.shape)} is gone`
+        );
+        break;
+    }
+  }
+  const shown =
+    Math.min(delta.moved.length, cap) + Math.min(delta.other.length, room);
+  if (total > shown) lines.push(`+${total - shown} more change(s)`);
+  return lines.join("; ");
+}
+
+/** Where one shape ended up over a whole batch, and how many steps took it there. */
+export interface ShapeTravel {
+  shape: Component;
+  dRow: number;
+  dCol: number;
+  /** Steps in which this shape moved at all. */
+  moves: number;
+}
+
+/**
+ * A shape's identity within a batch: what it is, and where it sits right now.
+ * The box is passed apart from the color and cell count because a move's
+ * destination carries only a box — same color, same size, by construction.
+ */
+const travelKey = (shape: Component, at: Box): string =>
+  `${shape.color}:${shape.size}:${at.top},${at.left}`;
+
+/**
+ * Fold one step's moves into a batch's running totals.
+ *
+ * Identity is *position*, not appearance. Boards carrying two identical shapes
+ * are the ordinary case, not the contrived one — a pair of blocks, a player and
+ * its twin — and summing them under one color-and-size key reports two shapes
+ * that passed each other as one shape that never moved, which is the single
+ * worst thing this line could say.
+ *
+ * Each entry is re-keyed to where its shape landed, which is exactly where the
+ * next step's diff will find it: the frames chain, step N's board being step
+ * N+1's starting board, so a position is a stable handle for as long as the
+ * shape keeps its color and size. Sources are cleared before any destination is
+ * written, so a shape sliding into the cell another just vacated inherits its
+ * own history rather than the vacater's.
+ */
+export function trackTravel(
+  travels: Map<string, ShapeTravel>,
+  moved: MovedShape[]
+): void {
+  const started = moved.map((move) => {
+    const key = travelKey(move.from, move.from);
+    const travel = travels.get(key) ?? {
+      shape: move.from,
+      dRow: 0,
+      dCol: 0,
+      moves: 0
+    };
+    travels.delete(key);
+    return { move, travel };
+  });
+  for (const { move, travel } of started) {
+    travel.dRow += move.dRow;
+    travel.dCol += move.dCol;
+    travel.moves++;
+    travels.set(travelKey(move.from, move.to), travel);
+  }
+}
+
+/**
+ * A shape's net travel over a batch, counted in **moves** rather than cells.
+ *
+ * Cells are the misleading unit for a sequence: two presses that each slide a
+ * selector five cells are not "ten cells down", they are two moves of five, and a
+ * model reading the former will place itself ten cells from where it is. So the
+ * per-move stride is stated whenever the total divides by the moves that produced
+ * it — observed from the steps, never assumed.
+ */
+export function renderTravel(travel: ShapeTravel): string {
+  const label = shapeLabel(travel.shape);
+  if (travel.dRow === 0 && travel.dCol === 0) {
+    return `${label} is back where it started after ${travel.moves} move(s)`;
+  }
+  const shift = describeShift(travel.dRow, travel.dCol);
+  if (travel.moves <= 1) return `${label} ${shift}`;
+  const even =
+    travel.dRow % travel.moves === 0 && travel.dCol % travel.moves === 0;
+  const stride = even
+    ? `, ${describeShift(travel.dRow / travel.moves, travel.dCol / travel.moves)} per move`
+    : "";
+  return `${label} ${shift} over ${travel.moves} moves${stride}`;
+}
+
 /** `0=white 9=blue b=yellow` — maps grid characters to names, present colors only. */
 export function renderLegend(grid: number[][]): string {
   const present = colorHistogram(grid).sort((a, b) => a.color - b.color);

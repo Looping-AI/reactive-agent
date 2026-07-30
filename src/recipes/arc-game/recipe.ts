@@ -8,9 +8,10 @@ import { ARC_CAPABILITY, arcDelegationGuidance } from "./main-agent";
 export const ARC_GAME_TYPE = "arc-game";
 
 /**
- * Recipe for playing an ARC-AGI-3 game. Runs on the repo's default model pair and
- * the baseline budget; what distinguishes it is its tool families, its soul, and
- * its context discipline — not its limits.
+ * Recipe for playing an ARC-AGI-3 game. Runs on the repo's default model pair;
+ * what distinguishes it is its tool family, its soul, its context discipline, and
+ * a turn budget twice the baseline — a play is a long sequence of cheap decisions,
+ * and 20 turns bought roughly ten game actions once inspection was paid for.
  *
  * It used to be "the long recipe", budgeted at 1,000 turns on the reasoning that
  * 25 turns per chunk made 40 durable chunks. That arithmetic assumed a turn under
@@ -20,17 +21,26 @@ export const ARC_GAME_TYPE = "arc-game";
  * time and turns, both enforced directly, and a play ends through the graceful
  * summary — a terminal report with the metrics footer.
  *
- * - `historyWindow` is small: the model keeps only recent turns in context and
- *   persists durable state (rules, plans) to the workspace instead (see the
- *   memory discipline in {@link ARC_GAME_SOUL}). Note it counts *assistant
- *   messages* — one per tool call, not one per game action — so a play spends it
- *   several times faster than the number suggests.
+ * - `historyWindow` bounds context, and it is now the model's *only* memory: the
+ *   workspace tools are gone (see below), so a plan that scrolls out of it is
+ *   gone. Note it counts *assistant messages* — one per tool call, not one per
+ *   game action — so a play spends it several times faster than the number
+ *   suggests.
  * - `reportMetrics` appends the turns/model-calls/wall-clock footer the user
  *   asked to see.
  *
- * Tool families: `workspace` (the model's durable file store) and `arc-game`
- * (start/act/inspect against the ARC REST API, session state kept in the
- * workspace). Both are code-validated by `validateRecipe`/`buildRecipeTools`.
+ * Tool family: `arc-game` alone (act/inspect against the ARC REST API, session
+ * state kept in the workspace), code-validated by
+ * `validateRecipe`/`buildRecipeTools`.
+ *
+ * It used to also carry `workspace`, on the theory that a small history window
+ * needs a file store behind it. Two logged plays say otherwise: `ws_read` was
+ * never called once, and the three `ws_write` calls between them were a
+ * scratchpad for arithmetic — a use that costs a turn per note and now belongs in
+ * `arc_act`'s `note` field, which costs none and stays in the model's own history.
+ * The session file is unaffected: the family reaches the workspace through its
+ * {@link file://../../agent/tools.ts ToolFamilyContext}, not through the tools the
+ * model can see.
  */
 export const ARC_GAME_RECIPE: ResolvedRecipe = {
   key: ARC_GAME_TYPE,
@@ -38,15 +48,24 @@ export const ARC_GAME_RECIPE: ResolvedRecipe = {
   primaryModelId: CHAT_MODEL_ID,
   fallbackModelId: CHAT_FALLBACK_MODEL_ID,
   soul: ARC_GAME_SOUL,
-  toolFamilies: ["workspace", "arc-game"],
+  toolFamilies: ["arc-game"],
   enabled: true,
-  // The baseline. A game would happily use more, which is exactly why the number
-  // is not the game's to choose.
-  limits: {},
-  // Counts assistant messages (tool calls), so an inspect + act + note cycle spends
-  // three or four of these per game action; 12 left the model unable to see more
-  // than a couple of moves back, which it answered by re-inspecting.
-  historyWindow: 24,
+  // Twice the baseline turns, and the largest number that keeps
+  // `MAX_CHUNKS_PER_BRANCH` unreachable: a yielding chunk always advanced at least
+  // one turn, so a run takes at most `maxTurns` chunks and the cap is 40. Asserted
+  // in `test/agent/subtasks/subtask-types.spec.ts` — raising this past 39 is a
+  // platform change, not a recipe one.
+  //
+  // `maxWallMs` deliberately stays at the 30-minute baseline. Measured turns run
+  // ~15s but reach 165s, so time may well end a play before turn 39 does; both
+  // ceilings end it the same way, through the graceful summary, so the cost of
+  // guessing wrong here is a shorter play rather than lost work.
+  limits: { maxTurns: 39 },
+  // Counts assistant messages (tool calls), so an inspect + act cycle spends two
+  // or three of these per game action; 12 left the model unable to see more than a
+  // couple of moves back, which it answered by re-inspecting. Raised from 24 with
+  // the workspace tools' removal, since this window is now the whole of its memory.
+  historyWindow: 32,
   reportMetrics: true
 };
 

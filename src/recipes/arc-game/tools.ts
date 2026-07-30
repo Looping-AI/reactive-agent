@@ -8,13 +8,19 @@ import {
   describeBox,
   describeCell,
   diffGrids,
+  diffShapes,
   lastGrid,
   parseGrid,
   renderGrid,
   renderRegion,
+  renderShapeDelta,
   renderShapes,
+  renderTravel,
   serializeGrid,
-  type GridDiff
+  trackTravel,
+  type GridDiff,
+  type ShapeDelta,
+  type ShapeTravel
 } from "./analysis";
 import { ARC_SESSION_PATH, type ArcSession, type FrameResponse } from "./types";
 
@@ -138,6 +144,13 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
   let oriented = false;
 
   /**
+   * The last `arc_inspect` this chunk served — its arguments and the board they
+   * were rendered from. A closure variable for the same reason `oriented` is one:
+   * it must reset exactly where the model's context was trimmed.
+   */
+  let lastView: { key: string; gridHex: string | null } | null = null;
+
+  /**
    * The orientation to prepend to this chunk's first tool result, and "" after.
    *
    * Completing a level emits progress, and progress ends the chunk, so the model
@@ -160,7 +173,7 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
   const tools = {
     arc_act: tool({
       description:
-        "Take one or more actions in the current game, in order. Only use actions listed in the latest available_actions. Returns one diff per step — what each individual action changed — then the new level, state and available_actions. Batch only a movement you are confident about: every step is a real action counted against the game's baseline, so a wrong batch wastes score. While forming a hypothesis, send a single step.",
+        "Take one or more actions in the current game, in order. Only use actions listed in the latest available_actions. Returns one line per step naming which shapes moved and how far — `nothing moved` means that action was blocked or refused — then the net travel over the batch and the new level, state and available_actions. Batch the whole path you intend to walk: a batch runs to the end whatever happens, so the report tells you exactly which steps did nothing rather than stopping. Every step is a real action counted against the game's baseline, so batch a route you have reason to believe in, not a guess.",
       inputSchema: z.object({
         steps: z
           .array(
@@ -229,6 +242,15 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
         let sent = 0;
         let stopped: string | null = null;
 
+        // Where the batch left each shape — keyed by where that shape currently
+        // is, see {@link trackTravel} — plus a count of the steps that moved
+        // nothing. Both exist for the net line: a model reading five per-step
+        // lines should not have to add up its own position, and "4 of 5 steps did
+        // nothing" is the sentence that would have told this play it was walking
+        // into a wall.
+        const travels = new Map<string, ShapeTravel>();
+        let noEffect = 0;
+
         for (const [index, step] of steps.entries()) {
           const { action, x, y } = step;
 
@@ -269,10 +291,20 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
           // line attributes its change to the one action that caused it. That
           // attribution is what makes batching safe: without it the model would see
           // that the board changed but not which action changed it.
+          //
+          // Both diffs, always: the cell diff is the ground truth for "did anything
+          // change at all", and the shape delta is the only one of the two that can
+          // say a *wall* was hit on a board where something else ticks every turn.
           const before = board(session);
           const next = lastGrid(frame.frame);
           const diff = diffGrids(before, next, cellCap);
+          const delta = diffShapes(before, next);
           const prevLevel = session.levelsCompleted;
+
+          if (delta) {
+            if (delta.moved.length === 0) noEffect++;
+            trackTravel(travels, delta.moved);
+          }
 
           session.cookies = cookies;
           session.guid = frame.guid;
@@ -303,7 +335,7 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
 
           await save(session);
           trace.push(
-            `${index + 1}. ${actionName(action, x, y)} → ${renderDiff(diff)}`
+            `${index + 1}. ${actionName(action, x, y)} → ${renderEffect(diff, delta)}`
           );
 
           // The play ended mid-sequence: anything after this would act on a
@@ -334,6 +366,7 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
           opening +
           header +
           trace.join("\n") +
+          renderNet(travels, sent, noEffect) +
           "\n" +
           stateLine(session) +
           terminal +
@@ -365,6 +398,28 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
           );
         }
         const opening = orient(session, false);
+
+        // The same view of a board nothing has touched, again. Redrawing it
+        // re-answers a question already answered and teaches nothing, so say what
+        // is actually true instead. Scoped to this chunk
+        // by `lastView` being a closure variable: across a chunk boundary the
+        // earlier render has been trimmed out of context, and pointing at a view
+        // the model can no longer see would be worse than repeating it.
+        const key = JSON.stringify({ view, x, y, radius });
+        if (
+          lastView !== null &&
+          lastView.key === key &&
+          lastView.gridHex === session.lastGridHex
+        ) {
+          return (
+            opening +
+            `Unchanged since your last \`${view}\` view — not one cell of the ` +
+            "board has changed since, so what you saw then still holds. Act on " +
+            "it rather than looking again."
+          );
+        }
+        lastView = { key, gridHex: session.lastGridHex };
+
         const rendered = ((): string => {
           switch (view) {
             case "grid":
@@ -454,13 +509,64 @@ function remaining(total: number, from: number, why: string): string {
 }
 
 /**
- * What one action did: how much changed, where, and which colors — the causal
- * signal the model refines its hypothesis from.
+ * What one action did, in the most informative register the frames support.
+ *
+ * Shapes first, because "nothing moved" and "the orange 5×5 went right 5" are the
+ * two answers a player needs and neither is recoverable from a cell count. The
+ * cell diff takes over whenever the shape view declines — no pairing at all, or a
+ * repaint of everything — so a board this heuristic cannot read is described as
+ * fully as it always was, never as a confident "nothing moved".
+ */
+function renderEffect(diff: GridDiff, delta: ShapeDelta | null): string {
+  if (diff.changed < 0) return "first frame";
+  // Nothing changed anywhere, counters included: worth saying in its own words,
+  // since it means the game refused the action outright rather than absorbing it.
+  if (diff.changed === 0) return "0 cells changed (no effect at all)";
+  const shapes = delta === null ? null : renderShapeDelta(delta);
+  return shapes ?? renderDiff(diff);
+}
+
+/**
+ * Where a whole batch left things: net travel per shape, then how many of its
+ * steps changed nothing.
+ *
+ * The no-effect count is what this rendering exists for. A batch is not
+ * stopped when a step does nothing — different games mean different things by it,
+ * and guessing would throw away legitimate sequences — so the batch runs to the
+ * end and is *told on*. "4 of 5 steps moved nothing" is a sentence a model cannot
+ * misread; four consecutive fuel-bar diffs, as these logs show, is one it can.
+ */
+function renderNet(
+  travels: Map<string, ShapeTravel>,
+  sent: number,
+  noEffect: number
+): string {
+  if (sent < 2) return "";
+  const parts = [...travels.values()]
+    .sort((a, b) => b.shape.size - a.shape.size)
+    .slice(0, NET_SHAPES)
+    .map(renderTravel);
+  const moved =
+    parts.length === 0 ? "nothing moved at all" : `net: ${parts.join("; ")}`;
+  const idle =
+    noEffect === 0
+      ? ""
+      : ` — ${noEffect} of ${sent} step(s) moved nothing${
+          noEffect === sent ? " (every one of them was refused or blocked)" : ""
+        }`;
+  return `\n${moved}${idle}.`;
+}
+
+/** How many shapes the net line names before it stops. */
+const NET_SHAPES = 3;
+
+/**
+ * What one action did as cells: how much changed, where, and which colors.
+ *
+ * The fallback register — see {@link renderEffect}, which owns the "first frame"
+ * and "nothing changed" cases so this one only ever describes a real change.
  */
 function renderDiff(diff: GridDiff): string {
-  if (diff.changed < 0) return "first frame";
-  // A no-op is information, not an absence of it: it usually means blocked.
-  if (diff.changed === 0) return "0 cells changed (no effect)";
   const where = diff.box === null ? "" : `, ${describeBox(diff.box)}`;
   const examples =
     diff.cells.length === 0

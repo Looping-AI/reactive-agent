@@ -16,8 +16,10 @@
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { buildArcGameTools } from "@/recipes/arc-game/tools";
+import { parseGrid } from "@/recipes/arc-game/analysis";
 import type { ArcSession, FrameResponse } from "@/recipes/arc-game/types";
 import { ctx, callTool } from "./helpers";
+import { LS20_LEVEL1_BEFORE, LS20_LEVEL1_BLOCKED } from "./ls20-level1";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -533,16 +535,55 @@ describe("arc_act sequences", () => {
     expect(paths).toEqual(["/api/cmd/ACTION4", "/api/cmd/ACTION2"]);
     expect(out).toContain("2 steps requested, 2 sent.");
     // Step 1 moved (0,0)->(0,1); step 2 moved (0,1)->(1,1). Each line describes
-    // only its own action's change, diffed against the board just before it.
-    expect(out).toContain("1. right → 2 cells changed, row 0, cols 0-1");
-    expect(out).toContain("(0,0) blue->white, (0,1) white->blue");
-    expect(out).toContain("2. down → 2 cells changed, rows 0-1, col 1");
-    expect(out).toContain("(0,1) blue->white, (1,1) white->blue");
+    // only its own action's shift, matched against the board just before it — the
+    // same cell no longer reported twice as a vanishing and an appearing cell.
+    expect(out).toContain(
+      "1. right → blue 1×1 row 0, col 0 → cols 1-1 (right 1)"
+    );
+    expect(out).toContain(
+      "2. down → blue 1×1 row 0, col 1 → rows 1-1 (down 1)"
+    );
+    // And where the batch left it, in moves rather than in cells.
+    expect(out).toContain("net: blue 1×1 down 1, right 1 over 2 moves");
 
     const session = await c.workspace.readJson<ArcSession>("arc/session.json");
     expect(session?.actionsSent).toBe(2);
     expect(session?.lastGridHex).toBe("00\n09");
     expect(session?.pendingAction).toBeNull();
+  });
+
+  it("nets two identical shapes separately instead of cancelling them out", async () => {
+    // Two blue cells, one walking right and one walking left, one column per
+    // step. Netted by color and size alone the two cancel and the batch claims
+    // nothing moved — the one thing the model could not have recovered from the
+    // per-step lines above it.
+    stubFrames([
+      boardFrame([
+        [0, 9, 0],
+        [0, 0, 0],
+        [0, 9, 0]
+      ]),
+      boardFrame([
+        [0, 0, 9],
+        [0, 0, 0],
+        [9, 0, 0]
+      ])
+    ]);
+    const { ctx: c } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({ availableActions: [4], lastGridHex: "900\n000\n009" })
+    );
+
+    const { tools } = buildArcGameTools(c);
+    const out = await callTool(tools.arc_act, {
+      steps: [{ action: 4 }, { action: 4 }]
+    });
+    expect(out).toContain(
+      "net: blue 1×1 right 2 over 2 moves, right 1 per move; " +
+        "blue 1×1 left 2 over 2 moves, left 1 per move"
+    );
+    expect(out).not.toContain("back where it started");
   });
 
   it("reports a step that changed nothing as a real result, not a gap", async () => {
@@ -560,7 +601,89 @@ describe("arc_act sequences", () => {
 
     const { tools } = buildArcGameTools(c);
     const out = await callTool(tools.arc_act, { steps: [{ action: 4 }] });
-    expect(out).toContain("0 cells changed (no effect)");
+    expect(out).toContain("0 cells changed (no effect at all)");
+  });
+
+  // The failure this whole rendering exists for. A move into a wall on a board
+  // with a step counter changes exactly the counter, so the cell diff reports a
+  // change and reads as a move that worked; one logged play spent eleven actions,
+  // eight of them into walls, and never noticed. The shape view has to name what
+  // *moved*, and say when nothing did.
+  it("calls a blocked move blocked even when a counter ticked", async () => {
+    // Row 0 is the player, pinned against the left wall; row 1 is a counter that
+    // loses one cell per action. It starts at three cells and ends at one.
+    stubFrames([
+      boardFrame([
+        [9, 0, 0, 0],
+        [11, 11, 0, 0]
+      ]),
+      boardFrame([
+        [9, 0, 0, 0],
+        [11, 0, 0, 0]
+      ])
+    ]);
+    const { ctx: c } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({ availableActions: [4], lastGridHex: "9000\nbbb0" })
+    );
+
+    const { tools } = buildArcGameTools(c);
+    const out = await callTool(tools.arc_act, {
+      steps: [{ action: 4 }, { action: 4 }]
+    });
+
+    // Neither step moved the player, and the counter's shrinking is reported as
+    // exactly that rather than as a change of position.
+    expect(out).toContain("1. right → nothing moved");
+    expect(out).toContain("2. right → nothing moved");
+    expect(out).toContain(
+      "yellow row 1, cols 0-2 → row 1, cols 0-1 (3→2 cells)"
+    );
+    expect(out).toContain("yellow row 1, cols 0-1 → row 1, col 0 (2→1 cells)");
+    expect(out).toContain("nothing moved at all");
+    expect(out).toContain(
+      "2 of 2 step(s) moved nothing (every one of them was refused or blocked)"
+    );
+    // The cell diff is not what the model reads here — the counter's four cells
+    // would have been the whole story.
+    expect(out).not.toContain("cells changed");
+  });
+
+  // The same claim, on the board that actually produced the failure: 64×64, two
+  // dozen regions, a selector pinned against a wall and a bar that ticks anyway.
+  // A synthetic 2×4 board proves the rendering; this proves the *matching* holds up
+  // at real scale — that two dozen static shapes pair off silently and the change
+  // count stays under MAX_SHAPE_CHANGES, rather than the whole view standing aside.
+  it("reads a real blocked ls20 action as blocked", async () => {
+    stubFrames([boardFrame(parseGrid(LS20_LEVEL1_BLOCKED))]);
+    const { ctx: c } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({
+        availableActions: [1, 2, 3, 4],
+        lastGridHex: LS20_LEVEL1_BEFORE
+      })
+    );
+
+    const { tools } = buildArcGameTools(c);
+    const out = await callTool(tools.arc_act, { steps: [{ action: 4 }] });
+
+    const step = out.split("\n").find((l) => l.startsWith("1. right"));
+    expect(step).toContain("nothing moved");
+    // The selector is where it was — the claim the play got wrong about itself.
+    expect(step).not.toContain("orange");
+    expect(step).not.toContain("rows 40-41");
+    // The bar is named as a bar giving up cells, which is all it did — three
+    // actions' worth, four cells each — and the spent stretch behind it as one
+    // growing by the same amount. Two changes on a board of two dozen regions:
+    // everything else paired off silently, which is why this stays readable.
+    expect(step).toContain(
+      "yellow rows 61-62, cols 25-54 → rows 61-62, cols 31-54 (60→48 cells)"
+    );
+    expect(step).toContain(
+      "neutral rows 61-62, cols 13-24 → rows 61-62, cols 13-30 (24→36 cells)"
+    );
   });
 
   it("stops the sequence and names the unsent tail when an action goes unavailable", async () => {
@@ -649,25 +772,29 @@ describe("arc_act sequences", () => {
   });
 
   it("budgets cell detail across the batch so a long sequence cannot flood context", async () => {
-    // Every action repaints the whole 4×4 board, so each step has 16 changes and
-    // the per-step cell cap is what bounds the output.
-    const filled = (v: number) =>
-      boardFrame(Array.from({ length: 4 }, () => new Array(4).fill(v)));
+    // Every action repaints a 5×5 checkerboard in a new color: 13 isolated cells
+    // vanish and 13 appear, which is past the point where naming shapes says
+    // anything (MAX_SHAPE_CHANGES), so these steps render as cells and the
+    // per-step cell cap is what bounds the output.
+    const checker = (v: number) =>
+      boardFrame(
+        Array.from({ length: 5 }, (_, r) =>
+          Array.from({ length: 5 }, (_, c) => ((r + c) % 2 === 0 ? v : 0))
+        )
+      );
+    const blank = Array.from({ length: 5 }, () => "00000").join("\n");
     stubFrames([
-      filled(1),
-      filled(2),
-      filled(3),
-      filled(4),
-      filled(5),
-      filled(6)
+      checker(1),
+      checker(2),
+      checker(3),
+      checker(4),
+      checker(5),
+      checker(6)
     ]);
     const { ctx: c } = ctx();
     await c.workspace.writeJson(
       "arc/session.json",
-      SESSION({
-        availableActions: [4],
-        lastGridHex: Array.from({ length: 4 }, () => "0000").join("\n")
-      })
+      SESSION({ availableActions: [4], lastGridHex: blank })
     );
 
     const { tools } = buildArcGameTools(c);
@@ -677,18 +804,16 @@ describe("arc_act sequences", () => {
     // floor(24/6) = 4 example cells per step. Anchored to the step line's own
     // text rather than its position: the chunk orientation rides in front of it.
     const step1 = long.split("\n").find((l) => l.startsWith("1. right"));
+    expect(step1).toContain("cells changed");
     expect(step1?.match(/\(\d,\d\)/g)).toHaveLength(4);
 
     await c.workspace.writeJson(
       "arc/session.json",
-      SESSION({
-        availableActions: [4],
-        lastGridHex: Array.from({ length: 4 }, () => "0000").join("\n")
-      })
+      SESSION({ availableActions: [4], lastGridHex: blank })
     );
     const single = await callTool(tools.arc_act, { steps: [{ action: 4 }] });
-    // A single step has the whole budget: 24, capped by the 16 cells that changed.
-    expect(single.match(/\(\d,\d\)/g)).toHaveLength(16);
+    // A single step has the whole budget: 24, capped by the 13 cells that changed.
+    expect(single.match(/\(\d,\d\)/g)).toHaveLength(13);
   });
 
   it("orients a fresh play with where the shapes are, not an order to go look", async () => {
@@ -734,5 +859,65 @@ describe("arc_act sequences", () => {
     const grid = await callTool(tools.arc_inspect, { view: "grid" });
     expect(grid).toContain("colors: 0=white 9=blue b=yellow");
     expect(grid).toContain("| 9b");
+  });
+
+  // A play spent fifteen of nineteen turns looking, four of them at the same
+  // `shapes` view of a board nothing had touched. Redrawing it answers a question
+  // already answered; saying so is what makes the waste visible to the model.
+  it("says a repeated view is unchanged instead of drawing it again", async () => {
+    const { ctx: c } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({ lastGridHex: "9b\n00" })
+    );
+
+    const { tools } = buildArcGameTools(c);
+    expect(await callTool(tools.arc_inspect, { view: "shapes" })).toContain(
+      "blue: row 0, col 0"
+    );
+    const again = await callTool(tools.arc_inspect, { view: "shapes" });
+    expect(again).toContain("Unchanged since your last `shapes` view");
+    expect(again).not.toContain("blue: row 0, col 0");
+
+    // A different view of the same board is a different question, and answered.
+    expect(await callTool(tools.arc_inspect, { view: "histogram" })).toContain(
+      "white: 2 cells"
+    );
+  });
+
+  it("draws the same view again once the board has moved on", async () => {
+    const { ctx: c } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({ lastGridHex: "9b\n00" })
+    );
+
+    const { tools } = buildArcGameTools(c);
+    await callTool(tools.arc_inspect, { view: "shapes" });
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({ lastGridHex: "00\n9b" })
+    );
+    const moved = await callTool(tools.arc_inspect, { view: "shapes" });
+    expect(moved).toContain("blue: row 1, col 0");
+    expect(moved).not.toContain("Unchanged");
+  });
+
+  it("re-draws for a new chunk rather than pointing at a view that scrolled away", async () => {
+    // The dedupe is scoped to one chunk on purpose: across a chunk boundary the
+    // earlier render has been trimmed out of the model's context, so telling it
+    // "you already saw this" would leave it with nothing.
+    const { ctx: c } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({ lastGridHex: "9b\n00" })
+    );
+
+    await callTool(buildArcGameTools(c).tools.arc_inspect, { view: "shapes" });
+    const next = await callTool(buildArcGameTools(c).tools.arc_inspect, {
+      view: "shapes"
+    });
+    expect(next).toContain("blue: row 0, col 0");
+    expect(next).not.toContain("Unchanged");
   });
 });

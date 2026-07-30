@@ -1,5 +1,7 @@
 import { GENERAL_RECIPE } from "@/recipes/general/recipe";
+import { validateRecipe } from "@/recipes/validation";
 import type { RecipeExecutionRequest } from "@/agent/subtasks/types";
+import type { RenderableExecution } from "@/subagent/prompt";
 
 /**
  * A representative, fully-populated execution request. Override per test; the
@@ -37,4 +39,16 @@ export function makeRequest(
     ],
     ...overrides
   };
+}
+
+/**
+ * The same request with its Recipe validated — what the prompt renderer takes,
+ * and what both production call sites hand it (they validate first, so the budget
+ * it prints is the merged one and never a Recipe's partial override).
+ */
+export function makeExecution(
+  overrides: Partial<RecipeExecutionRequest> = {}
+): RenderableExecution {
+  const request = makeRequest(overrides);
+  return { ...request, recipe: validateRecipe(request.recipe) };
 }

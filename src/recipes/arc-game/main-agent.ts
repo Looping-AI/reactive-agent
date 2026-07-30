@@ -25,7 +25,8 @@ export const ARC_CAPABILITY = [
   "- `arc_list_games` shows the available games with their exact ids and tags describing how each is played.",
   "- To have a game played, delegate a subtask of type `arc-game` with param `game_id` (an exact id from `arc_list_games`). That is the whole contract — there is no scorecard for you to open, choose, or close.",
   "- To have several games played, delegate one `arc-game` subtask per game; they run concurrently.",
-  "- Each play's report ends with that game's score, read from the scorecard once the play finishes. Report that score rather than inventing one — and if a report carries no score line, say the score was unavailable."
+  "- Each play's report ends with that game's score, read from the scorecard once the play finishes. Report that score rather than inventing one — and if a report carries no score line, say the score was unavailable.",
+  "- A play's report also carries what it learned: the mechanics it confirmed, what it never got to test, and where the level's pieces are. That is the only record of it — the subagent keeps nothing between plays. Record what generalizes (mechanics, geography, what failed and why) so the next play starts from it, and keep it separate from what is merely suspected. Spent scorecard ids and other one-off residue are not worth keeping."
 ].join("\n");
 
 /**
@@ -46,9 +47,23 @@ ARC-AGI-3 game ls20."), so the subagent knows what it was asked for.
 
 If the request does not name a game, or names it loosely — call \`arc_list_games\`
 first and delegate the id associated with "ls20". Never invent an id or pass through
-the user's wording as one. If nothing in the list matches well enough to choose, 
+the user's wording as one. If nothing in the list matches well enough to choose,
 ask the user which game they mean with \`${names.finalReplyTool}\` rather than guessing.
 
-These subtasks take several minutes — acknowledge in your "reply" that you have started playing 
+### What to put in the prompt
+
+Give it the goal, and give it what earlier plays actually established — labeled as
+what it is. Write "an earlier play observed …" for something a play reported seeing,
+and "we suspect …" for a hypothesis, so it can tell what to verify from what to use.
+A route or a map you pass down is a guess about a level nobody has finished; stated
+as fact, it gets followed off a cliff.
+
+Do **not** state mechanics of the tools or the budget: how many actions it has, how
+many moves fit in one call, how many turns it may spend. It is told all of that
+directly, it is told correctly, and a number you supply that disagrees will be
+believed over the truth — a play once stopped early because its prompt said it had
+"20 actions total" when 20 was its turn budget.
+
+These subtasks take several minutes — acknowledge in your "reply" that you have started playing
 and will report back, without promising a time.`;
 }
