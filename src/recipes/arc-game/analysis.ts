@@ -275,13 +275,30 @@ export function connectedComponents(grid: number[][]): ComponentSummary[] {
     .sort((x, y) => y.components - x.components);
 }
 
-/** How much of its bounding box a region actually occupies, 0–1. */
+/**
+ * How much of its bounding box a region actually occupies, 0–1.
+ *
+ * Boxes are well formed by construction wherever this is used: every caller
+ * passes either a {@link Component} from {@link locateComponents} or a
+ * {@link unionBox} of those, and a flood fill cannot produce `bottom < top`. So
+ * `area` is always at least 1, and the zero-area branch below is unreachable —
+ * kept only so a malformed box degrades to 0 instead of dividing by zero.
+ *
+ * The result is deliberately **not** clamped into 0–1. An out-of-range value here
+ * could only mean a caller broke that invariant, and the way to learn that is a
+ * region classified absurdly, not a number quietly corrected into looking sane.
+ */
 export function fillRatio(box: Box, size: number): number {
   const area = (box.bottom - box.top + 1) * (box.right - box.left + 1);
   return area === 0 ? 0 : size / area;
 }
 
-/** The rectangle enclosing several boxes. */
+/**
+ * The rectangle enclosing several boxes. Takes a **non-empty** list — the reduce
+ * has no seed, since there is no identity box to start from, so `[]` throws. Its
+ * one caller filters components for a color it is already holding one of, and so
+ * cannot pass an empty list.
+ */
 function unionBox(boxes: Box[]): Box {
   return boxes.reduce((a, b) => ({
     top: Math.min(a.top, b.top),

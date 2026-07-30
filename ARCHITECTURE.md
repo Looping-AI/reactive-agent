@@ -718,10 +718,11 @@ traffic. They are characteristics, not known bugs; none is a correctness hole.
 
    Three later plays found the reason that spend never fell: `renderShapes`
    described every region by its **bounding box**, which is exact for a movable
-   piece and empty for a maze — the whole `ls20` wall arrived as `off-black: rows
-0-63, cols 0-63 (2129 cells)` and the whole floor as `neutral: rows 5-54, cols
-9-58`, both a shade over half-filled, the second asserting an open 50×50 arena
-   of which 46% was wall. Blind to the terrain, the plays batched routes into walls
+   piece and empty for a maze. The whole `ls20` wall arrived as one line reading
+   `off-black: rows 0-63, cols 0-63 (2129 cells)`, and the whole floor as
+   `neutral: rows 5-54, cols 9-58` — both a shade over half-filled, the second
+   asserting an open 50×50 arena of which 46% was wall.
+   Blind to the terrain, the plays batched routes into walls
    and then rebuilt the maze through `region` peepholes: 12 `region` calls across
    the three, and not one `grid`. A region that is large and sparse is now rendered
    as row bands of column runs instead (`colorSpans`), which costs ~700 tokens for
@@ -743,9 +744,9 @@ traffic. They are characteristics, not known bugs; none is a correctness hole.
    caps any recipe at **39 turns** today: the first assertion needs `maxTurns < 40`,
    and the second caps `MAX_CHUNKS_PER_BRANCH` itself at 57, so raising the constant
    to buy a recipe more turns runs out of room almost immediately. Wanting more than
-   39 means changing what bounds a branch's chunks — deriving it from `maxWallMs /
-CHUNK_SOFT_MS` plus a progress allowance, which does not grow with turns — not
-   nudging either number.
+   39 means changing what bounds a branch's chunks — deriving it from
+   `maxWallMs / CHUNK_SOFT_MS` plus a progress allowance, which does not grow with
+   turns — not nudging either number.
 
    **This is the mistake worth not repeating.** The ARC recipe originally budgeted
    1,000 turns and reasoned that 25 turns per chunk made 40 nominal chunks, half
