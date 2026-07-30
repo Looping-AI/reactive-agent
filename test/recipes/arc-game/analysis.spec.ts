@@ -3,12 +3,14 @@ import {
   COLOR_NAMES,
   colorHistogram,
   colorName,
+  colorSpans,
   connectedComponents,
   describeBox,
   describeCell,
   diffGrids,
   diffShapes,
   describeShift,
+  fillRatio,
   lastGrid,
   locateComponents,
   matchShapes,
@@ -24,6 +26,7 @@ import {
   serializeGrid,
   MAX_SHAPE_CHANGES
 } from "@/recipes/arc-game/analysis";
+import { LS20_LEVEL1_BEFORE } from "./ls20-level1";
 
 /** A tiny grid for readable assertions. */
 const GRID: number[][] = [
@@ -284,6 +287,155 @@ describe("renderShapes", () => {
     expect(out).toHaveLength(6);
     expect(out[5]).toBe("+27 more shape(s), smaller than these.");
   });
+
+  /**
+   * The failure this whole rendering exists for, on the board where it happened.
+   * `off-black` is the `ls20` maze: one component, 2129 cells, and a bounding box
+   * of the entire 64×64 board. Told only that, a play read its route off the box
+   * and walked into walls; the columns below are the walls it could not see.
+   */
+  describe("on a real ls20 board", () => {
+    const grid = parseGrid(LS20_LEVEL1_BEFORE);
+    const out = renderShapes(grid);
+
+    it("does not describe the maze by a box that spans the whole board", () => {
+      expect(out).not.toContain("off-black: rows 0-63, cols 0-63");
+      expect(out).toContain(
+        "off-black: 2129 cells in 1 region(s), 52% of rows 0-63, cols 0-63"
+      );
+    });
+
+    it("gives the wall's columns band by band", () => {
+      // The play walked left twice from cols 29-33 at rows 15-19 and reported
+      // `nothing moved` both times. Its destination, cols 24-28, is named here.
+      expect(out).toContain("  rows 15-19: cols 4-8, 24-28, 39-43, 54-63");
+      expect(out).toContain("  rows 20-24: cols 4-8, 24-28, 39-48, 59-63");
+    });
+
+    it("gives the walkable floor the same treatment, so corridors are named", () => {
+      // The old line asserted a 50×50 open arena of which 46% was wall — the
+      // more dangerous of the two, since a box that says nothing at least does
+      // not mislead.
+      expect(out).not.toContain("neutral: rows 5-54, cols 9-58");
+      expect(out).toContain(
+        "neutral: 1380 cells in 4 region(s), 48% of rows 5-62, cols 9-58"
+      );
+      expect(out).toContain("  row 15: cols 9-23, 29-38, 44-53");
+      expect(out).toContain("  rows 25-29: cols 14-18, 34-43, 49-58");
+    });
+
+    it("leaves regions that fill their box as a single line", () => {
+      // The 5×5 selector and the 3×3 donut: a box describes these exactly, and
+      // spending twenty lines on them would bury the terrain that needs them.
+      expect(out).toContain("blue: rows 42-44, cols 34-38 (15 cells)");
+      expect(out).toContain("orange: rows 40-41, cols 34-38 (10 cells)");
+      expect(out).toContain("yellow: rows 16-18, cols 15-17 (8 cells)");
+    });
+
+    it("names every band of both terrain layers without clipping", () => {
+      expect(out).not.toContain("more row band(s)");
+    });
+
+    /**
+     * This render rides on every chunk's free orientation (`describeState`), so
+     * its size is charged to the model's context window on every play. A ceiling
+     * rather than an exact length: the point is that it cannot quietly grow into
+     * the thing it replaced.
+     */
+    it("stays within its context budget", () => {
+      expect(out.length).toBeLessThan(3000);
+    });
+  });
+
+  it("bounds the render on a board this encoding suits badly", () => {
+    // Three combs: huge single components with a run every other column, and no
+    // two rows alike, so neither the run cap nor the band cap can be skipped.
+    const grid = Array.from({ length: 64 }, (_, r) =>
+      Array.from({ length: 64 }, (_, c) => {
+        if (r < 3) return [4, 9, 11][r];
+        return c % 2 === 0 ? [4, 9, 11][(r + c) % 3] : 3;
+      })
+    );
+    const out = renderShapes(grid);
+    expect(out).toContain("more run(s)");
+    expect(out).toContain("more row band(s)");
+    expect(out.split("\n").length).toBeLessThan(64);
+  });
+});
+
+describe("colorSpans", () => {
+  it("gives the column runs of one color, row by row", () => {
+    expect(
+      colorSpans(
+        [
+          [9, 0, 9, 9],
+          [0, 0, 0, 9]
+        ],
+        9
+      )
+    ).toEqual([
+      {
+        top: 0,
+        bottom: 0,
+        cols: [
+          [0, 0],
+          [2, 3]
+        ],
+        hidden: 0
+      },
+      { top: 1, bottom: 1, cols: [[3, 3]], hidden: 0 }
+    ]);
+  });
+
+  it("collapses consecutive rows whose runs are identical into one band", () => {
+    const grid = Array.from({ length: 6 }, () => [9, 0, 9]);
+    expect(colorSpans(grid, 9)).toEqual([
+      {
+        top: 0,
+        bottom: 5,
+        cols: [
+          [0, 0],
+          [2, 2]
+        ],
+        hidden: 0
+      }
+    ]);
+  });
+
+  it("skips rows the color is absent from rather than emitting empty bands", () => {
+    expect(
+      colorSpans([[9], [0], [9]], 9).map((b) => [b.top, b.bottom])
+    ).toEqual([
+      [0, 0],
+      [2, 2]
+    ]);
+  });
+
+  /**
+   * One color, several components. The flood fill's notion of connectedness is
+   * an implementation detail to a player: a wall a doorway splits in two is one
+   * wall, and it must read as one terrain layer.
+   */
+  it("spans a color across every component of it at once", () => {
+    const bands = colorSpans(
+      [
+        [4, 4, 4],
+        [0, 0, 0],
+        [4, 4, 4]
+      ],
+      4
+    );
+    expect(bands).toHaveLength(2);
+    expect(bands.every((b) => b.cols.length === 1)).toBe(true);
+  });
+});
+
+describe("fillRatio", () => {
+  it("is 1 for a region that fills its box and lower for one that does not", () => {
+    const box = { top: 0, left: 0, bottom: 3, right: 3 };
+    expect(fillRatio(box, 16)).toBe(1);
+    expect(fillRatio(box, 8)).toBe(0.5);
+  });
 });
 
 describe("renderLegend", () => {
@@ -358,6 +510,8 @@ describe("renderRegion", () => {
       [
         "colors: 0=white 1=off-white 2=neutral-light",
         "rows 0-1, cols 0-1 (centered on row 0, col 0)",
+        "    0",
+        "    |",
         "0 | 01",
         "1 | 02"
       ].join("\n")
@@ -367,7 +521,8 @@ describe("renderRegion", () => {
   it("anchors the first character at the labeled column, not at the center", () => {
     // The bottom-right corner: clipped on the far side, and starting at col 1.
     // A leading pad here would make the header's `cols 1-2` a lie and send a
-    // click one column off.
+    // click one column off. Cols 1-2 contain no ruler mark, and the ruler is
+    // omitted rather than drawn blank.
     expect(renderRegion(GRID, 2, 2, 1)).toBe(
       [
         "colors: 0=white 1=off-white 2=neutral-light 3=neutral",
@@ -386,13 +541,34 @@ describe("renderRegion", () => {
     expect(lines[1]).toBe(
       "rows 38-42, cols 28-32 (centered on row 40, col 30)"
     );
-    expect(lines.slice(2).map((l) => l.split(" | ")[0])).toEqual([
+    expect(lines.slice(4).map((l) => l.split(" | ")[0])).toEqual([
       "38",
       "39",
       "40",
       "41",
       "42"
     ]);
+  });
+
+  /**
+   * The reason the ruler was added: a model asked to place a cell in an 11-wide
+   * window counted the characters by hand and got them wrong. A mark whose label
+   * does not sit exactly above the cell it names would be worse than none.
+   */
+  it("rules absolute columns, aligned over the cells they label", () => {
+    const grid = Array.from({ length: 64 }, () =>
+      Array.from({ length: 64 }, (_, c) => c % 16)
+    );
+    const [marks, ticks, first] = renderRegion(grid, 40, 47, 5)
+      .split("\n")
+      .slice(2);
+    // Window is cols 42-52, so 45 and 50 are the marks; each label starts where
+    // its tick is, and the body's `40 | ` prefix is five characters wide.
+    expect(ticks).toBe("        |    |");
+    expect(marks).toBe("        45   50");
+    expect(ticks.indexOf("|")).toBe(5 + (45 - 42));
+    // And the cell under that tick really is column 45.
+    expect(first.slice(5)[45 - 42]).toBe((45 % 16).toString(16));
   });
 
   it("reports an empty grid rather than rendering nothing", () => {

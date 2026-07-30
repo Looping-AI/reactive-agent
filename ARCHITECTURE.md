@@ -716,6 +716,22 @@ traffic. They are characteristics, not known bugs; none is a correctness hole.
    workspace tools away: 15 of 19 turns in one of them went on `arc_inspect`,
    several on views of a board nothing had touched.
 
+   Three later plays found the reason that spend never fell: `renderShapes`
+   described every region by its **bounding box**, which is exact for a movable
+   piece and empty for a maze — the whole `ls20` wall arrived as `off-black: rows
+0-63, cols 0-63 (2129 cells)` and the whole floor as `neutral: rows 5-54, cols
+9-58`, both a shade over half-filled, the second asserting an open 50×50 arena
+   of which 46% was wall. Blind to the terrain, the plays batched routes into walls
+   and then rebuilt the maze through `region` peepholes: 12 `region` calls across
+   the three, and not one `grid`. A region that is large and sparse is now rendered
+   as row bands of column runs instead (`colorSpans`), which costs ~700 tokens for
+   a whole board and rides free on each chunk's orientation. What deliberately did
+   **not** ship alongside it is a lookahead that reports what a pending move would
+   run into: the tool can say what is on the board, but which colors block which
+   pieces is a game rule it would have to guess, and a wrong guess stated as a fact
+   is the failure mode this recipe keeps paying for. That judgement stays with the
+   model, and the soul's batching section now asks for it explicitly.
+
    `MAX_CHUNKS_PER_BRANCH` remains as a backstop against the 10,000
    step-per-instance ceiling, but reaching it is a bug rather than a budget — it
    _fails_ the branch instead of letting it report. Two assertions in
