@@ -552,6 +552,40 @@ describe("arc_act sequences", () => {
     expect(session?.pendingAction).toBeNull();
   });
 
+  it("nets two identical shapes separately instead of cancelling them out", async () => {
+    // Two blue cells, one walking right and one walking left, one column per
+    // step. Netted by color and size alone the two cancel and the batch claims
+    // nothing moved — the one thing the model could not have recovered from the
+    // per-step lines above it.
+    stubFrames([
+      boardFrame([
+        [0, 9, 0],
+        [0, 0, 0],
+        [0, 9, 0]
+      ]),
+      boardFrame([
+        [0, 0, 9],
+        [0, 0, 0],
+        [9, 0, 0]
+      ])
+    ]);
+    const { ctx: c } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({ availableActions: [4], lastGridHex: "900\n000\n009" })
+    );
+
+    const { tools } = buildArcGameTools(c);
+    const out = await callTool(tools.arc_act, {
+      steps: [{ action: 4 }, { action: 4 }]
+    });
+    expect(out).toContain(
+      "net: blue 1×1 right 2 over 2 moves, right 1 per move; " +
+        "blue 1×1 left 2 over 2 moves, left 1 per move"
+    );
+    expect(out).not.toContain("back where it started");
+  });
+
   it("reports a step that changed nothing as a real result, not a gap", async () => {
     stubFrames([
       boardFrame([

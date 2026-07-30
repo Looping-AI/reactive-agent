@@ -560,6 +560,53 @@ export interface ShapeTravel {
 }
 
 /**
+ * A shape's identity within a batch: what it is, and where it sits right now.
+ * The box is passed apart from the color and cell count because a move's
+ * destination carries only a box — same color, same size, by construction.
+ */
+const travelKey = (shape: Component, at: Box): string =>
+  `${shape.color}:${shape.size}:${at.top},${at.left}`;
+
+/**
+ * Fold one step's moves into a batch's running totals.
+ *
+ * Identity is *position*, not appearance. Boards carrying two identical shapes
+ * are the ordinary case, not the contrived one — a pair of blocks, a player and
+ * its twin — and summing them under one color-and-size key reports two shapes
+ * that passed each other as one shape that never moved, which is the single
+ * worst thing this line could say.
+ *
+ * Each entry is re-keyed to where its shape landed, which is exactly where the
+ * next step's diff will find it: the frames chain, step N's board being step
+ * N+1's starting board, so a position is a stable handle for as long as the
+ * shape keeps its color and size. Sources are cleared before any destination is
+ * written, so a shape sliding into the cell another just vacated inherits its
+ * own history rather than the vacater's.
+ */
+export function trackTravel(
+  travels: Map<string, ShapeTravel>,
+  moved: MovedShape[]
+): void {
+  const started = moved.map((move) => {
+    const key = travelKey(move.from, move.from);
+    const travel = travels.get(key) ?? {
+      shape: move.from,
+      dRow: 0,
+      dCol: 0,
+      moves: 0
+    };
+    travels.delete(key);
+    return { move, travel };
+  });
+  for (const { move, travel } of started) {
+    travel.dRow += move.dRow;
+    travel.dCol += move.dCol;
+    travel.moves++;
+    travels.set(travelKey(move.from, move.to), travel);
+  }
+}
+
+/**
  * A shape's net travel over a batch, counted in **moves** rather than cells.
  *
  * Cells are the misleading unit for a sequence: two presses that each slide a

@@ -19,6 +19,8 @@ import {
   renderShapeDelta,
   renderShapes,
   renderTravel,
+  trackTravel,
+  type ShapeTravel,
   serializeGrid,
   MAX_SHAPE_CHANGES
 } from "@/recipes/arc-game/analysis";
@@ -561,6 +563,69 @@ describe("renderTravel", () => {
     expect(renderTravel({ shape, dRow: 0, dCol: 0, moves: 2 })).toBe(
       "orange 5×5 is back where it started after 2 move(s)"
     );
+  });
+});
+
+describe("trackTravel", () => {
+  /** A 1×1 shape at a cell, which is all identity here turns on. */
+  const cell = (top: number, left: number, color = 9) => ({
+    color,
+    size: 1,
+    top,
+    left,
+    bottom: top,
+    right: left
+  });
+  const move = (from: ReturnType<typeof cell>, to: ReturnType<typeof cell>) =>
+    ({
+      kind: "moved",
+      from,
+      to,
+      dRow: to.top - from.top,
+      dCol: to.left - from.left
+    }) as const;
+
+  it("follows one shape across steps by where it landed", () => {
+    const travels = new Map<string, ShapeTravel>();
+    trackTravel(travels, [move(cell(0, 0), cell(0, 1))]);
+    trackTravel(travels, [move(cell(0, 1), cell(0, 2))]);
+    expect([...travels.values()].map(renderTravel)).toEqual([
+      "blue 1×1 right 2 over 2 moves, right 1 per move"
+    ]);
+  });
+
+  it("keeps two identical shapes apart instead of netting them to nothing", () => {
+    // Same color, same size, opposite directions. Summed under one
+    // color-and-size key this batch reads "back where it started" — a sentence
+    // about a shape that does not exist, over two that both moved.
+    const travels = new Map<string, ShapeTravel>();
+    trackTravel(travels, [
+      move(cell(0, 0), cell(0, 1)),
+      move(cell(4, 4), cell(4, 3))
+    ]);
+    trackTravel(travels, [
+      move(cell(0, 1), cell(0, 2)),
+      move(cell(4, 3), cell(4, 2))
+    ]);
+    expect([...travels.values()].map(renderTravel)).toEqual([
+      "blue 1×1 right 2 over 2 moves, right 1 per move",
+      "blue 1×1 left 2 over 2 moves, left 1 per move"
+    ]);
+  });
+
+  it("does not hand a shape the history of the one it displaced", () => {
+    // A chases B down a row: A ends the step on the cell B started it on, and
+    // must not inherit B's travel along with its position.
+    const travels = new Map<string, ShapeTravel>();
+    trackTravel(travels, [move(cell(0, 5), cell(0, 4))]);
+    trackTravel(travels, [
+      move(cell(0, 0), cell(0, 1)),
+      move(cell(0, 4), cell(0, 3))
+    ]);
+    expect([...travels.values()].map(renderTravel)).toEqual([
+      "blue 1×1 right 1",
+      "blue 1×1 left 2 over 2 moves, left 1 per move"
+    ]);
   });
 });
 

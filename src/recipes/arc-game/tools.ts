@@ -17,6 +17,7 @@ import {
   renderShapes,
   renderTravel,
   serializeGrid,
+  trackTravel,
   type GridDiff,
   type ShapeDelta,
   type ShapeTravel
@@ -241,11 +242,12 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
         let sent = 0;
         let stopped: string | null = null;
 
-        // Where the batch left each shape, keyed as the matcher keys them, plus a
-        // count of the steps that moved nothing. Both exist for the net line: a
-        // model reading five per-step lines should not have to add up its own
-        // position, and "4 of 5 steps did nothing" is the sentence that would have
-        // told this play it was walking into a wall.
+        // Where the batch left each shape — keyed by where that shape currently
+        // is, see {@link trackTravel} — plus a count of the steps that moved
+        // nothing. Both exist for the net line: a model reading five per-step
+        // lines should not have to add up its own position, and "4 of 5 steps did
+        // nothing" is the sentence that would have told this play it was walking
+        // into a wall.
         const travels = new Map<string, ShapeTravel>();
         let noEffect = 0;
 
@@ -301,22 +303,7 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
 
           if (delta) {
             if (delta.moved.length === 0) noEffect++;
-            for (const move of delta.moved) {
-              const key = `${move.from.color}:${move.from.size}`;
-              const travel = travels.get(key);
-              if (travel) {
-                travel.dRow += move.dRow;
-                travel.dCol += move.dCol;
-                travel.moves++;
-              } else {
-                travels.set(key, {
-                  shape: move.from,
-                  dRow: move.dRow,
-                  dCol: move.dCol,
-                  moves: 1
-                });
-              }
-            }
+            trackTravel(travels, delta.moved);
           }
 
           session.cookies = cookies;
