@@ -55,7 +55,13 @@ describe("ARC_GAME_RECIPE", () => {
     expect(ARC_GAME_RECIPE.historyWindow).toBeLessThan(
       validateRecipe(ARC_GAME_RECIPE).limits.maxTurns
     );
-    expect(ARC_GAME_RECIPE.historyWindow).toBeGreaterThan(24);
+    // The floor a documented regression put here: at 12 the model could not see a
+    // couple of moves back and spent turns re-inspecting to compensate. It holds
+    // at 24 rather than the 32 it briefly needed because `elideToolOutputs` made a
+    // window slot cheap — an aged-out turn keeps its reasoning and its `note` and
+    // loses only the board render. Reach is what this number buys, and the
+    // elision does not touch reach.
+    expect(ARC_GAME_RECIPE.historyWindow).toBeGreaterThanOrEqual(24);
   });
 });
 

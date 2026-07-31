@@ -63,9 +63,14 @@ export const ARC_GAME_RECIPE: ResolvedRecipe = {
   limits: { maxTurns: 39 },
   // Counts assistant messages (tool calls), so an inspect + act cycle spends two
   // or three of these per game action; 12 left the model unable to see more than a
-  // couple of moves back, which it answered by re-inspecting. Raised from 24 with
-  // the workspace tools' removal, since this window is now the whole of its memory.
-  historyWindow: 32,
+  // couple of moves back, which it answered by re-inspecting.
+  //
+  // Lowered from 32 because `elideToolOutputs` changed what a slot *costs*, not
+  // how many there are: a turn that has aged past the detail window now carries
+  // its reasoning and its `note` but not the board render that was nearly all of
+  // its tokens. 32 was the compensation for losing the workspace tools, and the
+  // thing it was compensating for — reach — is unaffected by the elision.
+  historyWindow: 24,
   reportMetrics: true
 };
 

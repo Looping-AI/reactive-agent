@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { SessionMessage } from "agents/experimental/memory/session";
 import { archivingCompaction } from "@/agent/session";
+import { COMPACT_AFTER_TOKENS, COMPACT_TAIL_TOKENS } from "@/config";
 
 function msg(id: string): SessionMessage {
   return { id, role: "user", parts: [{ type: "text", text: id }] };
@@ -14,6 +15,21 @@ const base = (async () => ({
   fromMessageId: "b",
   toMessageId: "d"
 })) as unknown as Parameters<typeof archivingCompaction>[0];
+
+/**
+ * The two compaction constants are one setting, and the failure of getting them
+ * wrong is silent: put the threshold too close to the tail and the fixed floor
+ * (system prompt + protected head + summary) eats the gap, so compaction fires on
+ * nearly every append and spends a summarizer call on a near-empty middle. See
+ * the derivation on `COMPACT_TAIL_TOKENS`.
+ */
+describe("compaction tuning", () => {
+  it("leaves enough room between the threshold and the tail", () => {
+    expect(COMPACT_AFTER_TOKENS - COMPACT_TAIL_TOKENS).toBeGreaterThanOrEqual(
+      10_000
+    );
+  });
+});
 
 describe("archivingCompaction", () => {
   it("hands exactly the displaced range to onArchive and returns the base result", async () => {
