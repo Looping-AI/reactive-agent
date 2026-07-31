@@ -641,13 +641,67 @@ describe("arc_act sequences", () => {
       "yellow row 1, cols 0-2 → row 1, cols 0-1 (3→2 cells)"
     );
     expect(out).toContain("yellow row 1, cols 0-1 → row 1, col 0 (2→1 cells)");
-    expect(out).toContain("nothing moved at all");
+    // And the net line says the same thing about the batch, in the register the
+    // steps earned: nothing travelled, on a board that changed both times. It
+    // does not call them refusals — a renderer that has not been told whether
+    // this game moves anything cannot know that, and saying it anyway is what
+    // told a click game its every click had been blocked.
+    expect(out).toContain("no shape travelled");
     expect(out).toContain(
-      "2 of 2 step(s) moved nothing (every one of them was refused or blocked)"
+      "2 of 2 step(s) changed the board without moving a shape"
     );
     // The cell diff is not what the model reads here — the counter's four cells
     // would have been the whole story.
     expect(out).not.toContain("cells changed");
+  });
+
+  // The mirror-image failure, and the one the click games produce. Nothing on a
+  // click board ever travels, so every step used to be counted as having moved
+  // nothing and the batch summarised as "every one of them was refused or
+  // blocked" — over clicks that had each toggled a block. What separates a refusal
+  // from a move here is the cell diff, not the shape delta.
+  it("does not call a click that changed the board a refusal", async () => {
+    // A blue block that clicking toggles to red, a bar that gives up a cell to a
+    // yellow counter when it does — then a click that lands on nothing.
+    const toggled = boardFrame(
+      [
+        [8, 8, 0, 0],
+        [8, 8, 0, 0],
+        [0, 0, 0, 0],
+        [12, 12, 12, 11]
+      ],
+      { available_actions: [6] }
+    );
+    stubFrames([toggled, toggled]);
+    const { ctx: c } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({
+        availableActions: [6],
+        lastGridHex: "9900\n9900\n0000\ncccc"
+      })
+    );
+
+    const { tools } = buildArcGameTools(c);
+    const out = await callTool(tools.arc_act, {
+      steps: [
+        { action: 6, x: 0, y: 0 },
+        { action: 6, x: 3, y: 2 }
+      ]
+    });
+
+    // The toggle is named as a toggle — one shape, repainted where it stood,
+    // rather than as one shape vanishing and another materializing in its place.
+    expect(out).toContain("blue 2×2 at rows 0-1, cols 0-1 turned red");
+    expect(out).toContain("no shape travelled, but the board changed");
+    expect(out).not.toContain("is gone");
+    // Only the second click did nothing, and only it is counted as a refusal.
+    expect(out).toContain("2. click(3,2) → 0 cells changed (no effect at all)");
+    expect(out).toContain("1 of 2 step(s) changed not one cell");
+    expect(out).toContain(
+      "1 of 2 step(s) changed the board without moving a shape"
+    );
+    expect(out).not.toContain("refused or blocked");
   });
 
   // The same claim, on the board that actually produced the failure: 64×64, two
@@ -706,7 +760,25 @@ describe("arc_act sequences", () => {
     // Only one action reached the API: the rest would have been rejected.
     expect(paths).toEqual(["/api/cmd/ACTION4"]);
     expect(out).toContain("4 steps requested, 1 sent.");
-    expect(out).toContain("2-4. not sent: right is not available");
+    expect(out).toContain(
+      "2-4. not sent: right is not available (available: 1=up)"
+    );
+  });
+
+  // `available actions: 6` was every result of a logged click-only play, and it
+  // reads as a count of six actions at least as readily as it reads as action 6.
+  // The number stays, because the number is what `arc_act` takes.
+  it("names the legal actions rather than listing bare opcodes", async () => {
+    stubFrames([boardFrame([[0]], { available_actions: [6] })]);
+    const { ctx: c } = ctx();
+    await c.workspace.writeJson(
+      "arc/session.json",
+      SESSION({ availableActions: [6] })
+    );
+
+    const { tools } = buildArcGameTools(c);
+    const out = await callTool(tools.arc_act, one(6, 1, 1));
+    expect(out).toContain("available actions: 6=click");
   });
 
   it("stops the sequence when the play ends mid-batch", async () => {

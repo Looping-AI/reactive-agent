@@ -173,7 +173,7 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
   const tools = {
     arc_act: tool({
       description:
-        "Take one or more actions in the current game, in order. Only use actions listed in the latest available_actions. Returns one line per step naming which shapes moved and how far — `nothing moved` means that action was blocked or refused — then the net travel over the batch and the new level, state and available_actions. Batch the whole path you intend to walk: a batch runs to the end whatever happens, so the report tells you exactly which steps did nothing rather than stopping. Every step is a real action counted against the game's baseline, so batch a route you have reason to believe in, not a guess.",
+        "Take one or more actions in the current game, in order. Only use actions listed in the latest available_actions. Returns one line per step naming what that action changed — which shapes moved and how far, which were repainted or appeared, and `0 cells changed` when the game refused it outright — then the net effect over the batch and the new level, state and available_actions. Batch the whole path you intend to walk: a batch runs to the end whatever happens, so the report tells you exactly which steps did nothing rather than stopping. Every step is a real action counted against the game's baseline, so batch a route you have reason to believe in, not a guess.",
       inputSchema: z.object({
         steps: z
           .array(
@@ -243,13 +243,22 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
         let stopped: string | null = null;
 
         // Where the batch left each shape — keyed by where that shape currently
-        // is, see {@link trackTravel} — plus a count of the steps that moved
-        // nothing. Both exist for the net line: a model reading five per-step
-        // lines should not have to add up its own position, and "4 of 5 steps did
+        // is, see {@link trackTravel} — plus counts of the steps that did little.
+        // All three exist for the net line: a model reading five per-step lines
+        // should not have to add up its own position, and "4 of 5 steps did
         // nothing" is the sentence that would have told this play it was walking
         // into a wall.
+        //
+        // The two idle counts are kept apart because only one of them is evidence
+        // of a refusal. `noChange` is the cell diff's own verdict and cannot be
+        // argued with; `noMove` is a board that changed with nothing travelling
+        // across it, which is a wall in a game you steer and an ordinary move in a
+        // game you click. Folding the second into the first told a logged `ft09`
+        // play that five clicks were "every one of them refused or blocked" when
+        // four of them had each toggled a 36-cell block.
         const travels = new Map<string, ShapeTravel>();
-        let noEffect = 0;
+        let noChange = 0;
+        let noMove = 0;
 
         for (const [index, step] of steps.entries()) {
           const { action, x, y } = step;
@@ -267,7 +276,7 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
           ) {
             stopped =
               `${actionName(action)} is not available ` +
-              `(available: ${session.availableActions.join(", ") || "none"})`;
+              `(available: ${namedActions(session.availableActions)})`;
           } else if (action === 6 && (x === undefined || y === undefined)) {
             stopped = "click (action 6) requires x and y (0–63)";
           }
@@ -301,10 +310,11 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
           const delta = diffShapes(before, next);
           const prevLevel = session.levelsCompleted;
 
-          if (delta) {
-            if (delta.moved.length === 0) noEffect++;
-            trackTravel(travels, delta.moved);
-          }
+          // `changed < 0` is the first frame — nothing to compare against, so it
+          // is neither idle nor active.
+          if (diff.changed === 0) noChange++;
+          else if (diff.changed > 0 && delta?.moved.length === 0) noMove++;
+          if (delta) trackTravel(travels, delta.moved);
 
           session.cookies = cookies;
           session.guid = frame.guid;
@@ -366,7 +376,7 @@ export function buildArcGameTools(ctx: ToolFamilyContext): RecipeToolSet {
           opening +
           header +
           trace.join("\n") +
-          renderNet(travels, sent, noEffect) +
+          renderNet(travels, sent, noChange, noMove) +
           "\n" +
           stateLine(session) +
           terminal +
@@ -502,6 +512,26 @@ function actionName(action: number, x?: number, y?: number): string {
     : name;
 }
 
+/**
+ * `3=left, 6=click` — the legal actions as number **and** name.
+ *
+ * The number alone is ambiguous in exactly the case that matters most. A
+ * click-only game offers `[6]`, and `available actions: 6` reads as *six actions
+ * are available* at least as naturally as it reads as *action 6 is available* —
+ * one of the two lines every result of a logged `ft09` play ended on. Naming them
+ * costs a few tokens and cannot be misread, and the number stays because the
+ * number is what `arc_act` takes.
+ */
+function namedActions(actions: number[]): string {
+  if (actions.length === 0) return "none";
+  return actions
+    .map((action) => {
+      const name = ACTION_NAMES[action];
+      return name === undefined ? String(action) : `${action}=${name}`;
+    })
+    .join(", ");
+}
+
 /** "5-8. not sent: <why>" — an aborted tail, named so it is never assumed to have run. */
 function remaining(total: number, from: number, why: string): string {
   const label = from + 1 === total ? `${total}.` : `${from + 1}-${total}.`;
@@ -528,18 +558,26 @@ function renderEffect(diff: GridDiff, delta: ShapeDelta | null): string {
 
 /**
  * Where a whole batch left things: net travel per shape, then how many of its
- * steps changed nothing.
+ * steps did nothing and how many moved nothing.
  *
- * The no-effect count is what this rendering exists for. A batch is not
- * stopped when a step does nothing — different games mean different things by it,
- * and guessing would throw away legitimate sequences — so the batch runs to the
- * end and is *told on*. "4 of 5 steps moved nothing" is a sentence a model cannot
+ * The idle counts are what this rendering exists for. A batch is not stopped when
+ * a step does nothing — different games mean different things by it, and guessing
+ * would throw away legitimate sequences — so the batch runs to the end and is
+ * *told on*. "4 of 5 steps changed not one cell" is a sentence a model cannot
  * misread; four consecutive fuel-bar diffs, as these logs show, is one it can.
+ *
+ * They are reported as two separate sentences because they carry different
+ * weight. A step that changed not one cell was refused, and this line says so. A
+ * step that changed the board without moving a shape is stated as exactly that
+ * and no more — reading it as a wall is a judgement about the game's rules, which
+ * belongs to the model and the soul, not to a renderer that has never been told
+ * whether this game moves anything at all.
  */
 function renderNet(
   travels: Map<string, ShapeTravel>,
   sent: number,
-  noEffect: number
+  noChange: number,
+  noMove: number
 ): string {
   if (sent < 2) return "";
   const parts = [...travels.values()]
@@ -547,14 +585,20 @@ function renderNet(
     .slice(0, NET_SHAPES)
     .map(renderTravel);
   const moved =
-    parts.length === 0 ? "nothing moved at all" : `net: ${parts.join("; ")}`;
-  const idle =
-    noEffect === 0
-      ? ""
-      : ` — ${noEffect} of ${sent} step(s) moved nothing${
-          noEffect === sent ? " (every one of them was refused or blocked)" : ""
-        }`;
-  return `\n${moved}${idle}.`;
+    parts.length === 0 ? "no shape travelled" : `net: ${parts.join("; ")}`;
+  const idle: string[] = [];
+  if (noChange > 0) {
+    idle.push(
+      `${noChange} of ${sent} step(s) changed not one cell` +
+        (noChange === sent ? " (every one of them was refused or blocked)" : "")
+    );
+  }
+  if (noMove > 0) {
+    idle.push(
+      `${noMove} of ${sent} step(s) changed the board without moving a shape`
+    );
+  }
+  return `\n${moved}${idle.length === 0 ? "" : ` — ${idle.join("; ")}`}.`;
 }
 
 /** How many shapes the net line names before it stops. */
@@ -591,7 +635,7 @@ function stateLine(session: ArcSession): string {
   return [
     `level ${session.levelsCompleted}${session.winLevels ? `/${session.winLevels}` : ""}`,
     `state ${session.state}`,
-    `available actions: ${session.availableActions.join(", ") || "none"}`
+    `available actions: ${namedActions(session.availableActions)}`
   ].join(" | ");
 }
 
