@@ -800,4 +800,68 @@ describe("elideToolOutputs", () => {
       }
     }
   });
+
+  /**
+   * `keepRecent` indexes an array, and every out-of-contract value used to land on
+   * the same wrong branch: an `undefined` index makes `i >= cutoff` false for
+   * every `i`, which reads as "no turn is recent". Right for 0, wrong for -1 and
+   * for NaN, and silent in all three cases. These pin the normalization so the
+   * only way to get that behaviour is to ask for it.
+   */
+  describe("an out-of-contract keepRecent", () => {
+    const messages = [
+      { role: "user" as const, content: "go" },
+      ...turn("a", "inspect"),
+      ...turn("b", "act"),
+      ...turn("c", "act")
+    ];
+
+    it("elides everything rules 2-4 do not save when asked for zero", () => {
+      // No turn is recent, so rule 1 protects nothing — but the newest result per
+      // tool still survives, which is what keeps this bounded rather than blind.
+      expect(outputs(elideToolOutputs(messages, 0))).toEqual([
+        BIG, // newest `inspect`
+        ELIDED_TOOL_OUTPUT,
+        BIG // newest `act`
+      ]);
+    });
+
+    it.each([
+      ["negative", -1],
+      ["NaN", Number.NaN],
+      ["Infinity's negative", Number.NEGATIVE_INFINITY]
+    ])("clamps a %s window to zero rather than to everything", (_l, keep) => {
+      expect(elideToolOutputs(messages, keep)).toEqual(
+        elideToolOutputs(messages, 0)
+      );
+    });
+
+    it("keeps everything when the window exceeds the conversation", () => {
+      expect(elideToolOutputs(messages, 99)).toBe(messages);
+      expect(elideToolOutputs(messages, Number.POSITIVE_INFINITY)).toBe(
+        messages
+      );
+    });
+
+    it("truncates a fractional window rather than indexing with it", () => {
+      expect(elideToolOutputs(messages, 2.9)).toEqual(
+        elideToolOutputs(messages, 2)
+      );
+    });
+
+    it("still protects a failure and a small result at zero", () => {
+      const err = { type: "error-text" as const, value: "y".repeat(500) };
+      const small = { type: "text" as const, value: "ok" };
+      const withBoth = [
+        { role: "user" as const, content: "go" },
+        ...turn("a", "act", err),
+        ...turn("b", "read", small),
+        ...turn("c", "act"),
+        ...turn("d", "act")
+      ];
+      const [first, second] = outputs(elideToolOutputs(withBoth, 0));
+      expect(first).toEqual(err);
+      expect(second).toBe("ok");
+    });
+  });
 });

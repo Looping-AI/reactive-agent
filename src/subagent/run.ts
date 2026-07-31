@@ -176,21 +176,52 @@ function outputSize(output: ToolResultPart["output"]): number {
  * 4. it is already small enough that stubbing it saves nothing.
  *
  * Idempotent: a stubbed part is small, so a later pass leaves it alone.
+ *
+ * `keepRecent` is normalized rather than trusted — see the note on `keep` below.
+ * Zero is a legal, meaningful value: no turn is recent, so rule 1 protects
+ * nothing and rules 2-4 carry the whole of what survives.
  */
 export function elideToolOutputs(
   messages: ModelMessage[],
   keepRecent: number
 ): ModelMessage[] {
+  /**
+   * Rule 1's width, normalized to a non-negative integer.
+   *
+   * Not defensive habit: `keepRecent` is a config value reaching a function whose
+   * arithmetic indexes an array with it, and every out-of-contract value used to
+   * land on the *same* wrong branch. `assistantIdx[len - 0]` is `undefined`, as is
+   * any negative or `NaN` index, and `i >= undefined` is false for every `i` — so
+   * `cutoff` silently meant "no turn is recent" instead of throwing or clamping.
+   * That happens to be right for 0 and wrong for everything else, which is the
+   * worst way for a guard to fail: correct until the day someone passes -1.
+   *
+   * So 0 now says it explicitly (see `cutoff`), and nothing else can reach it by
+   * accident. `NaN` is the one value with no reading at all, and it takes the
+   * conservative floor — still bounded by rules 2-4, which keep the newest result
+   * per tool, every failure, and everything already small. Both infinities keep
+   * the reading they plainly have: an unboundedly wide window keeps everything, a
+   * negative one keeps nothing.
+   */
+  const keep = Number.isNaN(keepRecent)
+    ? 0
+    : Math.max(0, Math.trunc(keepRecent));
+
   // Where the detail window starts, counted in assistant messages so it lines up
-  // with `historyWindow`. Fewer assistant messages than the window ⇒ keep all.
+  // with `historyWindow`. Everything before it is a candidate for elision, so
+  // `messages.length` is the honest spelling of an empty window and 0 the honest
+  // spelling of a window covering everything (fewer assistant messages than the
+  // window ⇒ keep all).
   const assistantIdx: number[] = [];
   for (const [i, m] of messages.entries()) {
     if (m.role === "assistant") assistantIdx.push(i);
   }
   const cutoff =
-    assistantIdx.length <= keepRecent
-      ? 0
-      : assistantIdx[assistantIdx.length - keepRecent];
+    keep === 0
+      ? messages.length
+      : assistantIdx.length <= keep
+        ? 0
+        : assistantIdx[assistantIdx.length - keep];
   if (cutoff === 0) return messages;
 
   // The newest result per tool, so rule 2 can be a lookup rather than a scan.
