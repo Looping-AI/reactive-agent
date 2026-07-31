@@ -76,6 +76,12 @@ export interface AgentSessionOptions {
   /** History token threshold that triggers compaction. */
   compactAfterTokens: number;
   /**
+   * Tokens of recent history compaction keeps verbatim. Coupled to
+   * {@link compactAfterTokens} — see `COMPACT_TAIL_TOKENS` in `config.ts` for the
+   * invariant that binds them.
+   */
+  compactTailTokens: number;
+  /**
    * Archive the raw messages displaced by each compaction (episodic recall).
    * Best-effort: a throw here must never abort compaction. (Wired in Phase 3.)
    */
@@ -126,6 +132,10 @@ export function buildAgentSession(
 ): Session {
   const compact = archivingCompaction(
     createCompactFunction({
+      // The one boundary worth owning. `protectHead` (3) and `minTailMessages`
+      // (2) keep the SDK defaults: the head is the conversation's opening and is
+      // cheap, and the tail floor is a safety net rather than a budget.
+      tailTokenBudget: opts.compactTailTokens,
       // Bounded like every other call: an unbounded summary is not the risk, a
       // silently truncated one is — it becomes this caller's memory of everything
       // that scrolled out, with no way to tell it was cut short.

@@ -1,6 +1,12 @@
-import type { LanguageModel, ModelMessage, StepResult, ToolSet } from "ai";
+import type {
+  LanguageModel,
+  ModelMessage,
+  StepResult,
+  ToolResultPart,
+  ToolSet
+} from "ai";
 import { generateText, isStepCount } from "ai";
-import { MAX_OUTPUT_TOKENS } from "@/config";
+import { MAX_OUTPUT_TOKENS, TOOL_OUTPUT_WINDOW } from "@/config";
 import { CHUNK_SOFT_MS } from "@/platform";
 import { stepAllowance } from "@/agent/budget";
 import { isTransientAiError } from "@/agent/inference";
@@ -59,6 +65,12 @@ export interface ChunkRunDeps {
    */
   chunkSoftMs: number;
   historyWindow: number;
+  /**
+   * How many of the most recent assistant turns keep their tool results in full;
+   * older ones are stubbed by {@link elideToolOutputs}. A mechanic of the window
+   * rather than a property of a domain — see `TOOL_OUTPUT_WINDOW` in `config.ts`.
+   */
+  toolOutputWindow: number;
   reportMetrics: boolean;
   now: () => number;
   /** Shared sink the tool families push progress events into (fresh per chunk). */
@@ -112,6 +124,109 @@ export function windowMessages(
   if (assistantIdx.length <= window) return messages;
   const start = assistantIdx[assistantIdx.length - window];
   return [messages[0], ...messages.slice(start)];
+}
+
+/** What replaces a tool result that has aged out of the detail window. */
+export const ELIDED_TOOL_OUTPUT =
+  "[output from an earlier turn, trimmed to save context]";
+
+/**
+ * Below this many serialized characters a result is not worth stubbing — the
+ * stub would be most of what it replaced.
+ */
+const MIN_ELIDABLE_OUTPUT = 200;
+
+/** Serialized size of a tool result's output, for the "worth stubbing" test. */
+function outputSize(output: ToolResultPart["output"]): number {
+  if (output.type === "text" || output.type === "error-text")
+    return output.value.length;
+  if (output.type === "execution-denied") return (output.reason ?? "").length;
+  try {
+    return JSON.stringify(output.value).length;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+/**
+ * Shrink the window without shortening it: stub out the *payloads* of tool
+ * results the model has moved past, leaving every message, every tool call — and
+ * therefore every note the model wrote itself — exactly where it was.
+ *
+ * This is the other half of {@link windowMessages}, and it exists because the two
+ * things a rolling window holds have opposite value curves. A recipe's own
+ * reasoning and its tool-call *inputs* stay useful for as long as the run does; a
+ * tool *result* is a snapshot of a world that has since moved, and it is also
+ * where nearly all the tokens are. Dropping whole turns to bound context throws
+ * both away together, which is why a short window makes a model re-derive what it
+ * already knew.
+ *
+ * A result's output survives if any of:
+ *
+ * 1. it is within the last `keepRecent` assistant messages — the same unit
+ *    `windowMessages` counts in, so the two knobs are commensurable;
+ * 2. **it is the newest result for its tool**, at any age. Tools may hold state
+ *    about what they have already shown this chunk and answer a repeat with
+ *    "unchanged since you last looked" — a real optimization that becomes a lie
+ *    the moment the render it points at is gone. Keeping the newest per tool is
+ *    what makes "your latest view" a thing the model can still see, and it is why
+ *    `keepRecent` can be small;
+ * 3. it reports a failure or a denial — short, diagnostic, and losing *why* a
+ *    call failed costs a retry to rediscover for no saving;
+ * 4. it is already small enough that stubbing it saves nothing.
+ *
+ * Idempotent: a stubbed part is small, so a later pass leaves it alone.
+ */
+export function elideToolOutputs(
+  messages: ModelMessage[],
+  keepRecent: number
+): ModelMessage[] {
+  // Where the detail window starts, counted in assistant messages so it lines up
+  // with `historyWindow`. Fewer assistant messages than the window ⇒ keep all.
+  const assistantIdx: number[] = [];
+  for (const [i, m] of messages.entries()) {
+    if (m.role === "assistant") assistantIdx.push(i);
+  }
+  const cutoff =
+    assistantIdx.length <= keepRecent
+      ? 0
+      : assistantIdx[assistantIdx.length - keepRecent];
+  if (cutoff === 0) return messages;
+
+  // The newest result per tool, so rule 2 can be a lookup rather than a scan.
+  const newestPerTool = new Map<string, number>();
+  for (const [i, message] of messages.entries()) {
+    if (message.role !== "tool") continue;
+    for (const part of message.content) {
+      if (part.type === "tool-result") newestPerTool.set(part.toolName, i);
+    }
+  }
+
+  let changed = false;
+  const out = messages.map((message, i) => {
+    if (message.role !== "tool" || i >= cutoff) return message;
+    let messageChanged = false;
+    const content = message.content.map((part) => {
+      if (part.type !== "tool-result") return part;
+      if (newestPerTool.get(part.toolName) === i) return part;
+      if (
+        part.output.type === "error-text" ||
+        part.output.type === "error-json" ||
+        part.output.type === "execution-denied"
+      )
+        return part;
+      if (outputSize(part.output) < MIN_ELIDABLE_OUTPUT) return part;
+      messageChanged = true;
+      return {
+        ...part,
+        output: { type: "text" as const, value: ELIDED_TOOL_OUTPUT }
+      };
+    });
+    if (!messageChanged) return message;
+    changed = true;
+    return { ...message, content };
+  });
+  return changed ? out : messages;
 }
 
 /** Human-readable elapsed time for the metrics footer. */
@@ -216,9 +331,15 @@ export async function runResumableChunk(
 
   const onStepEnd = async (step: StepResult<ToolSet>): Promise<void> => {
     state.turns += 1;
-    state.messages = windowMessages(
-      [...state.messages, ...step.response.messages],
-      deps.historyWindow
+    // Window first (drops whole turns at an assistant boundary), then elide what
+    // survived. Both before the checkpoint, so the durable `run_state` row
+    // shrinks with the context rather than tracking the untrimmed run.
+    state.messages = elideToolOutputs(
+      windowMessages(
+        [...state.messages, ...step.response.messages],
+        deps.historyWindow
+      ),
+      deps.toolOutputWindow
     );
     await deps.checkpoint(state);
   };
@@ -479,6 +600,7 @@ export async function runRecipeExecution(
       limits: recipe.limits,
       chunkSoftMs: CHUNK_SOFT_MS,
       historyWindow: recipe.historyWindow,
+      toolOutputWindow: TOOL_OUTPUT_WINDOW,
       reportMetrics: recipe.reportMetrics,
       now,
       progress: [],

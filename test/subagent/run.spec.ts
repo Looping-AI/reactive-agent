@@ -11,11 +11,14 @@
 import { describe, it, expect } from "vitest";
 import { z } from "zod";
 import { tool } from "ai";
-import type { LanguageModel, ToolSet } from "ai";
+import type { LanguageModel, ModelMessage, ToolResultPart, ToolSet } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import {
   runResumableChunk,
   runRecipeExecution,
+  elideToolOutputs,
+  windowMessages,
+  ELIDED_TOOL_OUTPUT,
   type ChunkRunDeps,
   type ChunkRunState
 } from "@/subagent/run";
@@ -85,6 +88,7 @@ describe("runResumableChunk", () => {
     models?: ModelPair;
     now?: () => number;
     chunkSoftMs?: number;
+    toolOutputWindow?: number;
   }): ChunkRunDeps {
     return {
       system: "sys",
@@ -99,6 +103,9 @@ describe("runResumableChunk", () => {
       },
       chunkSoftMs: over.chunkSoftMs ?? 10 * 60_000,
       historyWindow: 64,
+      // Wide enough that elision never fires incidentally — the cases that care
+      // about it exercise `elideToolOutputs` directly.
+      toolOutputWindow: over.toolOutputWindow ?? 64,
       reportMetrics: over.reportMetrics ?? false,
       now: over.now ?? (() => 1000),
       progress: over.progress ?? [],
@@ -637,5 +644,160 @@ describe("runRecipeExecution", () => {
       modelId: null
     });
     expect(factoryCalls).toBe(0);
+  });
+});
+
+/**
+ * The other half of the rolling window: `windowMessages` decides how many turns
+ * survive, `elideToolOutputs` decides what a surviving turn costs. The rules that
+ * matter are the ones that keep an *old* result — losing the wrong one is not a
+ * context saving, it is a model acting on something it can no longer see.
+ */
+describe("elideToolOutputs", () => {
+  const BIG = "x".repeat(500);
+
+  /** One turn: an assistant tool call and the result that answered it. */
+  function turn(
+    id: string,
+    toolName: string,
+    output: ToolResultPart["output"] = { type: "text", value: BIG }
+  ): ModelMessage[] {
+    return [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: id, toolName, input: { note: id } }
+        ]
+      },
+      {
+        role: "tool",
+        content: [{ type: "tool-result", toolCallId: id, toolName, output }]
+      }
+    ];
+  }
+
+  /** Every tool-result output in order, for compact assertions. */
+  function outputs(messages: ModelMessage[]): unknown[] {
+    return messages
+      .filter((m) => m.role === "tool")
+      .flatMap((m) =>
+        (m.content as ToolResultPart[])
+          .filter((p) => p.type === "tool-result")
+          .map((p) => (p.output.type === "text" ? p.output.value : p.output))
+      );
+  }
+
+  it("stubs a result the model has moved past", () => {
+    const messages = [
+      { role: "user" as const, content: "go" },
+      ...turn("a", "inspect"),
+      ...turn("b", "act"),
+      ...turn("c", "act")
+    ];
+    // Only the last assistant turn keeps its detail; `a` is old, and `b` is no
+    // longer the newest `act`.
+    expect(outputs(elideToolOutputs(messages, 1))).toEqual([
+      BIG, // rule 2: still the newest `inspect`
+      ELIDED_TOOL_OUTPUT,
+      BIG
+    ]);
+  });
+
+  // The regression this rule exists for: `arc_inspect` answers a repeated view of
+  // an unchanged board with "what you saw then still holds", which is only true
+  // while the render it points at is in context. Age alone would elide it.
+  it("keeps the newest result for each tool however old it is", () => {
+    const messages = [
+      { role: "user" as const, content: "go" },
+      ...turn("a", "inspect"),
+      ...turn("b", "act"),
+      ...turn("c", "act"),
+      ...turn("d", "act")
+    ];
+    const [inspect] = outputs(elideToolOutputs(messages, 1));
+    expect(inspect).toBe(BIG);
+  });
+
+  it("keeps a failure, which is short and says why", () => {
+    const err = { type: "error-text" as const, value: "y".repeat(500) };
+    const messages = [
+      { role: "user" as const, content: "go" },
+      ...turn("a", "act", err),
+      ...turn("b", "act"),
+      ...turn("c", "act")
+    ];
+    expect(outputs(elideToolOutputs(messages, 1))[0]).toEqual(err);
+  });
+
+  it("leaves a small result alone, since the stub would be most of it", () => {
+    const small = { type: "text" as const, value: "ok" };
+    const messages = [
+      { role: "user" as const, content: "go" },
+      ...turn("a", "act", small),
+      ...turn("b", "act"),
+      ...turn("c", "act")
+    ];
+    expect(outputs(elideToolOutputs(messages, 1))[0]).toBe("ok");
+  });
+
+  it("preserves ids, names, order and the tool calls themselves", () => {
+    const messages = [
+      { role: "user" as const, content: "go" },
+      ...turn("a", "act"),
+      ...turn("b", "act"),
+      ...turn("c", "act")
+    ];
+    const out = elideToolOutputs(messages, 1);
+    expect(out).toHaveLength(messages.length);
+    expect(out.map((m) => m.role)).toEqual(messages.map((m) => m.role));
+    // The call side is untouched — that is where the model's own notes live.
+    expect(out[1]).toEqual(messages[1]);
+    const stubbed = (out[2] as { content: ToolResultPart[] }).content[0];
+    expect(stubbed.toolCallId).toBe("a");
+    expect(stubbed.toolName).toBe("act");
+  });
+
+  it("is idempotent — a stub is small enough to survive the next pass", () => {
+    const messages = [
+      { role: "user" as const, content: "go" },
+      ...turn("a", "act"),
+      ...turn("b", "act"),
+      ...turn("c", "act")
+    ];
+    const once = elideToolOutputs(messages, 1);
+    expect(elideToolOutputs(once, 1)).toEqual(once);
+  });
+
+  it("returns the input unchanged when nothing needs eliding", () => {
+    const messages = [
+      { role: "user" as const, content: "go" },
+      ...turn("a", "act")
+    ];
+    expect(elideToolOutputs(messages, 4)).toBe(messages);
+  });
+
+  it("composes with windowMessages without orphaning a tool result", () => {
+    const messages = [
+      { role: "user" as const, content: "go" },
+      ...turn("a", "act"),
+      ...turn("b", "act"),
+      ...turn("c", "act")
+    ];
+    const out = elideToolOutputs(windowMessages(messages, 2), 1);
+    // Every surviving tool-result still has the assistant call it answers.
+    const callIds = new Set(
+      out
+        .filter((m) => m.role === "assistant")
+        .flatMap((m) =>
+          (m.content as { type: string; toolCallId?: string }[])
+            .filter((p) => p.type === "tool-call")
+            .map((p) => p.toolCallId)
+        )
+    );
+    for (const m of out.filter((m) => m.role === "tool")) {
+      for (const p of m.content as ToolResultPart[]) {
+        expect(callIds.has(p.toolCallId)).toBe(true);
+      }
+    }
   });
 });

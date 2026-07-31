@@ -82,7 +82,13 @@ accept (see **Async task delivery** below). The DO backs a **Session** with
   task delivery** below), and `this.schedule` is used for weekly data retention
   (see below).
 - **Compaction** keeps the context lean: history is automatically compacted once
-  it grows past `COMPACT_AFTER_TOKENS` (the Sessions `compactAfter` mechanism).
+  it grows past `COMPACT_AFTER_TOKENS` (the Sessions `compactAfter` mechanism),
+  which folds everything but a protected head and the most recent
+  `COMPACT_TAIL_TOKENS` into one summary. The two constants are **one setting** —
+  the threshold has to clear the post-compaction floor (system prompt + head +
+  summary + tail) by a healthy margin, or compaction fires on nearly every append
+  and spends a summarizer call on a near-empty middle. `config.ts` carries the
+  derivation and the invariant; `test/agent/session.spec.ts` asserts it.
 - **Episodic recall** ([`src/agent/recall.ts`](src/agent/recall.ts)): the raw
   messages each compaction displaces are embedded (Workers AI `@cf/baai/bge-m3`)
   and upserted into **Vectorize** via the Session's `onArchive` seam, namespaced
@@ -268,6 +274,17 @@ separate "compose-time" declaration would have required. Reconstruction derives
 each subtask's `localKey` from its durable id (`s<id>`) and omits
 `referenceIndexes`, whose catalog is long gone.
 
+Note what this costs, since it is invisible from the Session: a round rebuilds
+_every_ earlier round of its Task, so branch results are re-sent on every
+inference for as long as the Task runs, and — living in durable rows rather than
+in the Session — compaction can neither see nor shorten them. Nothing bounds that
+today. It has not been worth bounding: the round contract asks for as few subtasks
+as a request needs, the `arc-game` guidance is one subtask per game, and observed
+Tasks delegate one subtask and compose in the next round, so the replay is a
+single report rendered once. A Task that delegates repeatedly — each round playing
+again on what the last one learned — is the shape that would change that answer,
+and the gateway's per-Task token stats are where it would show up first.
+
 The same pass numbers the referenceable turns `[ref 1..N]` for a delegation this
 round might make. Round acknowledgments are deliberately _not_ referenceable: they
 are the agent's own scaffolding, and they are already rendered as tool calls.
@@ -448,6 +465,17 @@ no recall, and no access to parent history beyond the supplied references.
 **One resumable runner, driven in durable chunks.** Every recipe runs the same
 agentic loop (`runResumableChunk`, [`src/subagent/run.ts`](src/subagent/run.ts)),
 customized only by its `limits` and `historyWindow`.
+
+The rolling window has two halves. `windowMessages` decides how many turns
+survive; `elideToolOutputs` decides what a surviving turn costs, stubbing the
+_payload_ of tool results the model has moved past while leaving every tool call —
+and therefore every note the model wrote itself — in place. It always keeps the
+newest result per tool, at any age: tools may answer a repeated request with
+"unchanged since you last looked", which becomes a lie the moment the render it
+points at is gone. Its window is the house constant `TOOL_OUTPUT_WINDOW`, not a
+Recipe field, precisely because a Recipe field is fingerprinted — changing one
+strands every in-flight run behind a mismatch whose recovery costs it its history,
+its turn counter and its workspace.
 
 `RecipeLimits` is `maxTurns` and `maxWallMs` and nothing else — the same two
 currencies the main agent is budgeted in, one level down, defaulting to

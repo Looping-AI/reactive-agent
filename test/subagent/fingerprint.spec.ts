@@ -3,7 +3,7 @@
  * cache key for a subagent's single terminal result.
  */
 import { describe, it, expect } from "vitest";
-import { fingerprintRequest } from "@/subagent/fingerprint";
+import { canonicalRequest, fingerprintRequest } from "@/subagent/fingerprint";
 import type { RecipeExecutionRequest } from "@/agent/subtasks/types";
 import { makeRequest } from "./fixtures";
 
@@ -102,6 +102,21 @@ describe("fingerprintRequest", () => {
     });
     expect(await fingerprintRequest(swapped)).not.toBe(
       await fingerprintRequest(base)
+    );
+  });
+
+  /**
+   * The other direction, and it is a guard rather than a property: the
+   * tool-output window is a house constant precisely *so* it stays out of here.
+   * A fingerprint change strands every in-flight run behind a mismatch, whose
+   * recovery deletes the child — costing it its history, its turn counter and
+   * its workspace. Promoting `TOOL_OUTPUT_WINDOW` to a Recipe field would put it
+   * in `canonicalRequest` and buy that on the next deploy, silently.
+   */
+  it("does not fingerprint the tool-output window", () => {
+    expect(canonicalRequest(makeRequest())).not.toContain("toolOutputWindow");
+    expect(JSON.stringify(makeRequest().recipe)).not.toContain(
+      "toolOutputWindow"
     );
   });
 });

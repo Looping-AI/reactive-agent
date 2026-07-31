@@ -1,6 +1,7 @@
 import { Agent } from "agents";
 import { z } from "zod";
 import type { Workspace } from "@cloudflare/shell";
+import { TOOL_OUTPUT_WINDOW } from "@/config";
 import { CHUNK_SOFT_MS } from "@/platform";
 import { createModelPair, type ModelPair } from "@/agent/model";
 import { buildRecipeTools } from "@/agent/tools";
@@ -242,6 +243,7 @@ export class RecipeSubagent extends Agent<Env> {
         limits: recipe.limits,
         chunkSoftMs: CHUNK_SOFT_MS,
         historyWindow: recipe.historyWindow,
+        toolOutputWindow: TOOL_OUTPUT_WINDOW,
         reportMetrics: recipe.reportMetrics,
         now: () => Date.now(),
         progress,

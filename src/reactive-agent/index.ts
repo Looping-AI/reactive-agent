@@ -61,6 +61,7 @@ import type {
 import { FINGERPRINT_MISMATCH, RecipeSubagent, subagentName } from "@/subagent";
 import {
   COMPACT_AFTER_TOKENS,
+  COMPACT_TAIL_TOKENS,
   MEMORY_DESCRIPTION,
   MEMORY_MAX_TOKENS
 } from "@/config";
@@ -189,6 +190,7 @@ export class ReactiveAgent extends Agent<Env> {
         memoryDescription: MEMORY_DESCRIPTION,
         memoryMaxTokens: MEMORY_MAX_TOKENS,
         compactAfterTokens: COMPACT_AFTER_TOKENS,
+        compactTailTokens: COMPACT_TAIL_TOKENS,
         // Episodic recall: embed the messages each compaction displaces into
         // this instance's Vectorize namespace. Best-effort — the wrapper
         // swallows failures so compaction still shortens history.

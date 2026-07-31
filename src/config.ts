@@ -80,6 +80,21 @@ export const SUBAGENT_LIMITS: RecipeLimits = {
 };
 
 /**
+ * How many of the most recent assistant turns keep their tool **results** in a
+ * subagent's rolling window. Older results are stubbed; the tool *calls* and the
+ * model's own text always survive the full `historyWindow`, because that is where
+ * a recipe's model keeps whatever it wrote down for itself.
+ *
+ * A mechanic of the window, not a property of a domain: it is about what a stale
+ * payload is worth, which is the same answer everywhere. So it is deliberately
+ * **not** a Recipe field — a Recipe field is fingerprinted (see
+ * {@link file://./subagent/fingerprint.ts}), and changing a fingerprint strands
+ * every in-flight run behind a mismatch that costs it its whole history. It can
+ * become an optional, merging Recipe field the day a domain genuinely differs.
+ */
+export const TOOL_OUTPUT_WINDOW = 4;
+
+/**
  * Upper bound on Subtasks per **round** — a Core Invariant: a delegating round
  * emits 1..8 Subtasks, which is also what bounds its fan-out (all
  * dependency-ready Subtasks run concurrently, with no other concurrency cap).
@@ -101,7 +116,42 @@ export const MAX_SUBTASKS = 8;
 export const MEMORY_MAX_TOKENS = 1200;
 
 /** Live-history token threshold that triggers automatic (size-based) compaction. */
-export const COMPACT_AFTER_TOKENS = 60_000;
+export const COMPACT_AFTER_TOKENS = 16_000;
+
+/**
+ * Tokens of the most recent history that compaction keeps **verbatim**.
+ *
+ * Read this together with {@link COMPACT_AFTER_TOKENS}; neither number means
+ * anything alone. The SDK default is 20_000, and leaving it unset alongside a
+ * 60_000 threshold is what had every request carrying 30-60k of history.
+ *
+ * After a compaction the floor is `systemPrompt + protectHead + summary + tail`,
+ * so the conversation that must accumulate before compaction fires again is
+ *
+ *     Δ = COMPACT_AFTER_TOKENS − floor
+ *
+ * and the SDK sizes each summary at 20% of the middle it just folded, so at
+ * equilibrium `S ≈ 0.2Δ` and `Δ = (T − systemPrompt − head − tail)/1.2`. Here
+ * that is Δ ≈ 6k against S ≈ 1.2k, and per-request history settles at ~11-16k.
+ *
+ * The summarizer re-sends the previous summary on every iterative update, so its
+ * total input is `V + V·S/Δ` over history volume V — an overhead that is
+ * hyperbolic in Δ, not additive. Because `Δ/S = 5` is structural it costs about
+ * the same at any threshold; what a tighter one really spends is *fidelity*,
+ * since `V/Δ` re-summarization passes each re-compress what came before. The
+ * Vectorize archive behind `recall` is the backstop for that.
+ *
+ * INVARIANT: `COMPACT_AFTER_TOKENS − COMPACT_TAIL_TOKENS >= 10_000`, asserted in
+ * `test/agent/session.spec.ts`. Below it the fixed floor eats the gap, and
+ * compaction fires on nearly every append — each firing spending a summarizer
+ * call on a near-empty middle. Never lower the threshold without lowering the
+ * tail with it.
+ *
+ * One edge this does not address, because it needs no machinery: the SDK always
+ * keeps the final message and honors its `minTailMessages` floor, so a single
+ * enormous reply can exceed the tail budget on its own. Unchanged from before.
+ */
+export const COMPACT_TAIL_TOKENS = 5_000;
 
 /** One-line description shown to the model for the writable `"memory"` block. */
 export const MEMORY_DESCRIPTION =
