@@ -628,6 +628,35 @@ describe("matchShapes", () => {
     ]);
   });
 
+  it("calls a shape that changed color where it stood a repaint", () => {
+    // What a click game does instead of moving anything. Paired by colour, this
+    // is a blue block vanishing and an unrelated red one materializing on its
+    // exact footprint — twenty of which a logged `ft09` play had to reassemble
+    // into "clicking a block toggles it".
+    const { moved, other } = matchShapes(
+      locateComponents(block(1, 1)),
+      locateComponents(block(1, 1, 8))
+    );
+    expect(moved).toEqual([]);
+    expect(other).toEqual([
+      {
+        kind: "recolored",
+        from: { color: 9, size: 4, top: 1, left: 1, bottom: 2, right: 2 },
+        to: { color: 8, size: 4, top: 1, left: 1, bottom: 2, right: 2 }
+      }
+    ]);
+  });
+
+  it("keeps a repaint apart from a shape that both moved and changed color", () => {
+    // Same colors, different footprint: nothing here says these are one object,
+    // so the pass declines to claim it and the two events stand.
+    const { other } = matchShapes(
+      locateComponents(block(1, 1)),
+      locateComponents(block(1, 4, 8))
+    );
+    expect(other.map((c) => c.kind).sort()).toEqual(["appeared", "gone"]);
+  });
+
   it("reports arrivals and departures when nothing pairs up", () => {
     const { moved, other } = matchShapes(
       locateComponents([[9, 0]]),
@@ -690,6 +719,23 @@ describe("renderShapeDelta", () => {
     );
     expect(renderShapeDelta(delta)).toBe(
       "nothing moved; yellow row 0, cols 0-2 → row 0, cols 0-1 (3→2 cells)"
+    );
+  });
+
+  it("does not say `nothing moved` over a board that changed", () => {
+    // The phrase is the soul's signal for blocked-or-refused, so a step that
+    // repainted a block must not lead with it: a click game moves nothing ever,
+    // and every one of its steps would read as a refusal.
+    const toggle = (color: number) =>
+      locateComponents([
+        [color, color, 0],
+        [color, color, 0],
+        [0, 0, 0]
+      ]);
+    const rendered = renderShapeDelta(matchShapes(toggle(9), toggle(8)));
+    expect(rendered).toBe(
+      "no shape travelled, but the board changed; " +
+        "blue 2×2 at rows 0-1, cols 0-1 turned red"
     );
   });
 

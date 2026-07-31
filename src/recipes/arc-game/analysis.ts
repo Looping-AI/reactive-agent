@@ -507,6 +507,11 @@ export type ShapeChange =
     }
   /** Same color, still overlapping, different cell count — a bar, a trail, a fill. */
   | { kind: "resized"; from: Component; to: Component }
+  /**
+   * Same footprint and same cell count, a different color — a repaint in place,
+   * which is what a click game does instead of moving anything.
+   */
+  | { kind: "recolored"; from: Component; to: Component }
   | { kind: "appeared"; shape: Component }
   | { kind: "gone"; shape: Component };
 
@@ -590,10 +595,12 @@ function groupShapes(
  * Match the shapes of two frames: what moved, what changed size, what came and
  * went. Null when there is no earlier frame to compare against.
  *
- * Two passes, and the order is the whole design. Color **and** cell count first,
- * because a rigid object that travelled keeps both — that pass is what finds a
- * move, and its pairs are never reconsidered. Color alone second, over what is
- * left, which is what a bar losing cells or a trail growing looks like.
+ * Three passes, and the order is the whole design. Color **and** cell count
+ * first, because a rigid object that travelled keeps both — that pass is what
+ * finds a move, and its pairs are never reconsidered. Color alone second, over
+ * what is left, which is what a bar losing cells or a trail growing looks like.
+ * **Footprint** alone last, over what neither pass claimed, which is a shape that
+ * changed color without moving — see {@link matchRepaints}.
  */
 export function diffShapes(
   before: number[][] | null,
@@ -641,6 +648,8 @@ export function matchShapes(
   const byColor = (s: Component): string => String(s.color);
   const colorBefore = groupShapes(leftFrom, byColor);
   const colorAfter = groupShapes(leftTo, byColor);
+  const gone: Component[] = [];
+  const appeared: Component[] = [];
   for (const key of new Set([...colorBefore.keys(), ...colorAfter.keys()])) {
     const result = pairByProximity(
       colorBefore.get(key) ?? [],
@@ -649,16 +658,55 @@ export function matchShapes(
     for (const [from, to] of result.pairs) {
       other.push({ kind: "resized", from, to });
     }
-    for (const shape of result.unpairedFrom)
-      other.push({ kind: "gone", shape });
-    for (const shape of result.unpairedTo) {
-      other.push({ kind: "appeared", shape });
-    }
+    gone.push(...result.unpairedFrom);
+    appeared.push(...result.unpairedTo);
   }
+  other.push(...matchRepaints(gone, appeared));
 
   moved.sort((x, y) => y.from.size - x.from.size);
   other.sort((x, y) => shapeOf(y).size - shapeOf(x).size);
   return { moved, other };
+}
+
+/**
+ * Pair off the shapes neither earlier pass claimed, by **footprint**: one that
+ * vanished and one that arrived on the same box with the same cell count are one
+ * shape repainted, not two events.
+ *
+ * A click game is the case this exists for. Nothing on such a board ever travels,
+ * so both earlier passes — which pair within a color — leave every changed block
+ * as a `gone` and an `appeared` at the same coordinates, and a whole play reads as
+ * things vanishing and other things materializing where they stood. The logged
+ * `ft09` play was told `blue 6×6 at rows 36-41, cols 36-41 is gone; red 6×6
+ * appeared at rows 36-41, cols 36-41` twenty times and had to work out for itself,
+ * across several turns, that a click toggles a block's color.
+ *
+ * Box and size together are strong evidence and not proof — two different shapes
+ * can share a bounding box and a cell count without sharing a cell — but the
+ * claim made from them is only that those cells changed color, which is true
+ * either way. Colors necessarily differ: same-color leftovers were already paired
+ * by {@link pairByProximity}, which leaves one side of each color empty.
+ */
+function matchRepaints(
+  gone: Component[],
+  appeared: Component[]
+): ShapeChange[] {
+  const footprint = (s: Component): string =>
+    `${s.top},${s.left},${s.bottom},${s.right}:${s.size}`;
+  const unclaimed = groupShapes(gone, footprint);
+  const changes: ShapeChange[] = [];
+  for (const shape of appeared) {
+    const from = unclaimed.get(footprint(shape))?.shift();
+    changes.push(
+      from === undefined
+        ? { kind: "appeared", shape }
+        : { kind: "recolored", from, to: shape }
+    );
+  }
+  for (const leftover of unclaimed.values()) {
+    for (const shape of leftover) changes.push({ kind: "gone", shape });
+  }
+  return changes;
 }
 
 /** The component a change is about, whichever field carries it. */
@@ -693,6 +741,14 @@ function describeDestination(change: MovedShape): string {
  * One action's effect as movement: `nothing moved` when the board's objects
  * stayed put, whatever a counter did alongside them.
  *
+ * That phrase is spent carefully, because the soul teaches it as the signal for
+ * *blocked or refused*: it leads a step only when everything else the delta holds
+ * is a {@link ShapeChange} of kind `resized`, which is a counter or a bar doing
+ * its own bookkeeping. A step that repainted a block, or made one appear, changed
+ * the board — no object travelled, and saying so as `nothing moved` told a logged
+ * `ft09` play that twenty clicks which each toggled a 36-cell block had been
+ * refused.
+ *
  * Null means *this view has nothing to say* — either no shape can be paired
  * across the frames, or so many changed that they are a repaint
  * ({@link MAX_SHAPE_CHANGES}). Both leave the cell diff as the better witness, so
@@ -710,7 +766,13 @@ export function renderShapeDelta(delta: ShapeDelta, cap = 6): string | null {
         `${describeDestination(change)} (${describeShift(change.dRow, change.dCol)})`
     );
   }
-  if (delta.moved.length === 0) lines.push("nothing moved");
+  if (delta.moved.length === 0) {
+    lines.push(
+      delta.other.every((change) => change.kind === "resized")
+        ? "nothing moved"
+        : "no shape travelled, but the board changed"
+    );
+  }
 
   const room = Math.max(0, cap - lines.length);
   for (const change of delta.other.slice(0, room)) {
@@ -719,6 +781,12 @@ export function renderShapeDelta(delta: ShapeDelta, cap = 6): string | null {
         lines.push(
           `${colorName(change.from.color)} ${describeBox(change.from)} → ` +
             `${describeBox(change.to)} (${change.from.size}→${change.to.size} cells)`
+        );
+        break;
+      case "recolored":
+        lines.push(
+          `${shapeLabel(change.from)} at ${describeBox(change.from)} ` +
+            `turned ${colorName(change.to.color)}`
         );
         break;
       case "appeared":
